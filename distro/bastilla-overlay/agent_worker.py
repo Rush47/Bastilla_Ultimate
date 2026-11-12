@@ -19,7 +19,7 @@ sys.path.insert(0, "/app/applet/distro/bastilla-overlay")
 from svl_kernel import SVLSystemKernel, TopologicalInfinityEngine, SVLProtectedVariable
 
 AGENT_NAME = sys.argv[1] if len(sys.argv) > 1 else pwd.getpwuid(os.getuid()).pw_name
-DB_PATH = "/var/lib/bastilla/bastilla.db"
+DB_PATH = os.environ.get("BASTILLA_DB_PATH", "/var/lib/bastilla/bastilla.db")
 HOME_DIR = f"/home/{AGENT_NAME}"
 STATUS_FILE = os.path.join(HOME_DIR, "worker_status.json")
 INBOX_FILE = os.path.join(HOME_DIR, "inbox.jsonl")

@@ -1,50 +1,54 @@
+import assert from "node:assert/strict";
 import { chromium } from "playwright";
 
 async function main() {
-  console.log("Launching Chromium via Playwright...");
+  const baseUrl = process.env.TEST_BASE_URL || "http://localhost:3000";
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH }
+      : {}),
+    args: ["--no-sandbox", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
   });
-
-  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-
-  console.log("Navigating to http://localhost:3000 ...");
-  await page.goto("http://localhost:3000", { waitUntil: "networkidle", timeout: 15000 });
-
-  // 1. Verify Top Banner
-  const banner = page.locator("text=MISJA CIĄGŁA AKTYWNA").first();
-  const bannerVisible = await banner.isVisible();
-  console.log("1. Continuous Mission Banner Visible:", bannerVisible);
-
-  // 2. Switch to ChatGPT Work tab
-  console.log("Switching to ChatGPT Work tab...");
-  await page.click("button:has-text('ChatGPT Work')");
-  await page.waitForTimeout(1500);
-
-  // 3. Verify 'Misja Ciągła' generative button exists
-  const chip = page.locator("button:has-text('Misja Ciągła')").first();
-  const chipVisible = await chip.isVisible();
-  console.log("2. 'Misja Ciągła' Generative Chip Visible:", chipVisible);
-
-  // 4. Check for interactive action buttons in the chat
-  const actionButtons = page.locator("button:has-text('Aktualizacja')").first();
-  const buttonsVisible = await actionButtons.isVisible().catch(() => false);
-  console.log("3. Interactive Action Buttons Visible:", buttonsVisible);
-
-  // 5. Trigger a mission cycle via button
-  console.log("Triggering continuous mission cycle from GUI...");
-  await page.click("button:has-text('Wymuś cykl')");
-  await page.waitForTimeout(2000);
-
-  await page.screenshot({ path: "/tmp/bastilla_verified.png" });
-  console.log("Screenshot saved to /tmp/bastilla_verified.png");
-
-  await browser.close();
-  console.log("Verification finished successfully!");
+  try {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+    const pageErrors: string[] = [];
+    const failedAssets: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(error.message));
+    page.on("response", (response) => {
+      if (response.url().startsWith(baseUrl) && /\.(jpg|png|js|css)(\?|$)/.test(response.url()) && response.status() >= 400) {
+        failedAssets.push(`${response.status()} ${response.url()}`);
+      }
+    });
+    const overview = page.waitForResponse((response) => response.url().endsWith("/api/system/overview"));
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    assert.equal((await overview).status(), 200);
+    await page.getByRole("button", { name: "ChatGPT Work", exact: true }).waitFor();
+    const imagesLoaded = await page.locator("img").evaluateAll(async (images) => {
+      await Promise.all(images.map((image) => (image as HTMLImageElement).decode().catch(() => {})));
+      return images.every((image) => (image as HTMLImageElement).naturalWidth > 0);
+    });
+    assert.ok(imagesLoaded, "Desktop images must load in the production build");
+    for (const name of ["ChatGPT Work", "Terminale", "Agenci Linux", "Układ 3D", "Diagnostyka i GitHub", "Pulpit Violet"]) {
+      await page.getByRole("button", { name, exact: true }).first().click();
+      await page.waitForTimeout(200);
+      if (name === "ChatGPT Work") {
+        await page.getByTitle("Włącz pełny ekran").click();
+        await page.getByTitle("Wyłącz pełny ekran").waitFor();
+        await page.keyboard.press("Escape");
+        await page.getByTitle("Włącz pełny ekran").waitFor();
+      }
+    }
+    assert.deepEqual(pageErrors, [], "Tabs must render without runtime errors");
+    assert.deepEqual(failedAssets, [], "Built assets must be served successfully");
+    await page.screenshot({ path: process.env.TEST_SCREENSHOT_PATH || "/tmp/bastilla_verified.png" });
+    console.log("UI verified: six tabs, production images, no page errors.");
+  } finally {
+    await browser.close();
+  }
 }
 
-main().catch((err) => {
-  console.error("Browser verification error:", err);
-  process.exit(1);
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
 });

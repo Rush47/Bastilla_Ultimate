@@ -14,7 +14,7 @@ import pwd
 import sqlite3
 from datetime import datetime, timezone
 
-DB_PATH = "/var/lib/bastilla/bastilla.db"
+DB_PATH = os.environ.get("BASTILLA_DB_PATH", "/var/lib/bastilla/bastilla.db")
 
 
 # --- WARSTWA 1: PROTOKOŁY BEZPIECZEŃSTWA I TYPY NATYWNE (SVL CORE) ---
