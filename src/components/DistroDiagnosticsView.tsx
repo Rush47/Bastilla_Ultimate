@@ -37,10 +37,22 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   });
   const [externalBackendSaved, setExternalBackendSaved] = useState<string>("");
 
+  const readApiJson = async (res: Response): Promise<any> => {
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/json")) {
+      throw new Error(`API zwróciło ${res.status} (${contentType || "brak Content-Type"}) zamiast JSON. Sprawdź backend i proxy /api.`);
+    }
+    const body = await res.json();
+    if (!res.ok) {
+      throw new Error(typeof body?.error === "string" ? body.error : `HTTP ${res.status}`);
+    }
+    return body;
+  };
+
   const fetchGitStatus = async () => {
     try {
       const res = await fetch("/api/git/status");
-      const data = await res.json();
+      const data = await readApiJson(res);
       if (data.ok) setGitInfo(data.git);
     } catch {
       // ignore
@@ -50,7 +62,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   const fetchMcpStatus = async () => {
     try {
       const res = await fetch("/api/mcp/status");
-      const data = await res.json();
+      const data = await readApiJson(res);
       if (data.ok) setMcpStatus(data);
     } catch {
       // ignore
@@ -74,7 +86,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
           },
         }),
       });
-      const initData = await initRes.json();
+      const initData = await readApiJson(initRes);
 
       const listRes = await fetch("/api/mcp", {
         method: "POST",
@@ -85,7 +97,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
           method: "tools/list",
         }),
       });
-      const listData = await listRes.json();
+      const listData = await readApiJson(listRes);
 
       await fetchMcpStatus();
       setMcpProbeOutput(
