@@ -1,9 +1,8 @@
-# Bastilla Ultimate — Codex CLI MCP configuration
-# Project-local configuration; no credentials are stored here.
-# Run `codex login` interactively in Codespaces to authenticate with ChatGPT.
-
-[mcp_servers.bastilla_cloud]
-url = "https://ais-pre-5st6ohqhbyd3gh3eje5zxh-668176017916.europe-west1.run.app/api/mcp"
+# Bastilla Ultimate: local MCP over stdio, no Cloud Run dependency.
+# Codex CLI starts this process in the repository working directory.
+[mcp_servers.bastilla_local]
+command = "node"
+args = ["scripts/bastilla-mcp-stdio.mjs"]
 enabled = true
-startup_timeout_sec = 20
-tool_timeout_sec = 60
+startup_timeout_sec = 15
+tool_timeout_sec = 30
