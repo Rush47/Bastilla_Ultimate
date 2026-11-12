@@ -72,6 +72,28 @@ export interface TaskHistoryRecord {
   created_at: string;
 }
 
+export interface ToolExecutionOutcomeSummary {
+  tool: string;
+  source: "backend" | "mcp" | "image_engine" | "terminal";
+  permission: "public_diag" | "operator_auth" | "mcp_token_required" | "privileged_exec";
+  status: "executed" | "planned" | "unavailable" | "denied" | "error";
+  summary: string;
+  data: Record<string, any> | null;
+  error?: string;
+  executedAt: string;
+  durationMs: number;
+}
+
+export interface AgentToolCatalogItem {
+  name: string;
+  description: string;
+  source: "backend" | "mcp" | "image_engine" | "terminal";
+  permission: "public_diag" | "operator_auth" | "mcp_token_required" | "privileged_exec";
+  allowedAgents: string[];
+  usableNow: boolean;
+  availabilityNote: string;
+}
+
 export interface ChatMessageRecord {
   id: number;
   session_id: string;
@@ -82,6 +104,7 @@ export interface ChatMessageRecord {
   artifact_title?: string;
   artifact_code?: string;
   created_at: string;
+  toolOutcomes?: ToolExecutionOutcomeSummary[];
 }
 
 export interface FleetUnitRecord {

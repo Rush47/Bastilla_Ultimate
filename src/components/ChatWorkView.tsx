@@ -4,6 +4,7 @@ import type {
   ChatMessageRecord,
   GeneratedImageItem,
   SystemOverviewResponse,
+  ToolExecutionOutcomeSummary,
 } from "../types/bastilla";
 import { AGENT_AVATARS } from "./BastillaDesktopView";
 import {
@@ -79,7 +80,6 @@ export type OllamaEngineChoice = string;
 interface ChatInputBarProps {
   onSend: (text: string) => void;
   onStopStreaming: () => void;
-  onExecRoot: () => void;
   onUploadImage: (file: File) => void;
   onLoadVisionSample: () => void;
   onTriggerGenerativeSample: (
@@ -104,7 +104,6 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
   ({
     onSend,
     onStopStreaming,
-    onExecRoot,
     onUploadImage,
     onLoadVisionSample,
     onTriggerGenerativeSample,
@@ -145,6 +144,28 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
       if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
         e.preventDefault();
         submitCurrentText();
+      }
+    };
+
+    const handleExecShortcut = () => {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        setText("/exec ");
+        requestAnimationFrame(() => {
+          adjustTextareaHeight();
+          textareaRef.current?.focus();
+        });
+        return;
+      }
+      if (/^\/(exec|root|sudo|bash)\s*$/i.test(trimmed)) {
+        requestAnimationFrame(() => textareaRef.current?.focus());
+        return;
+      }
+      const cmdToRun = /^\/(exec|root|sudo|bash)\b/i.test(trimmed) ? trimmed : `/exec ${trimmed}`;
+      onSend(cmdToRun);
+      setText("");
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "52px";
       }
     };
 
@@ -307,10 +328,10 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
 
               <button
                 type="button"
-                onClick={onExecRoot}
+                onClick={handleExecShortcut}
                 disabled={sending}
                 className="min-h-10 px-2.5 flex items-center justify-center gap-1 rounded-lg bg-[#0b0f18] hover:bg-slate-800 border border-slate-700 text-emerald-400 text-xs font-mono-tabular transition-colors shrink-0"
-                title="Wykonaj polecenie ROOT (/exec id)"
+                title="Wstaw /exec lub wykonaj wpisane polecenie ROOT"
                 aria-label="Wykonaj /exec"
               >
                 <Terminal className="w-4 h-4" />
@@ -354,6 +375,8 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [sending, setSending] = useState<boolean>(false);
   const [streamingContent, setStreamingContent] = useState<string>("");
   const [streamingEngine, setStreamingEngine] = useState<string>("");
+  const [streamingTools, setStreamingTools] = useState<ToolExecutionOutcomeSummary[]>([]);
+  const [messageToolsMap, setMessageToolsMap] = useState<Record<number, ToolExecutionOutcomeSummary[]>>({});
   const [clearing, setClearing] = useState<boolean>(false);
   const [unlocking, setUnlocking] = useState<boolean>(false);
   const [startingOllama, setStartingOllama] = useState<boolean>(false);
@@ -390,6 +413,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [executingArtifact, setExecutingArtifact] = useState<boolean>(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const pendingOptimisticIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!isFullscreen) return;
@@ -403,18 +427,19 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   useEffect(() => {
     const serverChats = overview?.host?.db?.chats || [];
     setLocalMessages((prev) => {
-      const pendingLocal = prev.filter((m) => m.id >= 1_000_000_000_000);
-      if (pendingLocal.length === 0) return serverChats;
-      const unmatched = pendingLocal.filter(
-        (loc) =>
-          !serverChats.some(
-            (srv) =>
-              srv.sender_role === loc.sender_role &&
-              srv.agent_id === loc.agent_id &&
-              srv.content === loc.content
-          )
+      const activeId = pendingOptimisticIdRef.current;
+      if (!activeId) return serverChats;
+      const inFlight = prev.find((m) => m.id === activeId);
+      if (!inFlight) return serverChats;
+      const inFlightTs = Date.parse(inFlight.created_at) || 0;
+      const alreadyOnServer = serverChats.some(
+        (srv) =>
+          srv.sender_role === inFlight.sender_role &&
+          srv.agent_id === inFlight.agent_id &&
+          srv.content === inFlight.content &&
+          (Date.parse(srv.created_at) || 0) >= inFlightTs - 5000
       );
-      return [...serverChats, ...unmatched];
+      return alreadyOnServer ? serverChats : [...serverChats, inFlight];
     });
   }, [overview?.host?.db?.chats]);
 
@@ -503,7 +528,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             aspectRatio: imageAspectRatio,
             agentId: selectedAgent,
             sourceImageBase64: imageBase64 || undefined,
-            sourceImageMimeType: imageBase64 ? imageMimeType : undefined,
+            sourceMimeType: imageBase64 ? imageMimeType : undefined,
           }),
           timeoutMs: 90000,
         });
@@ -543,51 +568,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
         return;
       }
 
-      if (/^\/exec\b/i.test(trimmed)) {
-        const cmd = trimmed.replace(/^\/exec\s*/i, "").trim();
-        const optimisticUserMsg: ChatMessageRecord = {
-          id: Date.now(),
-          session_id: "bastilla-main",
-          sender_role: "user",
-          agent_id: selectedAgent,
-          engine_used: "Operator",
-          content: trimmed,
-          created_at: new Date().toISOString(),
-        };
-        setLocalMessages((prev) => [...prev, optimisticUserMsg]);
-        setSending(true);
-
-        try {
-          const data = await apiFetchJson<any>("/api/terminal/exec", {
-            method: "POST",
-            body: JSON.stringify({
-              mode: "LINUX_ROOT",
-              command: cmd,
-              agentUser: selectedAgent,
-            }),
-          });
-          const execOutput = data.ok
-            ? `[SERVER uid=${data.execution_identity?.uid ?? "?"} · exit=${data.exitCode ?? 0}]\n$ ${cmd}\n\n${data.stdout || data.stderr || "[Brak wyjścia (exit=0)]"}`
-            : `[BŁĄD WYKONANIA · exit=${data.exitCode || 1}]\n$ ${cmd}\n\n${data.error || data.stderr || data.stdout || "Nieznany błąd powłoki."}`;
-
-          setLocalMessages((prev) => [
-            ...prev,
-            {
-              id: Date.now() + 1,
-              session_id: "bastilla-main",
-              sender_role: "assistant",
-              agent_id: selectedAgent,
-              engine_used: "Powłoka serwera",
-              content: execOutput,
-              created_at: new Date().toISOString(),
-            },
-          ]);
-          onRefresh();
-        } catch (err: any) {
-          setErrorMsg(err?.message || "Błąd wykonania komendy systemowej.");
-        } finally {
-          setSending(false);
-        }
+      // Validate empty /exec|/root|/sudo|/bash slash commands gracefully without throwing a 400 error
+      if (/^\/(exec|root|sudo|bash)\s*$/i.test(trimmed)) {
+        setErrorMsg("Podaj polecenie po /exec, np. /exec id && uname -a");
         return;
       }
 
@@ -603,13 +586,16 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
         created_at: new Date().toISOString(),
       };
 
+      pendingOptimisticIdRef.current = optimisticUserMsg.id;
       setLocalMessages((prev) => [...prev, optimisticUserMsg]);
       setSending(true);
       setStreamingContent("");
       setStreamingEngine(enginePreference);
+      setStreamingTools([]);
 
       const controller = new AbortController();
       streamAbortRef.current = controller;
+      let savedOnServer = false;
 
       try {
         const res = await fetch(buildApiUrl("/api/chat/stream"), {
@@ -649,6 +635,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
         let buffer = "";
         let assembled = "";
         let finalDonePayload: any = null;
+        const collectedTools: ToolExecutionOutcomeSummary[] = [];
 
         while (true) {
           const { value, done } = await reader.read();
@@ -675,6 +662,13 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             ) {
               assembled += evt.text ?? evt.token ?? "";
               setStreamingContent(assembled);
+            } else if (evt.type === "tool_result" && evt.outcome) {
+              const outcome = evt.outcome as ToolExecutionOutcomeSummary;
+              collectedTools.push(outcome);
+              setStreamingTools((prev) => [...prev, outcome]);
+              if (outcome.tool === "generate_image" && outcome.status === "executed" && outcome.data?.image) {
+                setImageHistory((prev) => [outcome.data!.image, ...prev]);
+              }
             } else if (evt.type === "start" || evt.type === "meta") {
               if (evt.engine || evt.enginePreference) {
                 setStreamingEngine(evt.engine || evt.enginePreference);
@@ -695,7 +689,21 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           finalDonePayload?.reply ??
           assembled
         ).trim();
+        const finalTools: ToolExecutionOutcomeSummary[] =
+          Array.isArray(finalDonePayload?.toolOutcomes) && finalDonePayload.toolOutcomes.length > 0
+            ? finalDonePayload.toolOutcomes
+            : collectedTools;
+
         if (finalText) {
+          savedOnServer = Boolean(finalDonePayload?.userMessageRecord);
+          pendingOptimisticIdRef.current = null;
+          const asstId =
+            finalDonePayload?.assistantMessageRecord?.id ??
+            finalDonePayload?.asstId ??
+            Date.now() + 2;
+          if (finalTools.length > 0) {
+            setMessageToolsMap((prev) => ({ ...prev, [asstId]: finalTools }));
+          }
           setLocalMessages((prev) => {
             const cleaned = finalDonePayload?.userMessageRecord
               ? prev.map((m) =>
@@ -703,7 +711,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                 )
               : prev;
             const asstRecord: ChatMessageRecord = finalDonePayload?.assistantMessageRecord || {
-              id: finalDonePayload?.asstId || Date.now() + 2,
+              id: asstId,
               session_id: "bastilla-main",
               sender_role: "assistant",
               agent_id: selectedAgent,
@@ -725,14 +733,19 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
         }
         onRefresh();
       } catch (err: any) {
+        if (!savedOnServer) {
+          setLocalMessages((prev) => prev.filter((m) => m.id !== optimisticUserMsg.id));
+        }
         if (err?.name === "AbortError") {
           setStatusNotice("Generowanie odpowiedzi zatrzymane przez Operatora.");
         } else {
           setErrorMsg(err?.message || "Błąd komunikacji z silnikiem AI.");
         }
       } finally {
+        pendingOptimisticIdRef.current = null;
         streamAbortRef.current = null;
         setStreamingContent("");
+        setStreamingTools([]);
         setSending(false);
       }
     },
@@ -1421,6 +1434,31 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                     </div>
                   </div>
 
+                  {(() => {
+                    const toolsForMsg = msg.toolOutcomes || messageToolsMap[msg.id];
+                    if (!toolsForMsg?.length) return null;
+                    return (
+                      <div className="mb-2 flex flex-wrap gap-1.5">
+                        {toolsForMsg.map((t, idx) => (
+                          <span
+                            key={`${t.tool}-${idx}`}
+                            title={t.error || t.summary}
+                            className={`px-2 py-0.5 rounded border text-[10px] font-mono-tabular ${
+                              t.status === "executed"
+                                ? "bg-emerald-950/50 border-emerald-700/60 text-emerald-300"
+                                : t.status === "denied"
+                                ? "bg-amber-950/50 border-amber-700/60 text-amber-300"
+                                : "bg-rose-950/50 border-rose-700/60 text-rose-300"
+                            }`}
+                          >
+                            [{t.status === "executed" ? "WYKONANE" : t.status === "denied" ? "ODMOWA" : t.status.toUpperCase()}]{" "}
+                            {t.tool}: {t.summary}
+                          </span>
+                        ))}
+                      </div>
+                    );
+                  })()}
+
                   <div className="space-y-2">
                     {segments.map((seg, sIdx) =>
                       seg.type === "text" ? (
@@ -1475,6 +1513,26 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                     Zatrzymaj
                   </button>
                 </div>
+                {streamingTools.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {streamingTools.map((t, idx) => (
+                      <span
+                        key={`${t.tool}-${idx}`}
+                        title={t.error || t.summary}
+                        className={`px-2 py-0.5 rounded border text-[10px] font-mono-tabular ${
+                          t.status === "executed"
+                            ? "bg-emerald-950/50 border-emerald-700/60 text-emerald-300"
+                            : t.status === "denied"
+                            ? "bg-amber-950/50 border-amber-700/60 text-amber-300"
+                            : "bg-rose-950/50 border-rose-700/60 text-rose-300"
+                        }`}
+                      >
+                        [{t.status === "executed" ? "WYKONANE" : t.status === "denied" ? "ODMOWA" : t.status.toUpperCase()}]{" "}
+                        {t.tool}: {t.summary}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <FormattedMarkdownText
                   text={streamingContent || "Łączenie z silnikiem modelu..."}
                   onExecuteCommand={(cmd) => void sendDirectMessage(cmd)}
@@ -1495,7 +1553,6 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           <ChatInputBar
             onSend={sendDirectMessage}
             onStopStreaming={handleStopStreaming}
-            onExecRoot={() => void sendDirectMessage("/exec id && whoami && uname -srmo")}
             onUploadImage={handleProcessImageFile}
             onLoadVisionSample={handleLoadVisionSample}
             onTriggerGenerativeSample={handleTriggerGenerativeSample}

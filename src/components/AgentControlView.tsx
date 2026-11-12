@@ -1,5 +1,9 @@
 import React, { useCallback, useEffect, useState } from "react";
-import type { AgentId } from "../types/bastilla";
+import type {
+  AgentId,
+  AgentToolCatalogItem,
+  ToolExecutionOutcomeSummary,
+} from "../types/bastilla";
 import { apiFetchJson } from "../utils/apiClient";
 
 type Job = { id: string; agent_id: string; prompt: string; priority: number; status: string; provider: string; model: string; result: string; error: string; created_at: string; heartbeat_at: string | null };
@@ -10,6 +14,9 @@ const labels: Record<string, string> = { queued: "W kolejce", running: "Wykonywa
 export function AgentControlView() {
   const [agents, setAgents] = useState<Capability[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [tools, setTools] = useState<AgentToolCatalogItem[]>([]);
+  const [lastToolOutcome, setLastToolOutcome] = useState<ToolExecutionOutcomeSummary | null>(null);
+  const [runningTool, setRunningTool] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [agentId, setAgentId] = useState<AgentId>("aria");
   const [prompt, setPrompt] = useState("");
@@ -18,15 +25,22 @@ export function AgentControlView() {
   const [checkedAt, setCheckedAt] = useState("");
   const refresh = useCallback(async (remote = false) => {
     try {
-      const [tasks, capabilities] = await Promise.all([
+      const [tasks, capabilities, toolCatalog] = await Promise.all([
         apiFetchJson<{ tasks: Job[] }>("/api/agent-tasks"),
         apiFetchJson<{ agents: Capability[] }>(
           `/api/agents/capabilities${remote ? "?remote=true" : ""}`
         ),
+        apiFetchJson<{ ok: boolean; tools: AgentToolCatalogItem[] }>(
+          `/api/agents/tools?agentId=${encodeURIComponent(agentId)}`
+        ),
       ]);
-      setJobs(tasks.tasks); setAgents(capabilities.agents); setCheckedAt(new Date().toLocaleTimeString()); setError("");
+      setJobs(tasks.tasks);
+      setAgents(capabilities.agents);
+      setTools(toolCatalog.tools || []);
+      setCheckedAt(new Date().toLocaleTimeString());
+      setError("");
     } catch (e) { setError(e instanceof Error ? e.message : "Brak połączenia."); }
-  }, []);
+  }, [agentId]);
   useEffect(() => {
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
@@ -54,6 +68,24 @@ export function AgentControlView() {
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Błąd anulowania."); }
   }
+  async function runCatalogTool(toolName: string) {
+    setRunningTool(toolName);
+    try {
+      const res = await apiFetchJson<{ ok: boolean; outcome: ToolExecutionOutcomeSummary }>(
+        "/api/agents/tools/execute",
+        {
+          method: "POST",
+          body: JSON.stringify({ tool: toolName, agentId, args: {} }),
+        }
+      );
+      setLastToolOutcome(res.outcome);
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Błąd wywołania narzędzia.");
+    } finally {
+      setRunningTool(null);
+    }
+  }
   return <div className="max-w-6xl mx-auto p-3 sm:p-6 space-y-5" aria-label="Panel sterowania agentami">
     <div className="flex flex-wrap justify-between items-center gap-3">
       <div><h1 className="text-xl sm:text-2xl font-bold">Sterowanie agentami</h1><p className="text-sm text-slate-400">Stan kont, dostęp i rzeczywiste wyniki zadań. Odczyt: {checkedAt || "oczekiwanie"}.</p></div>
@@ -71,10 +103,52 @@ export function AgentControlView() {
           <p>Narzędzia konta: {Object.entries(agent?.linux.tools || {}).filter(([, enabled]) => enabled).map(([name]) => name).join(", ") || "brak potwierdzenia"}</p>
           <p>Repo lokalne: {agent?.linux.repository.read ? "odczyt" : "brak potwierdzenia"}{agent?.linux.repository.write ? " i zapis" : ""}</p>
           <p>GitHub: {agent?.linux.github.state === "verified" ? `${agent.linux.github.read ? "odczyt" : "bez odczytu"}, ${agent.linux.github.push ? "prawo push" : "bez push"}` : "niezweryfikowany"}</p>
-          <p className="text-xs text-slate-400">Model otrzymuje treść zadania. Narzędzia i pliki repozytorium wymagają osobnego wykonawcy.</p>
+          <p className="text-xs text-slate-400">Model otrzymuje treść zadania. W czacie agenci korzystają z autoryzowanego katalogu narzędzi backendu.</p>
         </article>;
       })}
     </div>
+    <section aria-label="Katalog narzędzi agentów" className="p-4 sm:p-5 rounded-xl border border-slate-700 bg-[#111723] space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-lg font-semibold">Autoryzowany katalog narzędzi ({tools.length})</h2>
+        <span className="text-xs text-slate-400 font-mono-tabular">Połączony z MCP + Gemini/Ollama tool-calling</span>
+      </div>
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2.5 text-xs">
+        {tools.map(t => (
+          <div key={t.name} className="p-3 rounded-lg bg-[#0b0f17] border border-slate-800 space-y-1.5 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <strong className="font-mono-tabular text-violet-300 truncate">{t.name}</strong>
+              <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono-tabular shrink-0 ${t.usableNow ? "bg-emerald-950/60 text-emerald-300 border border-emerald-700/50" : "bg-amber-950/60 text-amber-300 border border-amber-700/50"}`}>
+                {t.permission}
+              </span>
+            </div>
+            <p className="text-slate-300 leading-snug">{t.description}</p>
+            <div className="flex items-center justify-between gap-2 pt-1">
+              <span className="text-[11px] text-slate-400 truncate">{t.availabilityNote}</span>
+              {t.permission === "public_diag" && (
+                <button
+                  type="button"
+                  disabled={runningTool === t.name}
+                  onClick={() => void runCatalogTool(t.name)}
+                  className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-600 text-cyan-300 font-mono-tabular shrink-0 disabled:opacity-50"
+                >
+                  {runningTool === t.name ? "..." : "Wykonaj"}
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+      {lastToolOutcome && (
+        <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono-tabular space-y-1">
+          <div className="text-emerald-300 font-semibold">
+            [{lastToolOutcome.status.toUpperCase()}] {lastToolOutcome.tool} ({lastToolOutcome.durationMs} ms) — {lastToolOutcome.summary}
+          </div>
+          <pre className="whitespace-pre-wrap break-words text-[11px] text-slate-300 max-h-40 overflow-y-auto">
+            {JSON.stringify(lastToolOutcome.data ?? { error: lastToolOutcome.error }, null, 2)}
+          </pre>
+        </div>
+      )}
+    </section>
     <form onSubmit={submit} className="p-4 sm:p-5 rounded-xl border border-slate-700 bg-[#111723] space-y-3">
       <h2 className="text-lg font-semibold">Nowe zadanie modelu</h2>
       <div className="grid grid-cols-2 gap-3">

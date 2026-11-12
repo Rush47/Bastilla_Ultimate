@@ -262,21 +262,25 @@ export const InteractiveActionButtonGroup: React.FC<{
     try {
       if (btn.actionType === "exec_root") {
         const cmd = btn.payload;
-        const data = await apiFetchJson<any>("/api/terminal/exec", {
-          method: "POST",
-          body: JSON.stringify({ mode: "LINUX_ROOT", command: cmd }),
-        });
-        if (data.ok) {
-          const out = (data.stdout || data.stderr || "Wykonano pomyślnie (exit=0)").trim();
-          setFeedback({
-            idx,
-            text: out.length > 120 ? out.substring(0, 120) + "..." : out,
-            ok: data.exitCode === 0,
-          });
+        if (onExecuteCommand) {
+          onExecuteCommand(`/exec ${cmd}`);
+          setFeedback({ idx, text: `Wysłano do czatu: ${cmd}`, ok: true });
         } else {
-          setFeedback({ idx, text: data.error || "Błąd wykonania", ok: false });
+          const data = await apiFetchJson<any>("/api/terminal/exec", {
+            method: "POST",
+            body: JSON.stringify({ mode: "LINUX_ROOT", command: cmd }),
+          });
+          if (data.ok) {
+            const out = (data.stdout || data.stderr || "Wykonano pomyślnie (exit=0)").trim();
+            setFeedback({
+              idx,
+              text: out.length > 120 ? out.substring(0, 120) + "..." : out,
+              ok: data.exitCode === 0,
+            });
+          } else {
+            setFeedback({ idx, text: data.error || "Błąd wykonania", ok: false });
+          }
         }
-        onExecuteCommand?.(`/exec ${cmd}`);
       } else if (btn.actionType === "exec_python") {
         const cmd = btn.payload;
         const data = await apiFetchJson<any>("/api/terminal/exec", {
@@ -288,7 +292,6 @@ export const InteractiveActionButtonGroup: React.FC<{
           text: (data.stdout || data.stderr || "Skrypt python wykonany").trim(),
           ok: data.exitCode === 0,
         });
-        onExecuteCommand?.(`/exec python3 -c "${cmd}"`);
       } else if (btn.actionType === "copy_text") {
         navigator.clipboard?.writeText(btn.payload);
         setFeedback({ idx, text: "Skopiowano do schowka", ok: true });
@@ -387,12 +390,10 @@ export const InteractiveCodeSandboxBox: React.FC<{
     setRunning(true);
     try {
       const mode = isPython ? "PYTHON_ROOT" : "LINUX_ROOT";
-      const res = await fetch("/api/terminal/exec", {
+      const data = await apiFetchJson<any>("/api/terminal/exec", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode, command: code }),
       });
-      const data = await res.json();
       if (data.ok) {
         setResult({
           stdout: data.stdout,
@@ -405,11 +406,6 @@ export const InteractiveCodeSandboxBox: React.FC<{
           exitCode: 1,
         });
       }
-      onExecuteCommand?.(
-        isPython
-          ? `/exec python3 -c '${code.replace(/'/g, "'\\''")}'`
-          : `/exec ${code}`
-      );
     } catch (e: any) {
       setResult({
         stderr: e?.message || "Błąd komunikacji z procesem root",
@@ -884,13 +880,16 @@ export const GenerativeComponentRenderer: React.FC<ComponentRendererProps> = ({
             <button
               type="button"
               onClick={async () => {
+                if (onExecuteCommand) {
+                  onExecuteCommand(`/exec ${cmd}`);
+                  return;
+                }
                 try {
                   await apiFetchJson("/api/terminal/exec", {
                     method: "POST",
                     body: JSON.stringify({ mode: "LINUX_ROOT", command: cmd }),
                   });
                 } catch {}
-                onExecuteCommand?.(`/exec ${cmd}`);
               }}
               className="w-full px-2 py-1 rounded bg-violet-600/90 hover:bg-violet-500 text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all shadow-sm active:scale-95"
               title={`Wykonaj w ROOT: ${cmd}`}

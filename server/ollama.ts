@@ -434,99 +434,170 @@ export async function startOllamaDaemon(ollamaBaseUrl: string): Promise<{
 export async function streamOllamaChat(options: {
   ollamaBaseUrl: string;
   model: string;
-  messages: Array<{ role: string; content: string; images?: string[] }>;
+  messages: Array<{ role: string; content: string; images?: string[]; tool_calls?: any[] }>;
   signal: AbortSignal;
   onChunk: (textDelta: string) => void;
+  tools?: any[];
+  onToolCall?: (name: string, args: Record<string, any>) => Promise<Record<string, any>>;
 }): Promise<{ text: string; model: string }> {
   const endpoint = options.ollamaBaseUrl.replace(/\/+$/, "");
   return trackOllamaInference(async () => {
-    const res = await fetch(`${endpoint}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: options.model,
-        stream: true,
-        messages: options.messages,
-      }),
-      signal: options.signal,
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Ollama HTTP ${res.status}: ${errText.slice(0, 200) || res.statusText}`);
-    }
-
-    const contentType = (res.headers.get("content-type") || "").toLowerCase();
-    // Handle single non-streaming JSON object (e.g., gemini-bridge or mock HTTP test servers)
-    if (!res.body || contentType.includes("application/json")) {
-      const body: any = await res.json();
-      if (body?.provider === "gemini-bridge") {
-        throw new Error("Adapter Gemini nie jest lokalnym modelem Ollama.");
-      }
-      const full = String(body?.message?.content || body?.response || "");
-      if (!full) throw new Error("Ollama zwróciła pustą odpowiedź.");
-      options.onChunk(full);
-      return { text: full, model: `ollama/${body?.model || options.model}` };
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let accumulated = "";
+    const conversation = [...options.messages];
     let actualModel = options.model;
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
+    for (let round = 0; round < 3; round++) {
+      const payload: Record<string, any> = {
+        model: options.model,
+        stream: true,
+        messages: conversation,
+      };
+      if (options.tools?.length) {
+        payload.tools = options.tools;
+      }
 
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (!line) continue;
-        let parsed: any;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (parsed?.provider === "gemini-bridge") {
+      const res = await fetch(`${endpoint}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: options.signal,
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`Ollama HTTP ${res.status}: ${errText.slice(0, 200) || res.statusText}`);
+      }
+
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
+      // Handle single non-streaming JSON object (e.g., gemini-bridge or mock HTTP test servers)
+      if (!res.body || contentType.includes("application/json")) {
+        const body: any = await res.json();
+        if (body?.provider === "gemini-bridge") {
           throw new Error("Adapter Gemini nie jest lokalnym modelem Ollama.");
         }
-        if (typeof parsed?.error === "string" && parsed.error) {
-          throw new Error(parsed.error);
+        const toolCalls: any[] = Array.isArray(body?.message?.tool_calls)
+          ? body.message.tool_calls
+          : [];
+        if (toolCalls.length > 0 && options.onToolCall && round < 2) {
+          conversation.push({
+            role: "assistant",
+            content: String(body?.message?.content || ""),
+            tool_calls: toolCalls,
+          });
+          for (const call of toolCalls) {
+            const fnName = String(call?.function?.name || "");
+            const rawArgs = call?.function?.arguments;
+            let fnArgs: Record<string, any> = {};
+            if (rawArgs && typeof rawArgs === "object") {
+              fnArgs = rawArgs;
+            } else if (typeof rawArgs === "string" && rawArgs.trim()) {
+              try { fnArgs = JSON.parse(rawArgs); } catch {}
+            }
+            const toolResult = await options.onToolCall(fnName, fnArgs);
+            conversation.push({
+              role: "tool",
+              content: JSON.stringify(toolResult),
+            });
+          }
+          continue;
         }
-        if (typeof parsed?.model === "string" && parsed.model) {
-          actualModel = parsed.model;
-        }
-        const delta = typeof parsed?.message?.content === "string"
-          ? parsed.message.content
-          : typeof parsed?.response === "string"
-          ? parsed.response
-          : "";
-        if (delta) {
-          accumulated += delta;
-          options.onChunk(delta);
+        const full = String(body?.message?.content || body?.response || "");
+        if (!full) throw new Error("Ollama zwróciła pustą odpowiedź.");
+        options.onChunk(full);
+        return { text: full, model: `ollama/${body?.model || options.model}` };
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let accumulated = "";
+      const collectedToolCalls: any[] = [];
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const rawLine of lines) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          let parsed: any;
+          try {
+            parsed = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (parsed?.provider === "gemini-bridge") {
+            throw new Error("Adapter Gemini nie jest lokalnym modelem Ollama.");
+          }
+          if (typeof parsed?.error === "string" && parsed.error) {
+            throw new Error(parsed.error);
+          }
+          if (typeof parsed?.model === "string" && parsed.model) {
+            actualModel = parsed.model;
+          }
+          if (Array.isArray(parsed?.message?.tool_calls) && parsed.message.tool_calls.length) {
+            collectedToolCalls.push(...parsed.message.tool_calls);
+          }
+          const delta =
+            typeof parsed?.message?.content === "string"
+              ? parsed.message.content
+              : typeof parsed?.response === "string"
+              ? parsed.response
+              : "";
+          if (delta) {
+            accumulated += delta;
+            options.onChunk(delta);
+          }
         }
       }
-    }
 
-    if (buffer.trim()) {
-      try {
-        const parsed = JSON.parse(buffer.trim());
-        const delta = parsed?.message?.content || parsed?.response || "";
-        if (delta) {
-          accumulated += delta;
-          options.onChunk(delta);
+      if (buffer.trim()) {
+        try {
+          const parsed = JSON.parse(buffer.trim());
+          if (Array.isArray(parsed?.message?.tool_calls) && parsed.message.tool_calls.length) {
+            collectedToolCalls.push(...parsed.message.tool_calls);
+          }
+          const delta = parsed?.message?.content || parsed?.response || "";
+          if (delta) {
+            accumulated += delta;
+            options.onChunk(delta);
+          }
+        } catch {}
+      }
+
+      if (collectedToolCalls.length > 0 && options.onToolCall && round < 2) {
+        conversation.push({
+          role: "assistant",
+          content: accumulated,
+          tool_calls: collectedToolCalls,
+        });
+        for (const call of collectedToolCalls) {
+          const fnName = String(call?.function?.name || "");
+          const rawArgs = call?.function?.arguments;
+          let fnArgs: Record<string, any> = {};
+          if (rawArgs && typeof rawArgs === "object") {
+            fnArgs = rawArgs;
+          } else if (typeof rawArgs === "string" && rawArgs.trim()) {
+            try { fnArgs = JSON.parse(rawArgs); } catch {}
+          }
+          const toolResult = await options.onToolCall(fnName, fnArgs);
+          conversation.push({
+            role: "tool",
+            content: JSON.stringify(toolResult),
+          });
         }
-      } catch {}
+        continue;
+      }
+
+      if (!accumulated.trim()) {
+        throw new Error("Ollama zakończyła strumień bez wygenerowania treści.");
+      }
+
+      return { text: accumulated, model: `ollama/${actualModel}` };
     }
 
-    if (!accumulated.trim()) {
-      throw new Error("Ollama zakończyła strumień bez wygenerowania treści.");
-    }
-
-    return { text: accumulated, model: `ollama/${actualModel}` };
+    throw new Error("Ollama przekroczyła limit wywołań narzędzi.");
   });
 }

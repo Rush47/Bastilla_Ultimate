@@ -451,12 +451,30 @@ export class ImageGenerationManager {
     if (!prompt) {
       return { ok: false, engineStatus: "ERROR", error: "Prompt obrazu nie może być pusty." };
     }
-    const mode = input.mode || "generate";
+    const mode = ["generate", "edit", "variation"].includes(String(input.mode))
+      ? (input.mode as "generate" | "edit" | "variation")
+      : "generate";
     const agentId = ["aria", "alex", "astyria", "aurelius"].includes(String(input.agentId))
       ? String(input.agentId)
       : "astyria";
-    const preferred = input.preferredEngine || "auto";
-    const aspectRatio = input.aspectRatio || "1:1";
+    const preferred = ["auto", "comfyui", "local", "gemini"].includes(String(input.preferredEngine))
+      ? (input.preferredEngine as "auto" | "comfyui" | "local" | "gemini")
+      : "auto";
+    const aspectRatio = ["1:1", "3:4", "4:3", "9:16", "16:9"].includes(String(input.aspectRatio))
+      ? String(input.aspectRatio)
+      : "1:1";
+
+    let normalizedSourceBase64 = typeof input.sourceImageBase64 === "string" ? input.sourceImageBase64.trim() : undefined;
+    let normalizedSourceMime = typeof input.sourceMimeType === "string" && input.sourceMimeType.trim()
+      ? input.sourceMimeType.trim()
+      : "image/png";
+    if (normalizedSourceBase64) {
+      const dataUrlMatch = normalizedSourceBase64.match(/^data:([^;]+);base64,([\s\S]+)$/i);
+      if (dataUrlMatch) {
+        normalizedSourceMime = dataUrlMatch[1];
+        normalizedSourceBase64 = dataUrlMatch[2].trim();
+      }
+    }
 
     const status = await this.probeStatus();
     const order: Array<"comfyui" | "local" | "gemini"> =
@@ -502,8 +520,8 @@ export class ImageGenerationManager {
           prompt,
           mode,
           aspectRatio,
-          input.sourceImageBase64,
-          input.sourceMimeType
+          normalizedSourceBase64,
+          normalizedSourceMime
         );
       }
 
@@ -545,11 +563,12 @@ export class ImageGenerationManager {
       };
     } catch (err: any) {
       let rawMsg = String(err?.message || "Generowanie obrazu nie powiodło się.");
+      const jsonCandidate = rawMsg.match(/\{[\s\S]*\}/)?.[0] || rawMsg;
       try {
-        const parsed = JSON.parse(rawMsg);
+        const parsed = JSON.parse(jsonCandidate);
         if (parsed?.error?.message) {
           const code = parsed.error.code;
-          const baseLine = String(parsed.error.message).split("\n")[0];
+          const baseLine = String(parsed.error.message).replace(/\s+/g, " ").trim().slice(0, 220);
           rawMsg =
             code === 429
               ? `Przekroczono limit API obrazów (${status.engines[chosen].model}, HTTP 429) — model wymaga aktywnego limitu/płatnego klucza lub uruchomionego ComfyUI.`

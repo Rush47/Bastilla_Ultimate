@@ -21,8 +21,18 @@ import {
 } from "./server/ollama";
 import { ImageGenerationManager } from "./server/images";
 import {
+  AGENT_TOOL_CATALOG,
+  AgentToolRuntime,
+  buildToolGroundingPrompt,
+  detectUserIntents,
+  toGeminiFunctionDeclarations,
+  toOllamaTools,
+  type ToolExecutionOutcome,
+} from "./server/agent-tools";
+import {
   GoogleGenAI,
   GenerateContentResponse,
+  type FunctionDeclaration,
 } from "@google/genai";
 import {
   SVLSystemKernel,
@@ -66,6 +76,26 @@ function bodyEngine(body: any, requested: string): string {
 
 function shellQuote(value: string) { return "'" + value.replace(/'/g, "'\\''") + "'"; }
 
+function isDestructiveCommand(cmd: string): boolean {
+  return /pkill\s+-f\s+server|killall\s+node|rm\s+-rf\s+\/\s*$|shutdown|reboot|mkfs\.|:\(\)\s*\{/i.test(cmd);
+}
+
+function normalizeInlineImageInput(
+  rawBase64?: string,
+  rawMimeType = "image/jpeg"
+): { base64?: string; mimeType: string } {
+  const mimeFallback = typeof rawMimeType === "string" && rawMimeType.trim() ? rawMimeType.trim() : "image/jpeg";
+  if (typeof rawBase64 !== "string" || !rawBase64.trim()) {
+    return { base64: undefined, mimeType: mimeFallback };
+  }
+  const trimmed = rawBase64.trim();
+  const dataUrlMatch = trimmed.match(/^data:([^;]+);base64,([\s\S]+)$/i);
+  if (dataUrlMatch) {
+    return { base64: dataUrlMatch[2].trim(), mimeType: dataUrlMatch[1].trim() || mimeFallback };
+  }
+  return { base64: trimmed, mimeType: mimeFallback };
+}
+
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY;
   if (!key || key === "MY_GEMINI_API_KEY" || key.trim() === "") {
@@ -101,6 +131,7 @@ function getGeminiCandidateModels(): string[] {
   const candidates = [
     ...(configured ? [configured] : []),
     "gemini-3.1-flash-lite",
+    "gemini-4-hydrogen",
     "gemini-2.5-flash",
     "gemini-3.8-flash",
     "gemini-flash-latest",
@@ -149,10 +180,20 @@ function sanitizeConversationHistory(
   return filtered;
 }
 
+export interface GeminiToolLoopConfig {
+  functionDeclarations?: FunctionDeclaration[];
+  executeToolCall?: (
+    name: string,
+    args: Record<string, any>
+  ) => Promise<ToolExecutionOutcome>;
+  onToolEvent?: (outcome: ToolExecutionOutcome) => void;
+}
+
 async function runLiveMultimodalModel(
   contents: any[],
   signal?: AbortSignal,
-  systemInstruction?: string
+  systemInstruction?: string,
+  toolLoop?: GeminiToolLoopConfig
 ): Promise<{ text: string; modelUsed: string }> {
   const ai = getGeminiClient();
   if (!ai) {
@@ -164,16 +205,50 @@ async function runLiveMultimodalModel(
   let lastError: any = null;
   for (const modelUsed of candidates) {
     try {
-      const config: any = {};
-      if (signal) config.abortSignal = signal;
-      if (systemInstruction) config.systemInstruction = systemInstruction;
-      const response: GenerateContentResponse = await ai.models.generateContent({
-        model: modelUsed,
-        contents,
-        config: Object.keys(config).length ? config : undefined,
-      });
-      if (!response.text?.trim()) throw new Error("Gemini zwrócił pustą odpowiedź.");
-      return { text: response.text, modelUsed };
+      const turnContents = [...contents];
+      for (let hop = 0; hop < 4; hop++) {
+        const config: any = {};
+        if (signal) config.abortSignal = signal;
+        if (systemInstruction) config.systemInstruction = systemInstruction;
+        if (toolLoop?.functionDeclarations?.length) {
+          config.tools = [{ functionDeclarations: toolLoop.functionDeclarations }];
+        }
+        const response: GenerateContentResponse = await ai.models.generateContent({
+          model: modelUsed,
+          contents: turnContents,
+          config: Object.keys(config).length ? config : undefined,
+        });
+        const calls = response.functionCalls;
+        const previousContent = response.candidates?.[0]?.content;
+        if (calls && calls.length > 0 && toolLoop?.executeToolCall && previousContent && hop < 3) {
+          turnContents.push(previousContent);
+          const responseParts: any[] = [];
+          for (const call of calls) {
+            const outcome = await toolLoop.executeToolCall(
+              String(call.name || ""),
+              (call.args as Record<string, any>) || {}
+            );
+            toolLoop.onToolEvent?.(outcome);
+            responseParts.push({
+              functionResponse: {
+                id: call.id,
+                name: String(call.name || ""),
+                response: {
+                  status: outcome.status,
+                  summary: outcome.summary,
+                  data: outcome.data,
+                  error: outcome.error,
+                },
+              },
+            });
+          }
+          turnContents.push({ role: "user", parts: responseParts });
+          continue;
+        }
+        if (!response.text?.trim()) throw new Error("Gemini zwrócił pustą odpowiedź.");
+        return { text: response.text, modelUsed };
+      }
+      throw new Error("Przekroczono limit wywołań narzędzi Gemini.");
     } catch (err: any) {
       lastError = err;
       const msg = String(err?.message || err || "");
@@ -191,7 +266,8 @@ async function streamLiveMultimodalModel(
   contents: any[],
   signal: AbortSignal,
   onChunk: (delta: string) => void,
-  systemInstruction?: string
+  systemInstruction?: string,
+  toolLoop?: GeminiToolLoopConfig
 ): Promise<{ text: string; modelUsed: string }> {
   const ai = getGeminiClient();
   if (!ai) {
@@ -203,26 +279,79 @@ async function streamLiveMultimodalModel(
   let lastError: any = null;
   for (const modelUsed of candidates) {
     try {
-      const config: any = { abortSignal: signal };
-      if (systemInstruction) config.systemInstruction = systemInstruction;
-      const stream = await ai.models.generateContentStream({
-        model: modelUsed,
-        contents,
-        config,
-      });
-      let accumulated = "";
-      for await (const chunk of stream) {
-        if (signal.aborted) break;
-        const partText = chunk.text || "";
-        if (partText) {
-          accumulated += partText;
-          onChunk(partText);
+      const turnContents = [...contents];
+      for (let hop = 0; hop < 4; hop++) {
+        const config: any = { abortSignal: signal };
+        if (systemInstruction) config.systemInstruction = systemInstruction;
+        if (toolLoop?.functionDeclarations?.length) {
+          config.tools = [{ functionDeclarations: toolLoop.functionDeclarations }];
         }
+        const stream = await ai.models.generateContentStream({
+          model: modelUsed,
+          contents: turnContents,
+          config,
+        });
+        let accumulated = "";
+        const calls: Array<{ id?: string; name?: string; args?: Record<string, any> }> = [];
+        const modelParts: any[] = [];
+
+        for await (const chunk of stream) {
+          if (signal.aborted) break;
+          const cParts = chunk.candidates?.[0]?.content?.parts;
+          if (Array.isArray(cParts)) {
+            for (const p of cParts) {
+              if (p.functionCall) {
+                modelParts.push(p);
+                calls.push({
+                  id: p.functionCall.id,
+                  name: p.functionCall.name,
+                  args: (p.functionCall.args as Record<string, any>) || {},
+                });
+              }
+            }
+          }
+          const partText = chunk.text || "";
+          if (partText) {
+            accumulated += partText;
+            onChunk(partText);
+          }
+        }
+
+        if (calls.length > 0 && toolLoop?.executeToolCall && hop < 3 && !signal.aborted) {
+          turnContents.push({
+            role: "model",
+            parts: accumulated ? [{ text: accumulated }, ...modelParts] : modelParts,
+          });
+          const responseParts: any[] = [];
+          for (const call of calls) {
+            const outcome = await toolLoop.executeToolCall(
+              String(call.name || ""),
+              call.args || {}
+            );
+            toolLoop.onToolEvent?.(outcome);
+            responseParts.push({
+              functionResponse: {
+                id: call.id,
+                name: String(call.name || ""),
+                response: {
+                  status: outcome.status,
+                  summary: outcome.summary,
+                  data: outcome.data,
+                  error: outcome.error,
+                },
+              },
+            });
+          }
+          turnContents.push({ role: "user", parts: responseParts });
+          continue;
+        }
+
+        if (!accumulated.trim()) {
+          throw new Error("Gemini zwrócił pustą odpowiedź strumieniową.");
+        }
+        return { text: accumulated, modelUsed };
       }
-      if (!accumulated.trim()) {
-        throw new Error("Gemini zwrócił pustą odpowiedź strumieniową.");
-      }
-      return { text: accumulated, modelUsed };
+      throw new Error("Przekroczono limit wywołań narzędzi Gemini.");
     } catch (err: any) {
       lastError = err;
       const msg = String(err?.message || err || "");
@@ -290,7 +419,7 @@ function startRootEscalationSocket() {
         const cmd = String(req.command || "id");
         const cwd = String(req.cwd || PROJECT_ROOT);
 
-        if (/pkill\s+-f\s+server|killall\s+node|rm\s+-rf\s+\/\s*$/i.test(cmd)) {
+        if (isDestructiveCommand(cmd)) {
           conn.end(
             JSON.stringify({
               stdout: "",
@@ -478,11 +607,17 @@ for offset in range(0, len(data), 16):
     ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
     print(f"{offset:08X}  {hex_left:<23}  {hex_right:<23}  |{ascii_str:<16}|")
 `;
-    const out = await execFileAsync("python3", ["-c", binInspectorPy, targetFile], {
-      timeout: 8000,
-    });
-    stdout = out.stdout;
-    stderr = out.stderr;
+    try {
+      const out = await execFileAsync("python3", ["-c", binInspectorPy, targetFile], {
+        timeout: 8000,
+      });
+      stdout = out.stdout;
+      stderr = out.stderr;
+    } catch (e: any) {
+      stdout = e.stdout || "";
+      stderr = e.stderr || e.message || "";
+      exitCode = typeof e.code === "number" ? e.code : 1;
+    }
   } else if (mode === "AI_CLI") {
     try {
       const out = await execAsync(command, {
@@ -534,20 +669,46 @@ async function startServer() {
   // Tool calls additionally require a matching operator token; cookies alone
   // are intentionally insufficient for invoking tools.
   const mcp = new MCPServerManager(PROJECT_ROOT, DB_PATH);
+
+  const extractOperatorToken = (req: express.Request): string | undefined => {
+    const bearer = req.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+    if (bearer) return bearer;
+    const cookie =
+      req.headers.cookie
+        ?.split(";")
+        .map((x) => x.trim())
+        .find((x) => x.startsWith("bastilla_access="))
+        ?.slice(16) || "";
+    try {
+      return cookie ? decodeURIComponent(cookie) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const isOperatorAuthorized = (req: express.Request): boolean => {
+    const configuredToken = process.env.BASTILLA_API_TOKEN || "";
+    if (!configuredToken) return true; // installApiSecurity already enforced local/preview origin check
+    const supplied = extractOperatorToken(req);
+    return Boolean(supplied && supplied === configuredToken);
+  };
+
+  const buildMcpStatusSnapshot = () => ({
+    ok: true,
+    configured: Boolean(process.env.BASTILLA_API_TOKEN),
+    transport: "http-jsonrpc-subset",
+    endpoint: "/api/mcp",
+    tools: mcp.listTools().tools.map((tool) => tool.name),
+    clientConnected: false,
+    codexLoginVerified: false,
+    deployment: process.env.NODE_ENV === "production" ? "production" : "development",
+    warning: "Endpoint availability does not prove that AI Studio or Codex can connect.",
+  });
+
   // Non-secret diagnostic metadata. API security middleware still applies.
   // Do not advertise an MCP connection until a client has actually called it.
   app.get("/api/mcp/status", (_req, res) => {
-    res.json({
-      ok: true,
-      configured: Boolean(process.env.BASTILLA_API_TOKEN),
-      transport: "http-jsonrpc-subset",
-      endpoint: "/api/mcp",
-      tools: mcp.listTools().tools.map(tool => tool.name),
-      clientConnected: false,
-      codexLoginVerified: false,
-      deployment: process.env.NODE_ENV === "production" ? "production" : "development",
-      warning: "Endpoint availability does not prove that AI Studio or Codex can connect.",
-    });
+    res.json(buildMcpStatusSnapshot());
   });
   app.post("/api/mcp", (req, res) => {
     const message = req.body;
@@ -620,6 +781,164 @@ async function startServer() {
         sseClients.delete(client);
       }
     }
+  };
+
+  const getAgentsHealthSnapshot = async (filterAgentId?: string) => {
+    const caps = await agentAccess(PROJECT_ROOT, queue, false);
+    const pyScript = `
+import json, os, pwd, sqlite3, subprocess, sys
+from datetime import datetime, timezone
+
+db_path = sys.argv[1]
+target = sys.argv[2] if len(sys.argv) > 2 else ""
+agent_ids = [target] if target in ("aria", "alex", "astyria", "aurelius") else ["aria", "alex", "astyria", "aurelius"]
+
+db_rows = {}
+if os.path.exists(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    for row in conn.execute("SELECT id, display_name, linux_user, home_dir, uid, gid, status, pid, last_heartbeat, cycle_count FROM agents").fetchall():
+        db_rows[row["id"]] = dict(row)
+    conn.close()
+
+out = []
+for a in agent_ids:
+    try:
+        pw = pwd.getpwnam(a)
+        uid, gid, home = pw.pw_uid, pw.pw_gid, pw.pw_dir
+    except KeyError:
+        uid, gid, home = -1, -1, f"/home/{a}"
+    try:
+        pids = subprocess.check_output(f"pgrep -u {a} -f 'agent_worker.py {a}([ ]|$)' || true", shell=True, timeout=2).decode().splitlines()
+    except Exception:
+        pids = []
+    pid = int(pids[0]) if pids and pids[0].isdigit() else 0
+    worker_status = {}
+    status_path = f"/home/{a}/worker_status.json"
+    if os.path.exists(status_path):
+        try:
+            with open(status_path) as f:
+                worker_status = json.load(f)
+        except Exception:
+            worker_status = {}
+    heartbeat_valid = False
+    try:
+        if isinstance(worker_status, dict) and worker_status.get("last_heartbeat"):
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(worker_status["last_heartbeat"])).total_seconds()
+            heartbeat_valid = 0 <= age < 20 and worker_status.get("pid") == pid
+    except Exception:
+        pass
+    out.append({
+        "id": a,
+        "uid": uid,
+        "gid": gid,
+        "home": home,
+        "pid": pid,
+        "running": pid > 0 and heartbeat_valid,
+        "worker_status": worker_status if isinstance(worker_status, dict) else {},
+        "sqlite_record": db_rows.get(a)
+    })
+print(json.dumps({"agents": out, "checkedAt": datetime.now(timezone.utc).isoformat()}))
+`;
+    const liveData = await querySqliteJson(pyScript, [filterAgentId || ""]);
+    const capMap = new Map(caps.map((c: any) => [c.id, c]));
+    return {
+      checkedAt: liveData?.checkedAt || new Date().toISOString(),
+      agents: (liveData?.agents || []).map((a: any) => ({
+        ...a,
+        capabilities: capMap.get(a.id) || null,
+      })),
+    };
+  };
+
+  const getSystemDiagnosticsSnapshot = async () => {
+    const pyScript = `
+import json, os, subprocess, sys
+def cmd(c):
+    try:
+        return subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT, timeout=3).decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+meminfo = {}
+if os.path.exists("/proc/meminfo"):
+    with open("/proc/meminfo") as f:
+        for line in f:
+            parts = line.split(":")
+            if len(parts) == 2:
+                meminfo[parts[0].strip()] = parts[1].strip()
+disk_df = cmd("df -h / | tail -n 1").split()
+print(json.dumps({
+    "uname": cmd("uname -srmo"),
+    "loadavg": cmd("cat /proc/loadavg").split()[:3],
+    "uptime_sec": float(cmd("cat /proc/uptime").split()[0] or 0),
+    "meminfo": {
+        "total": meminfo.get("MemTotal", "N/A"),
+        "available": meminfo.get("MemAvailable", "N/A"),
+        "free": meminfo.get("MemFree", "N/A"),
+    },
+    "disk": {
+        "size": disk_df[1] if len(disk_df) > 1 else "N/A",
+        "used": disk_df[2] if len(disk_df) > 2 else "N/A",
+        "avail": disk_df[3] if len(disk_df) > 3 else "N/A",
+        "use_pct": disk_df[4] if len(disk_df) > 4 else "N/A",
+    },
+    "git_branch": cmd("git rev-parse --abbrev-ref HEAD"),
+    "git_head": cmd("git rev-parse --short HEAD"),
+}))
+`;
+    const [host, codexStatus] = await Promise.all([
+      querySqliteJson(pyScript, []),
+      codexAuth.status(),
+    ]);
+    return {
+      ...host,
+      codex: codexStatus,
+      checkedAt: new Date().toISOString(),
+    };
+  };
+
+  const toolRuntime = new AgentToolRuntime({
+    probeOllama: () => probeOllamaStatus(getOllamaBaseUrl()),
+    getMcpStatus: async () => buildMcpStatusSnapshot(),
+    probeImageEngines: () => imageManager.probeStatus(),
+    generateImage: (args) => imageManager.generate(args),
+    getAgentsHealth: (agentId) => getAgentsHealthSnapshot(agentId),
+    getSystemDiagnostics: () => getSystemDiagnosticsSnapshot(),
+    mcpManager: mcp,
+    executeTerminal: (mode, command, agentId) =>
+      executeTerminalCommandInternal(mode, command, agentId),
+  });
+
+  const applyImageOutcomeToReplyText = (
+    text: string,
+    outcomes: ToolExecutionOutcome[]
+  ): { text: string; addedSuffix: string } => {
+    let next = text;
+    let addedSuffix = "";
+    const imageOutcome = outcomes.find(
+      (o) => o.tool === "generate_image" && o.status === "executed" && o.data?.image
+    );
+    if (imageOutcome?.data?.image) {
+      const img = imageOutcome.data.image;
+      const expectedUrl = `/api/images/file/${img.id}`;
+      const hasBlock =
+        next.includes(expectedUrl) && /```image\s*\n[\s\S]*?```/i.test(next);
+      if (!hasBlock) {
+        const block = `\n\n\`\`\`image\n${JSON.stringify({
+          url: expectedUrl,
+          prompt: img.prompt,
+          source: img.source,
+          model: img.model,
+          aspectRatio: imageOutcome.data.aspectRatio || "1:1",
+        })}\n\`\`\``;
+        next = `${next}${block}`;
+        addedSuffix = block;
+      }
+    } else if (outcomes.some((o) => o.tool === "generate_image" && o.status !== "executed")) {
+      // Never leak a fabricated ```image``` block if real generation failed.
+      next = next.replace(/```image\s*\n[\s\S]*?```/gi, "").trim();
+    }
+    return { text: next, addedSuffix };
   };
 
   app.get("/api/events/stream", (req, res) => {
@@ -755,7 +1074,8 @@ conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
         preferredEngine = "auto",
         aspectRatio = "1:1",
         sourceImageBase64,
-        sourceMimeType = "image/png",
+        sourceMimeType,
+        sourceImageMimeType,
         sessionId = "bastilla-main",
         saveToChat = true,
       } = req.body || {};
@@ -773,7 +1093,7 @@ conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
         preferredEngine,
         aspectRatio,
         sourceImageBase64,
-        sourceMimeType,
+        sourceMimeType: sourceMimeType || sourceImageMimeType || "image/png",
       });
 
       if (!result.ok || !result.image) {
@@ -895,22 +1215,6 @@ print(json.dumps({"results": rows}))`);
     }
   });
 
-  const extractOperatorToken = (req: express.Request): string | undefined => {
-    const bearer = req.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
-    if (bearer) return bearer;
-    const cookie =
-      req.headers.cookie
-        ?.split(";")
-        .map((x) => x.trim())
-        .find((x) => x.startsWith("bastilla_access="))
-        ?.slice(16) || "";
-    try {
-      return cookie ? decodeURIComponent(cookie) : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-
   app.get("/api/codex/tasks", (req, res) => {
     try {
       const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : undefined;
@@ -947,6 +1251,7 @@ print(json.dumps({"results": rows}))`);
   app.post("/api/codex/tasks/:id/start", (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    if (!codexTasks.getTaskById(id)) return res.status(404).json({ ok: false, error: "Nie znaleziono zadania Codex CLI." });
     codexTasks.startTask(id, typeof req.body?.stdin === "string" ? req.body.stdin : undefined);
     res.json({ ok: true, task: codexTasks.getTaskById(id) });
   });
@@ -954,6 +1259,7 @@ print(json.dumps({"results": rows}))`);
   app.post("/api/codex/tasks/:id/cancel", (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    if (!codexTasks.getTaskById(id)) return res.status(404).json({ ok: false, error: "Nie znaleziono zadania Codex CLI." });
     codexTasks.cancelTask(id);
     res.json({ ok: true, task: codexTasks.getTaskById(id) });
   });
@@ -961,6 +1267,7 @@ print(json.dumps({"results": rows}))`);
   app.post("/api/codex/tasks/:id/retry", (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    if (!codexTasks.getTaskById(id)) return res.status(404).json({ ok: false, error: "Nie znaleziono zadania Codex CLI." });
     codexTasks.retryTask(id);
     res.json({ ok: true, task: codexTasks.getTaskById(id) });
   });
@@ -976,25 +1283,26 @@ print(json.dumps({"results": rows}))`);
       Connection: "keep-alive",
     });
 
+    const safeWrite = (eventName: string, payload: unknown) => {
+      if (res.writableEnded) return;
+      try {
+        res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+      } catch {}
+    };
+
     const initial = codexTasks.getTaskById(id);
     if (initial) {
-      res.write(`event: init\ndata: ${JSON.stringify(initial)}\n\n`);
+      safeWrite("init", initial);
     }
 
     const onUpdate = (payload: any) => {
-      if (payload?.taskId === id) {
-        res.write(`event: data\ndata: ${JSON.stringify(payload)}\n\n`);
-      }
+      if (payload?.taskId === id) safeWrite("data", payload);
     };
     const onData = (payload: any) => {
-      if (payload?.taskId === id) {
-        res.write(`event: data\ndata: ${JSON.stringify(payload)}\n\n`);
-      }
+      if (payload?.taskId === id) safeWrite("data", payload);
     };
     const onComplete = (payload: any) => {
-      if (payload?.taskId === id) {
-        res.write(`event: complete\ndata: ${JSON.stringify(payload)}\n\n`);
-      }
+      if (payload?.taskId === id) safeWrite("complete", payload);
     };
 
     codexTasks.on("update", onUpdate);
@@ -1037,6 +1345,47 @@ print(json.dumps({"results": rows}))`);
   app.get("/api/agents/capabilities", async (req, res) => {
     try { res.json({ ok: true, agents: await agentAccess(PROJECT_ROOT, queue, req.query.remote === "true") }); }
     catch { res.status(500).json({ ok: false, error: "Błąd diagnostyki agentów." }); }
+  });
+
+  app.get("/api/agents/tools", async (req, res) => {
+    try {
+      const agentId = typeof req.query.agentId === "string" ? req.query.agentId : "aria";
+      const catalog = await toolRuntime.listCatalog({
+        agentId,
+        operatorToken: extractOperatorToken(req),
+        authorizedOperator: isOperatorAuthorized(req),
+      });
+      res.json(catalog);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd katalogu narzędzi." });
+    }
+  });
+
+  app.post("/api/agents/tools/execute", async (req, res) => {
+    try {
+      const { tool = "", args = {}, agentId = "aria" } = req.body || {};
+      if (typeof tool !== "string" || !tool.trim()) {
+        return res.status(400).json({ ok: false, error: "Podaj nazwę narzędzia (tool)." });
+      }
+      const outcome = await toolRuntime.executeTool(
+        tool.trim(),
+        args && typeof args === "object" ? args : {},
+        {
+          agentId: String(agentId || "aria"),
+          operatorToken: extractOperatorToken(req),
+          authorizedOperator: isOperatorAuthorized(req),
+        }
+      );
+      const statusCode =
+        outcome.status === "denied"
+          ? 403
+          : outcome.status === "unavailable" && /Nieznane narzędzie/.test(outcome.summary)
+          ? 404
+          : 200;
+      res.status(statusCode).json({ ok: outcome.status === "executed", outcome });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd wykonania narzędzia." });
+    }
   });
 
   // 1. Live System, Linux Kernel, SVL Core & SQLite State Overview
@@ -1272,27 +1621,46 @@ print(json.dumps({
       const { xStart, xEnd, token, newOperatorName, customPython } = req.body || {};
 
       if (customPython && typeof customPython === "string") {
-        const { stdout, stderr } = await execFileAsync(
-          "python3",
-          ["-c", customPython],
-          {
-            timeout: 8000,
-            env: {
-              ...process.env,
-              PYTHONPATH: process.env.PYTHONPATH,
-            },
-          }
-        );
+        if (isDestructiveCommand(customPython)) {
+          return res.status(400).json({
+            ok: false,
+            error: "Zablokowano destrukcyjny kod Python mogący zatrzymać serwer.",
+          });
+        }
+        let stdout = "";
+        let stderr = "";
+        let exitCode = 0;
+        try {
+          const out = await execFileAsync(
+            "python3",
+            ["-c", customPython],
+            {
+              timeout: 8000,
+              env: {
+                ...process.env,
+                PYTHONPATH: process.env.PYTHONPATH,
+              },
+            }
+          );
+          stdout = out.stdout;
+          stderr = out.stderr;
+        } catch (e: any) {
+          stdout = e.stdout || "";
+          stderr = e.stderr || e.message || "";
+          exitCode = typeof e.code === "number" ? e.code : 1;
+        }
+        stdout = redact(stdout);
+        stderr = redact(stderr);
         await querySqliteJson(
           `import sqlite3, sys, json
 from datetime import datetime, timezone
 conn = sqlite3.connect(sys.argv[1])
 conn.execute("INSERT INTO task_history (title, assigned_agent, terminal_type, command_or_prompt, output_summary, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  ("SVL Kernel Execution", "aria", "PYTHON_ROOT", sys.argv[2][:200], sys.argv[3][:400], "COMPLETED", datetime.now(timezone.utc).isoformat()))
+  ("SVL Kernel Execution", "aria", "PYTHON_ROOT", sys.argv[2][:200], sys.argv[3][:400], sys.argv[4], datetime.now(timezone.utc).isoformat()))
 conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
-          [customPython, stdout || stderr || "OK"]
+          [redact(customPython), stdout || stderr || "OK", exitCode === 0 ? "COMPLETED" : "ERROR"]
         );
-        return res.json({ ok: true, stdout, stderr });
+        return res.json({ ok: exitCode === 0, stdout, stderr, exitCode });
       }
 
       const pyEval = `
@@ -1363,7 +1731,7 @@ print(json.dumps(report, indent=4, ensure_ascii=False, allow_nan=False))
       return res.status(400).json({ ok: false, error: "Brak polecenia do wykonania." });
     }
 
-    if (/pkill\s+-f\s+server|killall\s+node|rm\s+-rf\s+\/\s*$/i.test(command)) {
+    if (isDestructiveCommand(command)) {
       return res.status(400).json({
         ok: false,
         error: "Zablokowano destrukcyjne polecenie mogące zatrzymać proces serwera głównego.",
@@ -1440,16 +1808,34 @@ Zwróć TYLKO czyste polecenie, bez formatowania markdown, bez cudzysłowów, be
 Polecenie użytkownika: "${prompt.trim()}"`;
 
         try {
-          const ollamaRes = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
+          const ollamaEndpoint = getOllamaBaseUrl();
+          const preferredOllamaModel = process.env.OLLAMA_MODEL || "llama3.2-vision:11b";
+          let ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              model: process.env.OLLAMA_MODEL || "llama3.2-vision:11b",
+              model: preferredOllamaModel,
               stream: false,
               messages: [{ role: "user", content: translationPrompt }],
             }),
             signal: AbortSignal.timeout(15000),
           });
+          if (ollamaRes.status === 404) {
+            const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+            const altModel = pickPreferredOllamaModel(liveOllama.models, { multimodal: false });
+            if (altModel && altModel !== preferredOllamaModel) {
+              ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  model: altModel,
+                  stream: false,
+                  messages: [{ role: "user", content: translationPrompt }],
+                }),
+                signal: AbortSignal.timeout(15000),
+              });
+            }
+          }
           if (ollamaRes.ok) {
             const data: any = await ollamaRes.json();
             generatedCmd = (data?.message?.content || "")
@@ -1478,6 +1864,13 @@ Polecenie użytkownika: "${prompt.trim()}"`;
 
       if (!generatedCmd) {
         return res.status(503).json({ ok: false, error: "Model nie zwrócił polecenia." });
+      }
+
+      if (isDestructiveCommand(generatedCmd)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Zablokowano destrukcyjne polecenie mogące zatrzymać proces serwera głównego.",
+        });
       }
 
       // Shell shortcuts remain executable when the selected interpreter is Python.
@@ -1556,6 +1949,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
       imageBase64?: string;
       imageMimeType?: string;
       saveToDb: boolean;
+      isGetRequest?: boolean;
     }
   ) {
     const {
@@ -1563,10 +1957,15 @@ Polecenie użytkownika: "${prompt.trim()}"`;
       message = "",
       enginePreference = "auto",
       sessionId = "bastilla-main",
-      imageBase64,
-      imageMimeType = "image/jpeg",
+      imageBase64: rawImageBase64,
+      imageMimeType: rawImageMimeType = "image/jpeg",
       saveToDb = false,
+      isGetRequest = false,
     } = params;
+    const { base64: imageBase64, mimeType: imageMimeType } = normalizeInlineImageInput(
+      rawImageBase64,
+      rawImageMimeType
+    );
 
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -1587,7 +1986,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
     try {
       writeEvent({ type: "start", agentId, enginePreference });
 
-      if (/^\/(exec|root|sudo|bash)\s+/i.test(message.trim())) {
+      if (/^\/(exec|root|sudo|bash)(?:\s+|$)/i.test(message.trim()) && isGetRequest) {
         writeEvent({ type: "error", error: "Polecenia wymagają POST /api/terminal/exec." });
         return res.end();
       }
@@ -1608,16 +2007,115 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
       );
       const priorTurns = sanitizeConversationHistory(historyData?.history || []);
 
+      const intentInfo = detectUserIntents(message, { hasImage: Boolean(imageBase64) });
+      const operatorToken = extractOperatorToken(req);
+      const authorizedOperator = isOperatorAuthorized(req);
+      const allowMutatingTools = !isGetRequest;
+      const executedOutcomes: ToolExecutionOutcome[] = [];
+      const outcomeCache = new Map<string, ToolExecutionOutcome>();
+
+      const executeAndRecordTool = async (
+        name: string,
+        args: Record<string, any> = {}
+      ): Promise<ToolExecutionOutcome> => {
+        const key = `${name}:${JSON.stringify(args || {})}`;
+        const cached = outcomeCache.get(key);
+        if (cached) return cached;
+
+        let outcome: ToolExecutionOutcome;
+        if (
+          !allowMutatingTools &&
+          (name === "terminal_exec_authorized" || name === "generate_image")
+        ) {
+          outcome = {
+            tool: name,
+            source: name === "generate_image" ? "image_engine" : "terminal",
+            permission: name === "generate_image" ? "operator_auth" : "privileged_exec",
+            status: "denied",
+            summary: `Narzędzie ${name} wymaga żądania POST (odmowa na GET SSE).`,
+            data: null,
+            error: "Polecenia wykonawcze i generowanie obrazów wymagają żądania POST.",
+            executedAt: new Date().toISOString(),
+            durationMs: 0,
+          };
+        } else {
+          outcome = await toolRuntime.executeTool(name, args, {
+            agentId,
+            operatorToken,
+            authorizedOperator,
+          });
+        }
+        outcomeCache.set(key, outcome);
+        executedOutcomes.push(outcome);
+        writeEvent({ type: "tool_result", outcome });
+        if (outcome.tool === "generate_image" && outcome.status === "executed" && outcome.data?.image) {
+          broadcastSystemEvent("images", { id: outcome.data.image.id, status: "completed" });
+        }
+        return outcome;
+      };
+
+      for (const suggested of intentInfo.suggestedTools) {
+        if (abortController.signal.aborted) return res.end();
+        if (!allowMutatingTools && suggested.name === "terminal_exec_authorized") {
+          continue;
+        }
+        await executeAndRecordTool(suggested.name, suggested.args);
+      }
+
+      const trimmedCmdMsg = message.trim();
+      const slashTermMatch = !isGetRequest
+        ? trimmedCmdMsg.match(/^\/(exec|root|sudo|bash)(?:\s+([\s\S]+))?$/i)
+        : null;
+
       let fullText = "";
       let engineUsed = "";
+      let overrideArtifactTitle = "";
+      let overrideArtifactCode = "";
+
+      if (slashTermMatch) {
+        const rawCmd = (slashTermMatch[2] || "").trim();
+        if (!rawCmd) {
+          writeEvent({
+            type: "error",
+            error: "Podaj polecenie po /exec (np. /exec id && uname -a).",
+          });
+          return res.end();
+        }
+        const termOutcome = await executeAndRecordTool("terminal_exec_authorized", {
+          command: rawCmd,
+        });
+        if (termOutcome.status === "executed" && termOutcome.data) {
+          const { stdout = "", stderr = "", exitCode = 0 } = termOutcome.data;
+          fullText = `[SERVER uid=${process.getuid?.()} gid=${process.getgid?.()} · exit=${exitCode}]\n$ ${rawCmd}\n\n${(
+            stdout ||
+            stderr ||
+            "Polecenie wykonane pomyślnie (exit=0, brak wyjścia)."
+          ).trim()}`;
+          engineUsed = `server-process (uid=${process.getuid?.()}/gid=${process.getgid?.()})`;
+          overrideArtifactTitle = `Wynik ROOT: ${rawCmd.substring(0, 40)}`;
+          overrideArtifactCode = rawCmd;
+          writeEvent({ type: "chunk", text: fullText });
+        } else {
+          writeEvent({
+            type: "error",
+            error: termOutcome.error || termOutcome.summary || "Błąd wykonania polecenia.",
+          });
+          return res.end();
+        }
+      }
+
+      const hasToolsOrIntents = intentInfo.intents.length > 0 || executedOutcomes.length > 0;
+      const groundingPrompt = buildToolGroundingPrompt(executedOutcomes, AGENT_TOOL_CATALOG);
+
       const targetModel = imageBase64
         ? "llama3.2-vision:11b"
         : enginePreference === "auto" || enginePreference === "ollama"
         ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b"
         : enginePreference;
 
-      if (enginePreference !== "gemini") {
-        const ollamaMessages = [
+      if (!fullText && enginePreference !== "gemini") {
+        const ollamaMessages: Array<{ role: string; content: string; images?: string[] }> = [
+          ...(hasToolsOrIntents ? [{ role: "system", content: groundingPrompt }] : []),
           ...priorTurns.map((h) => ({
             role: h.sender_role === "user" ? "user" : "assistant",
             content: h.content,
@@ -1629,6 +2127,20 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           },
         ];
         const ollamaEndpoint = getOllamaBaseUrl();
+        const ollamaToolOpt = hasToolsOrIntents
+          ? {
+              tools: toOllamaTools(AGENT_TOOL_CATALOG),
+              onToolCall: async (name: string, args: Record<string, any>) => {
+                const resOutcome = await executeAndRecordTool(name, args);
+                return {
+                  status: resOutcome.status,
+                  summary: resOutcome.summary,
+                  data: resOutcome.data,
+                  error: resOutcome.error,
+                };
+              },
+            }
+          : {};
         try {
           const timeoutSignal = AbortSignal.timeout(45000);
           const combinedSignal = AbortSignal.any([abortController.signal, timeoutSignal]);
@@ -1637,6 +2149,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
             model: targetModel,
             messages: ollamaMessages,
             signal: combinedSignal,
+            ...ollamaToolOpt,
             onChunk: (delta) => {
               writeEvent({ type: "chunk", text: redact(delta) });
             },
@@ -1660,6 +2173,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
                   model: altModel,
                   messages: ollamaMessages,
                   signal: AbortSignal.any([abortController.signal, AbortSignal.timeout(45000)]),
+                  ...ollamaToolOpt,
                   onChunk: (delta) => {
                     writeEvent({ type: "chunk", text: redact(delta) });
                   },
@@ -1684,13 +2198,18 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         parts.push({ text: message || "Przeanalizuj załączony obraz." });
         contents.push({ role: "user", parts });
 
+        const combinedSystemInstruction = `${buildAgentSystemInstruction(agentId)}\n\n${groundingPrompt}`;
         const streamedGemini = await streamLiveMultimodalModel(
           contents,
           abortController.signal,
           (delta) => {
             writeEvent({ type: "chunk", text: redact(delta) });
           },
-          buildAgentSystemInstruction(agentId)
+          combinedSystemInstruction,
+          {
+            functionDeclarations: toGeminiFunctionDeclarations(AGENT_TOOL_CATALOG),
+            executeToolCall: executeAndRecordTool,
+          }
         );
         fullText = streamedGemini.text;
         engineUsed =
@@ -1703,15 +2222,23 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         return res.end();
       }
 
+      const adjusted = applyImageOutcomeToReplyText(fullText, executedOutcomes);
+      fullText = adjusted.text;
+      if (adjusted.addedSuffix) {
+        writeEvent({ type: "chunk", text: adjusted.addedSuffix });
+      }
+
       let userMessageRecord: any = undefined;
       let assistantMessageRecord: any = undefined;
-      let artifactTitle = "";
-      let artifactCode = "";
+      let artifactTitle = overrideArtifactTitle;
+      let artifactCode = overrideArtifactCode;
 
-      const codeMatch = fullText.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
-      if (codeMatch && !/image|mermaid|chart|table|buttons|form|telemetry/i.test(codeMatch[1] || "")) {
-        artifactTitle = `Artefakt Roboczy (${codeMatch[1] || "code"}) — ${agentId.toUpperCase()}`;
-        artifactCode = codeMatch[2].trim();
+      if (!artifactCode) {
+        const codeMatch = fullText.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
+        if (codeMatch && !/image|mermaid|chart|table|buttons|form|telemetry/i.test(codeMatch[1] || "")) {
+          artifactTitle = `Artefakt Roboczy (${codeMatch[1] || "code"}) — ${agentId.toUpperCase()}`;
+          artifactCode = codeMatch[2].trim();
+        }
       }
 
       if (saveToDb && fullText) {
@@ -1790,6 +2317,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
         reply: fullText,
         artifactTitle,
         artifactCode,
+        toolOutcomes: executedOutcomes,
         userMessageRecord,
         assistantMessageRecord,
       });
@@ -1810,6 +2338,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
       enginePreference: q.enginePreference || "auto",
       sessionId: q.sessionId || "bastilla-stream",
       saveToDb: q.saveToDb === "true",
+      isGetRequest: true,
     });
   });
 
@@ -1823,6 +2352,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
       imageBase64: typeof b.imageBase64 === "string" ? b.imageBase64 : undefined,
       imageMimeType: typeof b.imageMimeType === "string" ? b.imageMimeType : "image/jpeg",
       saveToDb: b.saveToDb !== false,
+      isGetRequest: false,
     });
   });
 
@@ -1832,13 +2362,17 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
       const {
         agentId = "aria",
         message = "",
-        imageBase64,
-        imageMimeType = "image/jpeg",
+        imageBase64: rawImageBase64,
+        imageMimeType: rawImageMimeType = "image/jpeg",
         sessionId = "bastilla-main",
         enginePreference = "auto",
       } = req.body || {};
+      const { base64: imageBase64, mimeType: imageMimeType } = normalizeInlineImageInput(
+        rawImageBase64,
+        rawImageMimeType
+      );
 
-      if (!message.trim() && !imageBase64) {
+      if (!String(message || "").trim() && !imageBase64) {
         return res.status(400).json({ ok: false, error: "Wiadomość nie może być pusta." });
       }
 
@@ -1848,18 +2382,48 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
       let artifactCode = "";
       let resolved = false;
       let lastEngineError = "";
+      const executedOutcomes: ToolExecutionOutcome[] = [];
+      const outcomeCache = new Map<string, ToolExecutionOutcome>();
+      const operatorToken = extractOperatorToken(req);
+      const authorizedOperator = isOperatorAuthorized(req);
+
+      const executeAndRecordTool = async (
+        name: string,
+        args: Record<string, any> = {}
+      ): Promise<ToolExecutionOutcome> => {
+        const key = `${name}:${JSON.stringify(args || {})}`;
+        const cached = outcomeCache.get(key);
+        if (cached) return cached;
+        const outcome = await toolRuntime.executeTool(name, args, {
+          agentId,
+          operatorToken,
+          authorizedOperator,
+        });
+        outcomeCache.set(key, outcome);
+        executedOutcomes.push(outcome);
+        if (outcome.tool === "generate_image" && outcome.status === "executed" && outcome.data?.image) {
+          broadcastSystemEvent("images", { id: outcome.data.image.id, status: "completed" });
+        }
+        return outcome;
+      };
 
       // Direct Supreme Root command execution inside chat (/exec <cmd>, /root <cmd>, /sudo <cmd>)
-      const trimmedMsg = message.trim();
-      let effectiveUserMessage = message;
-      if (/^\/(exec|root|sudo|bash)\s+/i.test(trimmedMsg)) {
-        const rawCmd = trimmedMsg.replace(/^\/(exec|root|sudo|bash)\s+/i, "").trim();
-        const { stdout, stderr, exitCode } = await executeTerminalCommandInternal(
-          "LINUX_ROOT",
-          rawCmd,
-          agentId === "council" ? "aria" : agentId
-        );
-        {
+      const trimmedMsg = String(message || "").trim();
+      let effectiveUserMessage = String(message || "");
+      const slashMsgMatch = trimmedMsg.match(/^\/(exec|root|sudo|bash)(?:\s+([\s\S]+))?$/i);
+      if (slashMsgMatch) {
+        const rawCmd = (slashMsgMatch[2] || "").trim();
+        if (!rawCmd) {
+          return res.status(400).json({
+            ok: false,
+            error: "Podaj polecenie po /exec (np. /exec id && uname -a).",
+          });
+        }
+        const termOutcome = await executeAndRecordTool("terminal_exec_authorized", {
+          command: rawCmd,
+        });
+        if (termOutcome.status === "executed" && termOutcome.data) {
+          const { stdout = "", stderr = "", exitCode = 0 } = termOutcome.data;
           replyText = `[SERVER uid=${process.getuid?.()} gid=${process.getgid?.()} · exit=${exitCode}]\n$ ${rawCmd}\n\n${(
             stdout ||
             stderr ||
@@ -1869,8 +2433,27 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
           artifactTitle = `Wynik ROOT: ${rawCmd.substring(0, 40)}`;
           artifactCode = rawCmd;
           resolved = true;
+        } else {
+          return res.status(termOutcome.status === "denied" ? 403 : 400).json({
+            ok: false,
+            error: termOutcome.error || termOutcome.summary,
+            toolOutcomes: executedOutcomes,
+          });
         }
       }
+
+      const intentInfo = resolved
+        ? { intents: ["terminal_exec"], suggestedTools: [], mode: "terminal" as const }
+        : detectUserIntents(message, { hasImage: Boolean(imageBase64) });
+
+      if (!resolved) {
+        for (const suggested of intentInfo.suggestedTools) {
+          await executeAndRecordTool(suggested.name, suggested.args);
+        }
+      }
+
+      const hasToolsOrIntents = intentInfo.intents.length > 0 || executedOutcomes.length > 0;
+      const groundingPrompt = buildToolGroundingPrompt(executedOutcomes, AGENT_TOOL_CATALOG);
 
       // Fetch recent conversation history from SQLite for multi-turn continuity (NO steering prompts)
       const historyData = await querySqliteJson(
@@ -1884,9 +2467,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
       );
       const priorTurns = sanitizeConversationHistory(historyData?.history || []);
 
-      const isOllamaSelection =
-        !resolved &&
-        enginePreference !== "gemini";
+      const isOllamaSelection = !resolved && enginePreference !== "gemini";
 
       const targetOllamaModel = imageBase64
         ? "llama3.2-vision:11b"
@@ -1899,7 +2480,8 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
       // Step 1: Attempt active Ollama daemon with automatic model fallback from /api/tags
       if (isOllamaSelection) {
         const ollamaEndpoint = getOllamaBaseUrl();
-        const ollamaMessages = [
+        const ollamaMessages: Array<{ role: string; content: string; images?: string[] }> = [
+          ...(hasToolsOrIntents ? [{ role: "system", content: groundingPrompt }] : []),
           ...priorTurns.map((h) => ({
             role: h.sender_role === "user" ? "user" : "assistant",
             content: h.content,
@@ -1911,51 +2493,107 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           },
         ];
         try {
-          const ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: targetOllamaModel,
-              stream: false,
-              messages: ollamaMessages,
-            }),
-            signal: AbortSignal.timeout(25000),
-          });
-          if (ollamaRes.ok) {
-            const data: any = await ollamaRes.json();
-            replyText = data?.message?.content || "";
-            if (replyText) {
-              engineUsed = bodyEngine(data, targetOllamaModel);
-              resolved = true;
-            }
-          } else if (ollamaRes.status === 404) {
-            const liveOllama = await probeOllamaStatus(ollamaEndpoint);
-            const altModel = pickPreferredOllamaModel(liveOllama.models, {
-              multimodal: Boolean(imageBase64),
-            });
-            if (altModel && altModel !== targetOllamaModel) {
-              const retryRes = await fetch(`${ollamaEndpoint}/api/chat`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  model: altModel,
-                  stream: false,
-                  messages: ollamaMessages,
-                }),
+          if (hasToolsOrIntents) {
+            const ollamaToolOpt = {
+              tools: toOllamaTools(AGENT_TOOL_CATALOG),
+              onToolCall: async (name: string, args: Record<string, any>) => {
+                const resOutcome = await executeAndRecordTool(name, args);
+                return {
+                  status: resOutcome.status,
+                  summary: resOutcome.summary,
+                  data: resOutcome.data,
+                  error: resOutcome.error,
+                };
+              },
+            };
+            try {
+              const streamed = await streamOllamaChat({
+                ollamaBaseUrl: ollamaEndpoint,
+                model: targetOllamaModel,
+                messages: ollamaMessages,
                 signal: AbortSignal.timeout(25000),
+                onChunk: () => {},
+                ...ollamaToolOpt,
               });
-              if (retryRes.ok) {
-                const retryData: any = await retryRes.json();
-                replyText = retryData?.message?.content || "";
-                if (replyText) {
-                  engineUsed = bodyEngine(retryData, altModel);
-                  resolved = true;
+              if (streamed.text) {
+                replyText = streamed.text;
+                engineUsed = streamed.model;
+                resolved = true;
+              }
+            } catch (toolErr: any) {
+              if (/404|not found/i.test(String(toolErr?.message || ""))) {
+                const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+                const altModel = pickPreferredOllamaModel(liveOllama.models, {
+                  multimodal: Boolean(imageBase64),
+                });
+                if (altModel && altModel !== targetOllamaModel) {
+                  const retryStream = await streamOllamaChat({
+                    ollamaBaseUrl: ollamaEndpoint,
+                    model: altModel,
+                    messages: ollamaMessages,
+                    signal: AbortSignal.timeout(25000),
+                    onChunk: () => {},
+                    ...ollamaToolOpt,
+                  });
+                  if (retryStream.text) {
+                    replyText = retryStream.text;
+                    engineUsed = retryStream.model;
+                    resolved = true;
+                  }
+                } else {
+                  throw toolErr;
                 }
+              } else {
+                throw toolErr;
               }
             }
-            if (!resolved) lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
           } else {
-            lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
+            const ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: targetOllamaModel,
+                stream: false,
+                messages: ollamaMessages,
+              }),
+              signal: AbortSignal.timeout(25000),
+            });
+            if (ollamaRes.ok) {
+              const data: any = await ollamaRes.json();
+              replyText = data?.message?.content || "";
+              if (replyText) {
+                engineUsed = bodyEngine(data, targetOllamaModel);
+                resolved = true;
+              }
+            } else if (ollamaRes.status === 404) {
+              const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+              const altModel = pickPreferredOllamaModel(liveOllama.models, {
+                multimodal: Boolean(imageBase64),
+              });
+              if (altModel && altModel !== targetOllamaModel) {
+                const retryRes = await fetch(`${ollamaEndpoint}/api/chat`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    model: altModel,
+                    stream: false,
+                    messages: ollamaMessages,
+                  }),
+                  signal: AbortSignal.timeout(25000),
+                });
+                if (retryRes.ok) {
+                  const retryData: any = await retryRes.json();
+                  replyText = retryData?.message?.content || "";
+                  if (replyText) {
+                    engineUsed = bodyEngine(retryData, altModel);
+                    resolved = true;
+                  }
+                }
+              }
+              if (!resolved) lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
+            } else {
+              lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
+            }
           }
         } catch (err: any) {
           lastEngineError = `Ollama daemon (${ollamaEndpoint}) niedostępny: ${err?.message || "ECONNREFUSED"}`;
@@ -1963,7 +2601,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         }
       }
 
-      // Step 2: Real Server-Side Gemini API Fallback with clean agent persona instruction
+      // Step 2: Real Server-Side Gemini API Fallback with clean agent persona instruction + native tool calling
       if (!resolved) {
         try {
           const contents: any[] = priorTurns.map((h) => ({
@@ -1983,10 +2621,15 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           currentParts.push({ text: effectiveUserMessage });
           contents.push({ role: "user", parts: currentParts });
 
+          const combinedSystemInstruction = `${buildAgentSystemInstruction(agentId)}\n\n${groundingPrompt}`;
           const { text, modelUsed } = await runLiveMultimodalModel(
             contents,
             undefined,
-            buildAgentSystemInstruction(agentId)
+            combinedSystemInstruction,
+            {
+              functionDeclarations: toGeminiFunctionDeclarations(AGENT_TOOL_CATALOG),
+              executeToolCall: executeAndRecordTool,
+            }
           );
           replyText = text;
           engineUsed =
@@ -2003,13 +2646,16 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         return res.status(503).json({
           ok: false,
           error: `Brak połączenia z rzeczywistym modelem AI: ${lastEngineError}`,
+          toolOutcomes: executedOutcomes,
         });
       }
+
+      replyText = applyImageOutcomeToReplyText(replyText, executedOutcomes).text;
 
       // Extract first code block as ChatGPT Work Canvas Artifact if present
       if (!artifactCode) {
         const codeMatch = replyText.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
-        if (codeMatch) {
+        if (codeMatch && !/image|mermaid|chart|table|buttons|form|telemetry/i.test(codeMatch[1] || "")) {
           artifactTitle = `Artefakt Roboczy (${codeMatch[1] || "code"}) — ${agentId.toUpperCase()}`;
           artifactCode = codeMatch[2].trim();
         }
@@ -2046,7 +2692,7 @@ ipc_targets = json.loads(sys.argv[9]) if sys.argv[9] else []
 sender_agent = sys.argv[3] if sys.argv[3] in ('aria', 'alex', 'astyria', 'aurelius') else 'aria'
 for target_agent in ipc_targets:
     cur.execute(
-        "INSERT INTO ipc_messages (sender_agent, recipient_agent, subject, payload, status, created_at) VALUES (?, ?, ?, ?, 'DELIVERED', ?)",
+        "INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, ?, ?, 'QUEUED', ?)",
         (sender_agent, target_agent, 'CHAT_MENTION', sys.argv[4][:400], now)
     )
 conn.commit()
@@ -2071,6 +2717,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
         reply: replyText,
         artifactTitle,
         artifactCode,
+        toolOutcomes: executedOutcomes,
         userMessageRecord: {
           id: savedRows.user_id || Date.now() - 1,
           session_id: sessionId,
@@ -2100,6 +2747,18 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
   // 4B. Clear Chat Messages (for specific agent, single messageId, or all chats)
   app.post("/api/chat/clear", async (req, res) => {
     const { agentId, messageId, clearAll = false } = req.body || {};
+    let normalizedMsgId = "";
+    if (messageId !== undefined && messageId !== null && String(messageId).trim() !== "") {
+      const parsedId = Number(messageId);
+      if (!Number.isInteger(parsedId) || parsedId <= 0) {
+        return res.status(400).json({ ok: false, error: "Nieprawidłowe ID wiadomości (wymagana dodatnia liczba całkowita)." });
+      }
+      normalizedMsgId = String(parsedId);
+    }
+    const cleanAgentId = typeof agentId === "string" ? agentId.trim() : "";
+    if (cleanAgentId && !AGENTS.includes(cleanAgentId as any) && cleanAgentId !== "council") {
+      return res.status(400).json({ ok: false, error: "Nieprawidłowy identyfikator agenta." });
+    }
     try {
       const out = await querySqliteJson(
         `import sqlite3, sys, json
@@ -2121,8 +2780,8 @@ conn.commit()
 conn.close()
 print(json.dumps({"deleted": deleted, "ok": True}))`,
         [
-          String(agentId || ""),
-          String(messageId || ""),
+          cleanAgentId,
+          normalizedMsgId,
           clearAll ? "true" : "false",
         ]
       );
@@ -2219,12 +2878,14 @@ print(json.dumps({"saved": True, "created_at": now}))`,
 conn = sqlite3.connect(sys.argv[1])
 cur = conn.cursor()
 cur.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (sys.argv[3], sys.argv[2]))
-if cur.rowcount == 0:
-    cur.execute("INSERT OR REPLACE INTO agents (id, avatar_url, status) VALUES (?, ?, 'ACTIVE')", (sys.argv[2], sys.argv[3]))
+updated = cur.rowcount > 0
 conn.commit(); conn.close()
-print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv[3]}))`,
+print(json.dumps({"updated": updated, "agentId": sys.argv[2], "avatarUrl": sys.argv[3]}))`,
         [agentId, avatarUrl.trim()]
       );
+      if (!out?.updated) {
+        return res.status(404).json({ ok: false, error: "Nie znaleziono profilu agenta w bazie danych." });
+      }
       res.json({ ok: true, result: out });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
@@ -2244,8 +2905,23 @@ print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv
         await execFileAsync("pkill", ["-u", agentId, "-f", `agent_worker.py ${agentId}([ ]|$)`]).catch((error) => { if (error.code !== 1) throw error; });
       }
       if (action === "start" || action === "restart") {
+        const workerPath = fs.existsSync("/usr/lib/bastilla/agent_worker.py")
+          ? "/usr/lib/bastilla/agent_worker.py"
+          : path.join(KERNEL_DIR, "agent_worker.py");
+        if (!fs.existsSync(workerPath)) {
+          return res.status(503).json({ ok: false, error: "Brak skryptu agent_worker.py na hoście." });
+        }
+        try {
+          await execFileAsync("id", ["-u", agentId], { timeout: 2000 });
+        } catch {
+          return res.status(503).json({
+            ok: false,
+            error: `Brak konta Linux użytkownika "${agentId}". Uruchom provision-runtime.sh (BASTILLA_PROVISION_HOST=true), aby utworzyć konta agentów.`,
+          });
+        }
+        fs.mkdirSync("/var/log/bastilla", { recursive: true });
         await execAsync(
-          `runuser -u ${agentId} -- nohup python3 /usr/lib/bastilla/agent_worker.py ${agentId} >/var/log/bastilla/${agentId}-worker.log 2>&1 &`
+          `BASTILLA_DB_PATH=${shellQuote(DB_PATH)} runuser -u ${agentId} -- nohup python3 ${shellQuote(workerPath)} ${agentId} >/var/log/bastilla/${agentId}-worker.log 2>&1 &`
         );
         await new Promise((r) => setTimeout(r, 400));
       }
@@ -2348,12 +3024,22 @@ print(json.dumps({
       objective = "",
       deltaV = 5.45,
     } = req.body || {};
-    if (!codename.trim() || !objective.trim()) {
+    if (typeof codename !== "string" || !codename.trim() || typeof objective !== "string" || !objective.trim()) {
       return res.status(400).json({
         ok: false,
         error: "Wymagany jest kryptonim misji oraz cel operacyjny.",
       });
     }
+    const parsedDeltaV = Number(deltaV);
+    if (!Number.isFinite(parsedDeltaV) || parsedDeltaV < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Parametr deltaV musi być nieujemną liczbą.",
+      });
+    }
+    const cleanLeadAgent = AGENTS.includes(leadAgent as any) ? String(leadAgent) : "astyria";
+    const cleanTargetBody = typeof targetBody === "string" && targetBody.trim() ? targetBody.trim() : "Mars";
+    const cleanVesselId = typeof vesselId === "string" && vesselId.trim() ? vesselId.trim() : "BSV-03-ASTRAEA";
     try {
       const msnId = `MSN-${Math.floor(500 + Math.random() * 499)}`;
       const out = await querySqliteJson(
@@ -2365,7 +3051,7 @@ conn.execute("INSERT INTO missions VALUES (?, ?, ?, ?, ?, 'INITIATED', 15, ?, ?,
   (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], float(sys.argv[7]), sys.argv[8], now))
 conn.commit(); conn.close()
 print(json.dumps({"id": sys.argv[2], "updated_at": now}))`,
-        [msnId, codename.toUpperCase(), targetBody, leadAgent, vesselId, String(deltaV), objective]
+        [msnId, codename.trim().toUpperCase(), cleanTargetBody, cleanLeadAgent, cleanVesselId, String(parsedDeltaV), objective.trim()]
       );
       res.json({ ok: true, mission: out });
     } catch (err: any) {
@@ -2375,19 +3061,21 @@ print(json.dumps({"id": sys.argv[2], "updated_at": now}))`,
 
   app.post("/api/fleet/hypercomm", async (req, res) => {
     const { relayId = "HCR-SOL-L2", packetHeader = "SVL_QUANTUM_SYNC" } = req.body || {};
-    if (!packetHeader.trim()) {
+    if (typeof relayId !== "string" || !relayId.trim() || typeof packetHeader !== "string" || !packetHeader.trim()) {
       return res
         .status(400)
-        .json({ ok: false, error: "Wymagany nagłówek pakietu hiperkomunikacji." });
+        .json({ ok: false, error: "Wymagany jest identyfikator przekaźnika i nagłówek pakietu hiperkomunikacji." });
     }
     try {
       const out = await querySqliteJson(
         `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
-conn.execute("UPDATE hypercomm_relays SET last_packet = ?, status = 'LOCKED' WHERE id = ?", (sys.argv[3], sys.argv[2]))
+cur = conn.cursor()
+cur.execute("UPDATE hypercomm_relays SET last_packet = ?, status = 'LOCKED' WHERE id = ?", (sys.argv[3], sys.argv[2]))
+updated = cur.rowcount > 0
 conn.commit(); conn.close()
-print(json.dumps({"updated": True, "relayId": sys.argv[2], "packet": sys.argv[3]}))`,
-        [relayId, packetHeader]
+print(json.dumps({"updated": updated, "relayId": sys.argv[2], "packet": sys.argv[3]}))`,
+        [relayId.trim(), packetHeader.trim()]
       );
       res.json({ ok: true, result: out });
     } catch (err: any) {

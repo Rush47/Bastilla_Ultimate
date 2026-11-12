@@ -286,3 +286,30 @@ test("Codex endpoints reject fabricated tokens and report only CLI-confirmed aut
   const overview: any = await (await fetch(`${baseUrl}/api/system/overview`)).json();
   assert.equal(overview.host.tools.codex.auth_ready, true);
 });
+
+test("BINARY_ELF missing target, SVL Python errors, chat clear validation, and fleet validation return structured JSON instead of 500", async () => {
+  const missingElf = await post("/api/terminal/exec", { mode: "BINARY_ELF", command: "/tmp/definitely-missing-bastilla-elf" });
+  assert.equal(missingElf.status, 200);
+  assert.equal(missingElf.body.ok, true);
+  assert.equal(missingElf.body.exitCode, 1);
+  assert.match(missingElf.body.stdout, /Plik nie istnieje/);
+
+  const pyErr = await post("/api/svl/execute", { customPython: "import sys; print('PRE_ERR'); sys.exit(2)" });
+  assert.equal(pyErr.status, 200);
+  assert.equal(pyErr.body.ok, false);
+  assert.equal(pyErr.body.exitCode, 2);
+  assert.match(pyErr.body.stdout, /PRE_ERR/);
+
+  const badClear = await post("/api/chat/clear", { messageId: "not-an-integer" });
+  assert.equal(badClear.status, 400);
+  assert.equal(badClear.body.ok, false);
+
+  const badFleet = await post("/api/fleet/mission", { codename: "M-TEST", objective: "Orbit check", deltaV: "NaN" });
+  assert.equal(badFleet.status, 400);
+  assert.equal(badFleet.body.ok, false);
+
+  const bareExec = await post("/api/chat/message", { message: "/exec" });
+  assert.equal(bareExec.status, 400);
+  assert.equal(bareExec.body.ok, false);
+});
+
