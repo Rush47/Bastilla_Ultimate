@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { MCPServerManager, MCP_TOOLS } from "../server/mcp";
@@ -26,6 +26,25 @@ test("MCP denies missing token, legacy magic tokens and unsupported tools", () =
     const result = manager.executeTool("git_status", {}, process.env.BASTILLA_API_TOKEN);
     assert.equal(result.ok, true);
     assert.equal("branch" in result, true);
+  } finally {
+    if (oldToken === undefined) delete process.env.BASTILLA_API_TOKEN;
+    else process.env.BASTILLA_API_TOKEN = oldToken;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("MCP agent memory does not follow symlinks or read global fallback", () => {
+  const tmp = mkdtempSync(path.join(tmpdir(), "bastilla-mcp-memory-"));
+  const oldToken = process.env.BASTILLA_API_TOKEN;
+  process.env.BASTILLA_API_TOKEN = "test-operator-token-not-a-real-secret";
+  try {
+    const manager = new MCPServerManager(tmp, path.join(tmp, "db"));
+    writeFileSync(path.join(tmp, "memory.json"), JSON.stringify({ secret: "global-not-for-agent" }));
+    const empty = manager.executeTool("agent_memory_read", { agentId: "aria" }, process.env.BASTILLA_API_TOKEN);
+    assert.deepEqual(empty, { ok: true, agentId: "aria", memory: {} });
+    mkdirSync(path.join(tmp, "home", "aria"), { recursive: true });
+    symlinkSync(path.join(tmp, "memory.json"), path.join(tmp, "home", "aria", "memory.json"));
+    assert.throws(() => manager.executeTool("agent_memory_read", { agentId: "aria" }, process.env.BASTILLA_API_TOKEN), /regular file/);
   } finally {
     if (oldToken === undefined) delete process.env.BASTILLA_API_TOKEN;
     else process.env.BASTILLA_API_TOKEN = oldToken;
