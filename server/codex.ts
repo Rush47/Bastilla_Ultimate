@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -226,10 +227,11 @@ export class CodexTaskManager extends EventEmitter {
   }
 
   verifyOperatorPermission(operatorToken?: string): boolean {
-    if (operatorToken === undefined || operatorToken === "") {
-      return true;
-    }
-    return operatorToken === "364_OMNIKLUCZ_ROOT" || operatorToken === "SUPREME_ROOT_UID0_GID0";
+    const expected = this.env.BASTILLA_API_TOKEN;
+    if (!expected || !operatorToken) return false;
+    const a = Buffer.from(expected);
+    const b = Buffer.from(operatorToken);
+    return a.length === b.length && timingSafeEqual(a, b);
   }
 
   static normalizeSessionId(agentId: string, sessionId?: string): string {
