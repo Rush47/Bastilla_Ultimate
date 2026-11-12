@@ -1194,10 +1194,11 @@ conn = sqlite3.connect(sys.argv[1])
 rows = [r[0] for r in conn.execute("PRAGMA quick_check")]
 conn.close()
 print(json.dumps({"results": rows}))`);
-      const [ollama, images, codex] = await Promise.all([
+      const [ollama, images, codex, gitSync] = await Promise.all([
         probeOllamaStatus(getOllamaBaseUrl()),
         imageManager.probeStatus(),
         codexAuth.status(),
+        performBidirectionalGitSync({ trigger: "manual_system_sync" }),
       ]);
       const syncResult = {
         ok: true,
@@ -1205,10 +1206,26 @@ print(json.dumps({"results": rows}))`);
         ollama,
         images,
         codex,
+        git_sync: {
+          branch: gitSync.branch,
+          ahead: gitSync.ahead,
+          behind: gitSync.behind,
+          head_hash: gitSync.headHash,
+          remote_head_hash: gitSync.remoteHeadHash,
+          inbound_status: gitSync.inboundStatus,
+          outbound_status: gitSync.outboundStatus,
+          auto_sync_enabled: gitSync.enabled,
+          detail: gitSync.lastDetail,
+        },
         mcp_tools: mcp.listTools().tools.map((t) => t.name),
         syncedAt: new Date().toISOString(),
       };
-      broadcastSystemEvent("sync", { syncedAt: syncResult.syncedAt, ollama: ollama.state, images: images.engineStatus });
+      broadcastSystemEvent("sync", {
+        syncedAt: syncResult.syncedAt,
+        ollama: ollama.state,
+        images: images.engineStatus,
+        git_sync: syncResult.git_sync,
+      });
       res.json(syncResult);
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || "Synchronizacja systemu nie powiodła się." });
@@ -3006,7 +3023,352 @@ print(json.dumps({"logged": True}))`,
     }
   });
 
-  // 7. Git Repository Bastilla_OS_Ultimate (main branch) Inspection & Sync
+  // 7. Git Repository Bastilla_OS_Ultimate Inspection & Automatic Two-Way GitHub Sync
+  const isTestGitEnv =
+    Boolean(process.env.NODE_TEST_CONTEXT) ||
+    process.env.BASTILLA_PROVISION_HOST === "false" ||
+    process.env.BASTILLA_GIT_AUTO_SYNC === "false";
+
+  interface GitSyncEvent {
+    timestamp: string;
+    direction: "INBOUND" | "OUTBOUND" | "SYSTEM";
+    status: string;
+    detail: string;
+  }
+
+  const gitAutoSyncState = {
+    enabled: !isTestGitEnv,
+    intervalSec: Math.max(15, Math.min(3600, Number(process.env.BASTILLA_GIT_SYNC_INTERVAL_SEC) || 60)),
+    autoFastForwardPull: true,
+    autoPushWorkBranch: true,
+    repoName: "Rush47/Bastilla_Ultimate",
+    remoteName: "origin",
+    remoteUrl: "https://github.com/Rush47/Bastilla_Ultimate.git",
+    branch: "main",
+    targetBaseBranch: "main",
+    headHash: "",
+    remoteHeadHash: "",
+    ahead: 0,
+    behind: 0,
+    changedFilesCount: 0,
+    inboundStatus: "IDLE" as "IDLE" | "FETCHED" | "FAST_FORWARDED" | "REBASED" | "DIVERGED" | "DIRTY_SKIPPED" | "ERROR",
+    outboundStatus: "IDLE" as "IDLE" | "PUSHED" | "UP_TO_DATE" | "PROTECTED_MAIN" | "AUTH_REQUIRED" | "ERROR",
+    authReady: false,
+    syncCount: 0,
+    lastSyncAt: null as string | null,
+    lastDetail: "Automatyczna synchronizacja obustronna z GitHubem skonfigurowana.",
+    recentEvents: [] as GitSyncEvent[],
+  };
+
+  function addGitSyncEvent(direction: GitSyncEvent["direction"], status: string, detail: string) {
+    gitAutoSyncState.recentEvents.unshift({
+      timestamp: new Date().toISOString(),
+      direction,
+      status,
+      detail: redact(detail),
+    });
+    if (gitAutoSyncState.recentEvents.length > 30) {
+      gitAutoSyncState.recentEvents.pop();
+    }
+  }
+
+  async function runGitSafe(args: string[], timeoutMs = 10000): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+    try {
+      const { stdout, stderr } = await execFileAsync("git", args, {
+        cwd: PROJECT_ROOT,
+        timeout: timeoutMs,
+      });
+      return { ok: true, stdout: stdout.trim(), stderr: stderr.trim() };
+    } catch (err: any) {
+      return {
+        ok: false,
+        stdout: String(err?.stdout || "").trim(),
+        stderr: String(err?.stderr || err?.message || "Błąd wykonania git").trim(),
+      };
+    }
+  }
+
+  async function checkGithubAuthReady(): Promise<boolean> {
+    if (process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim()) {
+      return true;
+    }
+    try {
+      await execFileAsync("gh", ["auth", "status"], { cwd: PROJECT_ROOT, timeout: 4000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  let gitSyncMutex = false;
+
+  async function performBidirectionalGitSync(options?: {
+    trigger?: string;
+    commitMessage?: string;
+    stageAndCommit?: boolean;
+    pushNow?: boolean;
+  }) {
+    if (gitSyncMutex) return gitAutoSyncState;
+    gitSyncMutex = true;
+    try {
+      const [branchRes, headRes, statusRes, authReady] = await Promise.all([
+        runGitSafe(["rev-parse", "--abbrev-ref", "HEAD"]),
+        runGitSafe(["rev-parse", "--short", "HEAD"]),
+        runGitSafe(["status", "--porcelain"]),
+        checkGithubAuthReady(),
+      ]);
+
+      let branch = branchRes.ok && branchRes.stdout ? branchRes.stdout : "main";
+      let headHash = headRes.ok ? headRes.stdout : "";
+      let changedFiles = statusRes.ok && statusRes.stdout
+        ? statusRes.stdout.split("\n").filter((l) => l.trim().length > 0)
+        : [];
+
+      gitAutoSyncState.authReady = authReady;
+      gitAutoSyncState.branch = branch;
+      gitAutoSyncState.headHash = headHash;
+      gitAutoSyncState.changedFilesCount = changedFiles.length;
+
+      // 1. Optional stage & commit onto a working branch (never directly onto main)
+      if (options?.stageAndCommit && changedFiles.length > 0) {
+        const cleanMsg = String(options.commitMessage || "chore: automatic bidirectional sync snapshot")
+          .replace(/[\r\n]+/g, " ")
+          .trim()
+          .slice(0, 160);
+        if (branch === "main") {
+          const autoBranch = `sync/bastilla-auto-${new Date().toISOString().slice(0, 10)}`;
+          const checkoutRes = await runGitSafe(["checkout", "-B", autoBranch]);
+          if (checkoutRes.ok) {
+            branch = autoBranch;
+            gitAutoSyncState.branch = branch;
+            addGitSyncEvent("SYSTEM", "BRANCH_SWITCH", `Utworzono gałąź roboczą ${branch} (ochrona gałęzi main).`);
+          }
+        }
+        if (branch !== "main") {
+          await runGitSafe(["add", "-A"]);
+          const commitRes = await runGitSafe(["commit", "-m", cleanMsg]);
+          if (commitRes.ok) {
+            const newHead = await runGitSafe(["rev-parse", "--short", "HEAD"]);
+            headHash = newHead.ok ? newHead.stdout : headHash;
+            gitAutoSyncState.headHash = headHash;
+            changedFiles = [];
+            gitAutoSyncState.changedFilesCount = 0;
+            addGitSyncEvent("OUTBOUND", "COMMITTED", `Zapisano commit ${headHash} na gałęzi ${branch}: ${cleanMsg}`);
+          }
+        }
+      }
+
+      // 2. INBOUND: Fetch from GitHub (origin) & Fast-Forward Pull if behind
+      const fetchRes = await runGitSafe(["fetch", "origin", "--prune"], 12000);
+      const remoteHeadRes = await runGitSafe(["rev-parse", "--short", "origin/main"]);
+      if (remoteHeadRes.ok) {
+        gitAutoSyncState.remoteHeadHash = remoteHeadRes.stdout;
+      }
+
+      const remoteBranchExists = (await runGitSafe(["rev-parse", "--verify", `origin/${branch}`])).ok;
+      const compareRef = remoteBranchExists ? `origin/${branch}` : "origin/main";
+      const revListRes = await runGitSafe(["rev-list", "--left-right", "--count", `HEAD...${compareRef}`]);
+
+      let ahead = 0;
+      let behind = 0;
+      if (revListRes.ok && revListRes.stdout) {
+        const parts = revListRes.stdout.split(/\s+/);
+        ahead = Number(parts[0]) || 0;
+        behind = Number(parts[1]) || 0;
+      }
+      gitAutoSyncState.ahead = ahead;
+      gitAutoSyncState.behind = behind;
+
+      if (!fetchRes.ok) {
+        gitAutoSyncState.inboundStatus = "ERROR";
+        addGitSyncEvent("INBOUND", "FETCH_ERROR", `Nie udało się pobrać zmian z origin: ${fetchRes.stderr.slice(0, 140)}`);
+      } else if (behind > 0) {
+        if (changedFiles.length > 0) {
+          gitAutoSyncState.inboundStatus = "DIRTY_SKIPPED";
+          addGitSyncEvent(
+            "INBOUND",
+            "DIRTY_SKIPPED",
+            `Wykryto +${behind} nowych commitów na ${compareRef}, pominięto auto-merge z powodu ${changedFiles.length} niezapisanych plików.`
+          );
+        } else if (ahead === 0 && gitAutoSyncState.autoFastForwardPull) {
+          const ffRes = await runGitSafe(["merge", "--ff-only", compareRef]);
+          if (ffRes.ok) {
+            const updatedHead = await runGitSafe(["rev-parse", "--short", "HEAD"]);
+            gitAutoSyncState.headHash = updatedHead.ok ? updatedHead.stdout : headHash;
+            gitAutoSyncState.behind = 0;
+            behind = 0;
+            gitAutoSyncState.inboundStatus = "FAST_FORWARDED";
+            addGitSyncEvent(
+              "INBOUND",
+              "FAST_FORWARDED",
+              `Zintegrowano nowe commity z GitHub (${compareRef} → ${gitAutoSyncState.headHash}).`
+            );
+          } else {
+            gitAutoSyncState.inboundStatus = "DIVERGED";
+            addGitSyncEvent("INBOUND", "DIVERGED", `Nie można wykonać fast-forward z ${compareRef}.`);
+          }
+        } else {
+          gitAutoSyncState.inboundStatus = "DIVERGED";
+          addGitSyncEvent(
+            "INBOUND",
+            "DIVERGED",
+            `Gałąź ${branch} ma +${ahead}/-${behind} względem ${compareRef} (pobrano referencje).`
+          );
+        }
+      } else {
+        gitAutoSyncState.inboundStatus = "FETCHED";
+      }
+
+      // 3. OUTBOUND: Push working branch to GitHub (origin)
+      if (ahead === 0 && remoteBranchExists) {
+        gitAutoSyncState.outboundStatus = "UP_TO_DATE";
+      } else if (branch === "main" && ahead > 0) {
+        gitAutoSyncState.outboundStatus = "PROTECTED_MAIN";
+      } else if (ahead > 0 && (gitAutoSyncState.autoPushWorkBranch || options?.pushNow)) {
+        if (!authReady && !options?.pushNow) {
+          gitAutoSyncState.outboundStatus = "AUTH_REQUIRED";
+        } else {
+          const pushRes = await runGitSafe(["push", "-u", "origin", branch], 15000);
+          if (pushRes.ok) {
+            gitAutoSyncState.outboundStatus = "PUSHED";
+            gitAutoSyncState.ahead = 0;
+            addGitSyncEvent(
+              "OUTBOUND",
+              "PUSHED",
+              `Wypchnięto gałąź ${branch} (${gitAutoSyncState.headHash}) do origin/${branch}.`
+            );
+          } else {
+            const isAuthErr = /authentication|credentials|permission|could not read Username|401|403/i.test(
+              pushRes.stderr
+            );
+            gitAutoSyncState.outboundStatus = isAuthErr ? "AUTH_REQUIRED" : "ERROR";
+            addGitSyncEvent(
+              "OUTBOUND",
+              gitAutoSyncState.outboundStatus,
+              isAuthErr
+                ? `Push gałęzi ${branch} (+${ahead}) oczekuje na poświadczenia GitHub (GH_TOKEN / gh auth login).`
+                : `Błąd push do origin/${branch}: ${pushRes.stderr.slice(0, 140)}`
+            );
+          }
+        }
+      } else if (ahead === 0 && !remoteBranchExists && branch !== "main") {
+        // Working branch not yet pushed to origin
+        const mainRevList = await runGitSafe(["rev-list", "--left-right", "--count", "HEAD...origin/main"]);
+        if (mainRevList.ok && mainRevList.stdout) {
+          const parts = mainRevList.stdout.split(/\s+/);
+          gitAutoSyncState.ahead = Number(parts[0]) || 0;
+          gitAutoSyncState.behind = Number(parts[1]) || 0;
+        }
+        if (authReady && (gitAutoSyncState.autoPushWorkBranch || options?.pushNow)) {
+          const pushRes = await runGitSafe(["push", "-u", "origin", branch], 15000);
+          if (pushRes.ok) {
+            gitAutoSyncState.outboundStatus = "PUSHED";
+            addGitSyncEvent(
+              "OUTBOUND",
+              "PUSHED",
+              `Opublikowano nową gałąź ${branch} (${gitAutoSyncState.headHash}) na GitHub.`
+            );
+          } else {
+            gitAutoSyncState.outboundStatus = "AUTH_REQUIRED";
+          }
+        } else {
+          gitAutoSyncState.outboundStatus = gitAutoSyncState.ahead > 0 ? "AUTH_REQUIRED" : "UP_TO_DATE";
+        }
+      } else {
+        gitAutoSyncState.outboundStatus = "UP_TO_DATE";
+      }
+
+      gitAutoSyncState.syncCount += 1;
+      gitAutoSyncState.lastSyncAt = new Date().toISOString();
+      gitAutoSyncState.lastDetail =
+        `[INBOUND: ${gitAutoSyncState.inboundStatus} · OUTBOUND: ${gitAutoSyncState.outboundStatus}] ` +
+        `Gałąź ${gitAutoSyncState.branch} (${gitAutoSyncState.headHash}) względem origin/main (${gitAutoSyncState.remoteHeadHash || "N/A"}): ` +
+        `+${gitAutoSyncState.ahead} / -${gitAutoSyncState.behind}` +
+        (gitAutoSyncState.outboundStatus === "AUTH_REQUIRED"
+          ? " — Fetch z GitHuba aktywny; push oczekuje na GH_TOKEN / gh auth login."
+          : ".");
+
+      broadcastSystemEvent("git_sync", { sync: gitAutoSyncState });
+      return gitAutoSyncState;
+    } finally {
+      gitSyncMutex = false;
+    }
+  }
+
+  let gitAutoSyncTimer: NodeJS.Timeout | null = null;
+  function restartGitBidirectionalSyncTimer() {
+    if (gitAutoSyncTimer) {
+      clearInterval(gitAutoSyncTimer);
+      gitAutoSyncTimer = null;
+    }
+    if (gitAutoSyncState.enabled) {
+      gitAutoSyncTimer = setInterval(() => {
+        if (gitAutoSyncState.enabled) {
+          void performBidirectionalGitSync({ trigger: "auto_interval" });
+        }
+      }, gitAutoSyncState.intervalSec * 1000);
+    }
+  }
+
+  function startGitBidirectionalSyncDaemon() {
+    restartGitBidirectionalSyncTimer();
+    if (gitAutoSyncState.enabled) {
+      setTimeout(() => {
+        void performBidirectionalGitSync({ trigger: "startup" });
+      }, 1500);
+    }
+  }
+
+  app.get("/api/git/bidirectional/status", (_req, res) => {
+    res.json({ ok: true, sync: gitAutoSyncState });
+  });
+
+  app.post("/api/git/bidirectional/toggle", async (req, res) => {
+    const { enabled, intervalSec, autoFastForwardPull, autoPushWorkBranch } = req.body || {};
+    if (typeof enabled === "boolean") {
+      gitAutoSyncState.enabled = enabled;
+    } else if (enabled === undefined && intervalSec === undefined && autoFastForwardPull === undefined && autoPushWorkBranch === undefined) {
+      gitAutoSyncState.enabled = !gitAutoSyncState.enabled;
+    }
+    if (intervalSec !== undefined) {
+      const parsed = Number(intervalSec);
+      if (Number.isFinite(parsed) && parsed >= 15 && parsed <= 3600) {
+        gitAutoSyncState.intervalSec = Math.round(parsed);
+      }
+    }
+    if (typeof autoFastForwardPull === "boolean") {
+      gitAutoSyncState.autoFastForwardPull = autoFastForwardPull;
+    }
+    if (typeof autoPushWorkBranch === "boolean") {
+      gitAutoSyncState.autoPushWorkBranch = autoPushWorkBranch;
+    }
+    restartGitBidirectionalSyncTimer();
+    addGitSyncEvent(
+      "SYSTEM",
+      gitAutoSyncState.enabled ? "AUTO_SYNC_ON" : "AUTO_SYNC_OFF",
+      `Automatyczna synchronizacja obustronna: ${gitAutoSyncState.enabled ? `WŁĄCZONA (co ${gitAutoSyncState.intervalSec}s)` : "WSTRZYMANA"}.`
+    );
+    if (gitAutoSyncState.enabled) {
+      await performBidirectionalGitSync({ trigger: "toggle_on" });
+    }
+    res.json({ ok: true, sync: gitAutoSyncState });
+  });
+
+  app.post("/api/git/bidirectional/sync", async (req, res) => {
+    try {
+      const { commitMessage, stageAndCommit = false, pushNow = true } = req.body || {};
+      const state = await performBidirectionalGitSync({
+        trigger: "manual_bidirectional",
+        commitMessage: typeof commitMessage === "string" ? commitMessage : undefined,
+        stageAndCommit: Boolean(stageAndCommit),
+        pushNow: Boolean(pushNow),
+      });
+      res.json({ ok: true, sync: state });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd synchronizacji obustronnej GitHub." });
+    }
+  });
+
   app.get("/api/git/status", async (_req, res) => {
     try {
       const gitScript = `
@@ -3040,7 +3402,8 @@ print(json.dumps({
 }))
 `;
       const info = await querySqliteJson(gitScript);
-      res.json({ ok: true, git: info });
+      info.bidirectional = gitAutoSyncState;
+      res.json({ ok: true, git: info, bidirectional: gitAutoSyncState });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
     }
@@ -3281,6 +3644,7 @@ print(json.dumps({"results": rows}))`);
   }
   if (process.env.BASTILLA_OLLAMA_BRIDGE === "true") startLocalOllamaDaemon();
   startContinuousAgentMissionDaemon();
+  startGitBidirectionalSyncDaemon();
 
   const server = app.listen(PORT, HOST, () => {
     const address = server.address();

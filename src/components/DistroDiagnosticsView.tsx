@@ -45,11 +45,19 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   const [savingOllamaEndpoint, setSavingOllamaEndpoint] = useState<boolean>(false);
   const [ollamaPullModel, setOllamaPullModel] = useState<string>("qwen2.5:7b");
   const [pullingOllamaModel, setPullingOllamaModel] = useState<boolean>(false);
+  const [biSync, setBiSync] = useState<any>(null);
+  const [stageAndCommitOnSync, setStageAndCommitOnSync] = useState<boolean>(true);
+  const [togglingAutoSync, setTogglingAutoSync] = useState<boolean>(false);
 
   const fetchGitStatus = async () => {
     try {
       const data = await apiFetchJson<any>("/api/git/status");
-      if (data.ok) setGitInfo(data.git);
+      if (data.ok) {
+        setGitInfo(data.git);
+        if (data.bidirectional || data.git?.bidirectional) {
+          setBiSync(data.bidirectional || data.git?.bidirectional);
+        }
+      }
     } catch {}
   };
 
@@ -185,6 +193,10 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   useEffect(() => {
     void fetchGitStatus();
     void fetchMcpStatus();
+    const timer = setInterval(() => {
+      void fetchGitStatus();
+    }, 8000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -197,26 +209,60 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
     }
   }, [overview?.ollama_status?.endpoint]);
 
+  const handleToggleAutoSync = async (updates: {
+    enabled?: boolean;
+    intervalSec?: number;
+    autoFastForwardPull?: boolean;
+    autoPushWorkBranch?: boolean;
+  }) => {
+    setTogglingAutoSync(true);
+    try {
+      const data = await apiFetchJson<any>("/api/git/bidirectional/toggle", {
+        method: "POST",
+        body: JSON.stringify(updates),
+      });
+      if (data.ok && data.sync) {
+        setBiSync(data.sync);
+      }
+      void fetchGitStatus();
+    } catch (err: any) {
+      setSyncResult({
+        push_status: "BŁĄD KONFIGURACJI",
+        head_hash: biSync?.headHash || "N/A",
+        push_detail: err?.message || "Nie udało się zmienić konfiguracji auto-sync.",
+      });
+    } finally {
+      setTogglingAutoSync(false);
+    }
+  };
+
   const handleGitSync = async (e: React.FormEvent) => {
     e.preventDefault();
     setSyncing(true);
     try {
-      const data = await apiFetchJson<any>("/api/git/sync", {
+      const data = await apiFetchJson<any>("/api/git/bidirectional/sync", {
         method: "POST",
         body: JSON.stringify({
           commitMessage: commitMsg,
-          remoteUrl: "https://github.com/Rush47/Bastilla_Ultimate.git",
+          stageAndCommit: stageAndCommitOnSync,
+          pushNow: true,
         }),
       });
-      if (data.ok) {
-        setSyncResult(data.sync);
+      if (data.ok && data.sync) {
+        setBiSync(data.sync);
+        setSyncResult({
+          push_status: `IN: ${data.sync.inboundStatus} · OUT: ${data.sync.outboundStatus}`,
+          head_hash: data.sync.headHash || "HEAD",
+          push_detail: data.sync.lastDetail,
+        });
         void fetchGitStatus();
         onRefresh();
       }
     } catch (err: any) {
       setSyncResult({
-        push_status: "WYMAGANY PRZEGLĄD",
-        push_detail: err?.message || "Błąd synchronizacji Git",
+        push_status: "BŁĄD SYNCHRONIZACJI",
+        head_hash: biSync?.headHash || "N/A",
+        push_detail: err?.message || "Błąd synchronizacji obustronnej Git",
       });
     } finally {
       setSyncing(false);
@@ -491,29 +537,150 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
 
       {/* Section 2: GitHub Bastilla_OS_Ultimate (main branch) Auto-Sync & AgenticLinux Base */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Left (6 cols): GitHub Bastilla_OS_Ultimate (main) */}
+        {/* Left (6 cols): GitHub Bastilla_OS_Ultimate Bidirectional Auto-Sync */}
         <section className="lg:col-span-6 bg-[#0c1018] border border-slate-800 rounded-xl p-6 flex flex-col justify-between">
           <div>
-            <div className="flex items-center justify-between mb-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
               <h3 className="font-display text-lg font-bold text-white">
-                02. Przegląd zmian Rush47/Bastilla_Ultimate
+                02. Automatyczna Synchronizacja Obustronna GitHub
               </h3>
-              <span className="text-xs font-mono-tabular text-violet-400">
-                Gałąź: {gitInfo?.branch || "main"}
-              </span>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`px-2 py-0.5 rounded text-[11px] font-mono-tabular font-semibold border ${
+                    biSync?.enabled
+                      ? "bg-emerald-950/60 border-emerald-700/60 text-emerald-300"
+                      : "bg-slate-900 border-slate-700 text-slate-400"
+                  }`}
+                >
+                  {biSync?.enabled ? `AUTO-SYNC AKTYWNY (${biSync.intervalSec}s)` : "AUTO-SYNC WSTRZYMANY"}
+                </span>
+                <span className="text-xs font-mono-tabular text-violet-400">
+                  Gałąź: {biSync?.branch || gitInfo?.branch || "main"}
+                </span>
+              </div>
             </div>
             <p className="text-xs text-slate-400 mb-4">
-              Zmiany wymagają osobnej gałęzi, sprawdzenia diff i pull requestu. Automatyczny push do main jest wyłączony.
+              Dwukierunkowa synchronizacja z repozytorium{" "}
+              <code className="text-slate-200">Rush47/Bastilla_Ultimate</code>: automatyczny{" "}
+              <strong>INBOUND</strong> (<code className="text-cyan-300">git fetch origin</code> + bezpieczny Fast-Forward) oraz{" "}
+              <strong>OUTBOUND</strong> (<code className="text-violet-300">git push origin &lt;gałąź-robocza&gt;</code> z ochroną gałęzi <code className="text-slate-200">main</code>).
             </p>
+
+            {/* Bidirectional Telemetry Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 mb-4 text-xs font-mono-tabular">
+              <div className="p-3 rounded-lg bg-[#111723] border border-slate-800">
+                <div className="text-slate-400 text-[10px]">INBOUND (GitHub → Lokalnie)</div>
+                <div className="text-cyan-300 font-semibold mt-0.5">
+                  {biSync?.inboundStatus || "FETCHED"}
+                </div>
+                <div className="text-[11px] text-slate-400">
+                  origin/main: {biSync?.remoteHeadHash || "191f47f"} (behind: -{biSync?.behind ?? 0})
+                </div>
+              </div>
+              <div className="p-3 rounded-lg bg-[#111723] border border-slate-800">
+                <div className="text-slate-400 text-[10px]">OUTBOUND (Lokalnie → GitHub)</div>
+                <div
+                  className={`font-semibold mt-0.5 ${
+                    biSync?.outboundStatus === "PUSHED" || biSync?.outboundStatus === "UP_TO_DATE"
+                      ? "text-emerald-400"
+                      : "text-amber-300"
+                  }`}
+                >
+                  {biSync?.outboundStatus || "IDLE"}
+                </div>
+                <div className="text-[11px] text-slate-400">
+                  HEAD: {biSync?.headHash || "N/A"} (ahead: +{biSync?.ahead ?? 0})
+                </div>
+              </div>
+              <div className="p-3 rounded-lg bg-[#111723] border border-slate-800">
+                <div className="text-slate-400 text-[10px]">CYKLE I POŚWIADCZENIA</div>
+                <div className="text-white font-semibold mt-0.5">
+                  Cykl #{biSync?.syncCount ?? 0} · {biSync?.authReady || gitInfo?.gh_token_present ? "GH AUTH OK" : "TYLKO FETCH"}
+                </div>
+                <div className="text-[11px] text-slate-400 truncate">
+                  {biSync?.lastSyncAt
+                    ? `Ostatnio: ${new Date(biSync.lastSyncAt).toLocaleTimeString()}`
+                    : "Oczekiwanie na cykl"}
+                </div>
+              </div>
+            </div>
+
+            {/* Auto-Sync Controls */}
+            <div className="p-3.5 rounded-lg bg-[#111723] border border-slate-800 space-y-3 mb-4 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-3 flex-wrap">
+                  <button
+                    type="button"
+                    disabled={togglingAutoSync}
+                    onClick={() => void handleToggleAutoSync({ enabled: !biSync?.enabled })}
+                    className={`px-3 py-1.5 rounded font-semibold transition-colors ${
+                      biSync?.enabled
+                        ? "bg-emerald-700 hover:bg-emerald-600 text-white"
+                        : "bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600"
+                    }`}
+                  >
+                    {biSync?.enabled ? "Wstrzymaj Auto-Sync" : "Włącz Auto-Sync"}
+                  </button>
+                  <label className="flex items-center gap-1.5 text-slate-300">
+                    <span>Interwał:</span>
+                    <select
+                      value={biSync?.intervalSec || 60}
+                      onChange={(e) =>
+                        void handleToggleAutoSync({ intervalSec: Number(e.target.value) })
+                      }
+                      className="bg-[#07090e] border border-slate-700 rounded px-2 py-1 text-white font-mono-tabular"
+                    >
+                      <option value={30}>30 s</option>
+                      <option value={60}>60 s</option>
+                      <option value={120}>120 s</option>
+                      <option value={300}>300 s</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-3 flex-wrap text-[11px] text-slate-300">
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={biSync?.autoFastForwardPull ?? true}
+                      onChange={(e) =>
+                        void handleToggleAutoSync({ autoFastForwardPull: e.target.checked })
+                      }
+                    />
+                    <span>Auto Fast-Forward Pull</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={biSync?.autoPushWorkBranch ?? true}
+                      onChange={(e) =>
+                        void handleToggleAutoSync({ autoPushWorkBranch: e.target.checked })
+                      }
+                    />
+                    <span>Auto Push gałęzi roboczej</span>
+                  </label>
+                </div>
+              </div>
+            </div>
 
             <form onSubmit={handleGitSync} className="space-y-3 mb-5">
               <div>
-                <label
-                  htmlFor="git-commit-msg"
-                  className="block text-xs text-slate-400 mb-1"
-                >
-                  Opis planowanych zmian
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label
+                    htmlFor="git-commit-msg"
+                    className="block text-xs text-slate-400"
+                  >
+                    Opis zmian do commita przy synchronizacji obustronnej
+                  </label>
+                  <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={stageAndCommitOnSync}
+                      onChange={(e) => setStageAndCommitOnSync(e.target.checked)}
+                    />
+                    <span>Zapisz lokalne zmiany na gałęzi roboczej ({gitInfo?.changed_files_count ?? 0} plików)</span>
+                  </label>
+                </div>
                 <div className="flex gap-2">
                   <input
                     id="git-commit-msg"
@@ -527,19 +694,51 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
                     disabled={syncing}
                     className="px-4 py-2 rounded bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-xs font-semibold whitespace-nowrap shrink-0"
                   >
-                    {syncing ? "Synchronizacja..." : "Sprawdź zasady przeglądu"}
+                    {syncing ? "Synchronizacja..." : "Synchronizuj obustronnie teraz"}
                   </button>
                 </div>
               </div>
             </form>
 
-            {syncResult && (
+            {(syncResult || biSync?.lastDetail) && (
               <div className="p-3.5 rounded-lg bg-[#111723] border border-violet-700/60 text-xs font-mono-tabular space-y-1 mb-4">
                 <div className="text-emerald-400 font-semibold">
-                  Status: {syncResult.push_status} (HEAD: {syncResult.head_hash})
+                  Status: {syncResult?.push_status || `IN: ${biSync?.inboundStatus} · OUT: ${biSync?.outboundStatus}`} (HEAD: {syncResult?.head_hash || biSync?.headHash || "N/A"})
                 </div>
                 <div className="text-slate-300 font-sans">
-                  {syncResult.push_detail}
+                  {syncResult?.push_detail || biSync?.lastDetail}
+                </div>
+              </div>
+            )}
+
+            {Array.isArray(biSync?.recentEvents) && biSync.recentEvents.length > 0 && (
+              <div className="space-y-1.5 mb-4">
+                <div className="text-xs font-semibold text-slate-300">
+                  Dziennik synchronizacji obustronnej (INBOUND / OUTBOUND):
+                </div>
+                <div className="max-h-32 overflow-y-auto space-y-1 pr-1">
+                  {biSync.recentEvents.slice(0, 6).map((ev: any, i: number) => (
+                    <div
+                      key={i}
+                      className="p-2 rounded bg-[#07090e] border border-slate-800/90 text-[11px] font-mono-tabular flex items-center justify-between gap-2"
+                    >
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${
+                          ev.direction === "INBOUND"
+                            ? "bg-cyan-950/70 text-cyan-300"
+                            : ev.direction === "OUTBOUND"
+                            ? "bg-violet-950/70 text-violet-300"
+                            : "bg-slate-800 text-slate-300"
+                        }`}
+                      >
+                        {ev.direction}
+                      </span>
+                      <span className="text-slate-300 truncate flex-1">{ev.detail}</span>
+                      <span className="text-slate-500 shrink-0">
+                        {new Date(ev.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               </div>
             )}

@@ -122,7 +122,19 @@ export default function App() {
       void fetchOverview();
       void fetchContinuousMission();
     };
+    const handleGitSyncEvent = (ev: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(ev.data || "{}");
+        const s = parsed?.sync;
+        if (s && s.branch) {
+          setSyncNotice(
+            `GitHub Sync (${s.branch} · +${s.ahead ?? 0}/-${s.behind ?? 0} · IN:${s.inboundStatus} OUT:${s.outboundStatus})`
+          );
+        }
+      } catch {}
+    };
     es.addEventListener("sync", handleRefreshEvent);
+    es.addEventListener("git_sync", handleGitSyncEvent as EventListener);
     es.addEventListener("mission_cycle", handleRefreshEvent);
     es.addEventListener("image_generated", handleRefreshEvent);
     return () => {
@@ -163,14 +175,24 @@ export default function App() {
     try {
       const data = await apiFetchJson<{
         ok: boolean;
-        git_sync?: { ahead?: number; behind?: number; branch?: string };
+        git_sync?: {
+          ahead?: number;
+          behind?: number;
+          branch?: string;
+          inbound_status?: string;
+          outbound_status?: string;
+        };
         error?: string;
       }>("/api/system/sync", { method: "POST", body: "{}", timeoutMs: 25000 });
       await Promise.all([fetchOverview(), fetchContinuousMission()]);
       if (data.ok) {
         const ahead = data.git_sync?.ahead ?? 0;
         const behind = data.git_sync?.behind ?? 0;
-        setSyncNotice(`Zsynchronizowano (${data.git_sync?.branch || "main"} · +${ahead}/-${behind})`);
+        const inSt = data.git_sync?.inbound_status || "FETCHED";
+        const outSt = data.git_sync?.outbound_status || "IDLE";
+        setSyncNotice(
+          `Zsynchronizowano (${data.git_sync?.branch || "main"} · +${ahead}/-${behind} · IN:${inSt} OUT:${outSt})`
+        );
       }
     } catch (err: any) {
       setSyncNotice(err?.message || "Błąd synchronizacji");
