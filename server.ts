@@ -421,7 +421,9 @@ async function startServer() {
     const id = message.id ?? null;
     const reply = (result: unknown) => res.json({ jsonrpc: "2.0", id, result });
     const fail = (code: number, message: string) => res.json({ jsonrpc: "2.0", id, error: { code, message } });
-    if (message.method === "notifications/initialized") return res.status(202).end();
+    if (message.method.startsWith("notifications/")) return res.status(202).end();
+    if (message.id === undefined) return res.status(400).json({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Request id required" } });
+    if (message.method === "ping") return reply({});
     if (message.method === "initialize") return reply({
       protocolVersion: "2025-03-26",
       capabilities: { tools: { listChanged: false } },
