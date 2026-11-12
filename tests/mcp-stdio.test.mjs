@@ -55,4 +55,10 @@ test('local Bastilla MCP initializes and exposes safe tools', async (t) => {
   assert.equal(typeof parsed.branch, 'string');
   const invalid = await request('tools/call', { name: 'agent_memory_read', arguments: { agentId: '../private' } });
   assert.equal(invalid.result.isError, true);
+  const unknown = await request('tools/call', { name: 'terminal_exec', arguments: { command: 'id' } });
+  assert.equal(unknown.error.code, -32602);
+  const ping = await request('ping');
+  assert.deepEqual(ping.result, {});
+  const missing = await request('not-a-real-method');
+  assert.equal(missing.error.code, -32601);
 });
