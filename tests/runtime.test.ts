@@ -23,14 +23,24 @@ const ollama = createServer(async (req, res) => {
     req.socket.destroy();
     return;
   }
+  if (req.url === "/api/version") {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ version: "0.6.0-test" }));
+    return;
+  }
   if (req.url === "/api/tags") {
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify({ models: [{ name: "test-model" }] }));
     return;
   }
+  if (req.url === "/api/ps") {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ models: [] }));
+    return;
+  }
   let raw = "";
   for await (const chunk of req) raw += chunk;
-  modelRequests.push(JSON.parse(raw));
+  modelRequests.push(raw ? JSON.parse(raw) : {});
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify({ message: { content: "Test model response" } }));
 });

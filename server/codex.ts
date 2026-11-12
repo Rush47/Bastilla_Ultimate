@@ -287,9 +287,13 @@ print(json.dumps({"last_id": last_id}))
     agentId: string,
     sessionId: string,
     prompt: string,
-    options?: { autoStart?: boolean; stdin?: string; operatorToken?: string }
+    options?: { autoStart?: boolean; stdin?: string; operatorToken?: string; localAuthorized?: boolean }
   ): number {
-    if (!this.verifyOperatorPermission(options?.operatorToken)) {
+    const tokenConfigured = Boolean(this.env.BASTILLA_API_TOKEN?.trim());
+    const authorized = tokenConfigured
+      ? this.verifyOperatorPermission(options?.operatorToken)
+      : Boolean(options?.localAuthorized);
+    if (!authorized) {
       throw new CodexError(403, "Brak uprawnień operatora do wykonywania zadań Codex CLI.");
     }
     const cleanAgent = ["aria", "alex", "astyria", "aurelius"].includes(agentId.toLowerCase())

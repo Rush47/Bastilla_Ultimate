@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import type { CodexStatus } from "../types/codex";
+import { apiFetchJson } from "../utils/apiClient";
 
 export function CodexAuthPanel() {
   const [status, setStatus] = useState<CodexStatus | null>(null);
@@ -7,9 +8,10 @@ export function CodexAuthPanel() {
   const [error, setError] = useState("");
   const refresh = useCallback(async () => {
     try {
-      const response = await fetch("/api/codex/status");
-      const data = await response.json();
-      if (!response.ok || !data.ok) throw new Error(data.error || "Nie udało się odczytać stanu Codex CLI.");
+      const data = await apiFetchJson<CodexStatus & { ok: boolean; error?: string }>(
+        "/api/codex/status"
+      );
+      if (!data.ok) throw new Error(data.error || "Nie udało się odczytać stanu Codex CLI.");
       setStatus(data);
     } catch (error) {
       setError(error instanceof Error ? error.message : "Błąd połączenia z serwerem.");
@@ -28,13 +30,14 @@ export function CodexAuthPanel() {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch("/api/codex/auth", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action }),
-      });
-      const data = await response.json();
-      if (!response.ok || !data.ok) throw new Error(data.error || "Operacja Codex CLI nie powiodła się.");
+      const data = await apiFetchJson<CodexStatus & { ok: boolean; error?: string }>(
+        "/api/codex/auth",
+        {
+          method: "POST",
+          body: JSON.stringify({ action }),
+        }
+      );
+      if (!data.ok) throw new Error(data.error || "Operacja Codex CLI nie powiodła się.");
       setStatus(data);
     } catch (error) {
       setError(error instanceof Error ? error.message : "Błąd połączenia z serwerem.");

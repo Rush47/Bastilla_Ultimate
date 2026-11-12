@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import type { AgentId } from "../types/bastilla";
+import { apiFetchJson } from "../utils/apiClient";
 
 type Job = { id: string; agent_id: string; prompt: string; priority: number; status: string; provider: string; model: string; result: string; error: string; created_at: string; heartbeat_at: string | null };
 type Capability = { id: string; checked_at: string; linux: { state: string; uid?: number; gid?: number; tools: Record<string, boolean>; repository: { read: boolean; write: boolean }; github: { state: string; read: boolean; push: boolean } }; model: { state: string; model: string | null; last_success_at: string | null }; note: string };
@@ -17,9 +18,12 @@ export function AgentControlView() {
   const [checkedAt, setCheckedAt] = useState("");
   const refresh = useCallback(async (remote = false) => {
     try {
-      const responses = await Promise.all([fetch("/api/agent-tasks"), fetch(`/api/agents/capabilities${remote ? "?remote=true" : ""}`)]);
-      if (responses.some(r => !r.ok)) throw new Error("Nie udało się odczytać statusów. Dane mogą być nieaktualne.");
-      const [tasks, capabilities] = await Promise.all(responses.map(r => r.json()));
+      const [tasks, capabilities] = await Promise.all([
+        apiFetchJson<{ tasks: Job[] }>("/api/agent-tasks"),
+        apiFetchJson<{ agents: Capability[] }>(
+          `/api/agents/capabilities${remote ? "?remote=true" : ""}`
+        ),
+      ]);
       setJobs(tasks.tasks); setAgents(capabilities.agents); setCheckedAt(new Date().toLocaleTimeString()); setError("");
     } catch (e) { setError(e instanceof Error ? e.message : "Brak połączenia."); }
   }, []);
@@ -33,18 +37,20 @@ export function AgentControlView() {
   async function submit(e: React.FormEvent) {
     e.preventDefault(); setBusy(true);
     try {
-      const response = await fetch("/api/agent-tasks", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agentId, prompt, priority, idempotencyKey: crypto.randomUUID() }) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error);
+      await apiFetchJson("/api/agent-tasks", {
+        method: "POST",
+        body: JSON.stringify({ agentId, prompt, priority, idempotencyKey: crypto.randomUUID() }),
+      });
       setPrompt(""); await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Błąd zapisu zadania."); }
     finally { setBusy(false); }
   }
   async function cancel(id: string) {
     try {
-      const response = await fetch(`/api/agent-tasks/${id}/cancel`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      const data = await response.json(); if (!response.ok) throw new Error(data.error);
+      await apiFetchJson(`/api/agent-tasks/${id}/cancel`, {
+        method: "POST",
+        body: "{}",
+      });
       await refresh();
     } catch (e) { setError(e instanceof Error ? e.message : "Błąd anulowania."); }
   }

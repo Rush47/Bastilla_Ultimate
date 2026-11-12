@@ -1,8 +1,9 @@
 import { CodexAuthPanel } from "./CodexAuthPanel";
 import { CodexTasksPanel } from "./CodexTasksPanel";
-import React, { useState } from "react";
+import React, { useState, useRef } from "react";
 import type { AgentId } from "../types/bastilla";
-import { Play, Sparkles, Terminal, CheckCircle2, ShieldCheck } from "lucide-react";
+import { Play, Sparkles, Square } from "lucide-react";
+import { apiFetchJson } from "../utils/apiClient";
 
 type TerminalMode =
   | "LINUX_ROOT"
@@ -174,6 +175,9 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
   const [translatingNlp, setTranslatingNlp] = useState<boolean>(false);
   const [running, setRunning] = useState<boolean>(false);
   const [logs, setLogs] = useState<TerminalLogEntry[]>([]);
+  const [cmdHistory, setCmdHistory] = useState<string[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<number>(-1);
+  const execAbortRef = useRef<AbortController | null>(null);
 
   const handleModeSwitch = (newMode: TerminalMode) => {
     setMode(newMode);
@@ -181,21 +185,30 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
     setNaturalPrompt("");
   };
 
+  const stopRunningCommand = () => {
+    execAbortRef.current?.abort();
+    execAbortRef.current = null;
+  };
+
   const executeTerminalCommand = async (cmdOverride?: string) => {
     const targetCmd = cmdOverride ?? command;
     if (!targetCmd.trim()) return;
+    setCmdHistory((prev) => [targetCmd, ...prev.slice(0, 49)]);
+    setHistoryCursor(-1);
     setRunning(true);
+    const controller = new AbortController();
+    execAbortRef.current = controller;
     try {
-      const res = await fetch("/api/terminal/exec", {
+      const data = await apiFetchJson<any>("/api/terminal/exec", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        timeoutMs: 30000,
         body: JSON.stringify({
           mode,
           command: targetCmd,
           agentUser,
         }),
       });
-      const data = await res.json();
       const entry: TerminalLogEntry = {
         id: Date.now(),
         mode,
@@ -208,9 +221,27 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
       };
       setLogs((prev) => [entry, ...prev]);
       onRefresh();
-    } catch (error) {
-      setLogs(prev => [{ id: Date.now(), mode, agentUser, command: targetCmd, stdout: "", stderr: error instanceof Error ? error.message : "Błąd połączenia", exitCode: 1, timestamp: new Date().toLocaleTimeString() }, ...prev]);
+    } catch (error: any) {
+      setLogs((prev) => [
+        {
+          id: Date.now(),
+          mode,
+          agentUser,
+          command: targetCmd,
+          stdout: "",
+          stderr:
+            error?.name === "AbortError"
+              ? "Przerwano przez Operatora."
+              : error instanceof Error
+              ? error.message
+              : "Błąd połączenia",
+          exitCode: 1,
+          timestamp: new Date().toLocaleTimeString(),
+        },
+        ...prev,
+      ]);
     } finally {
+      execAbortRef.current = null;
       setRunning(false);
     }
   };
@@ -221,9 +252,9 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
     if (!trimmed) return;
     setTranslatingNlp(true);
     try {
-      const res = await fetch("/api/terminal/nlp", {
+      const data = await apiFetchJson<any>("/api/terminal/nlp", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        timeoutMs: 30000,
         body: JSON.stringify({
           prompt: trimmed,
           mode,
@@ -231,30 +262,54 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
           autoExecute: true,
         }),
       });
-      const data = await res.json();
       if (!data.ok) {
-        setLogs(prev => [{ id: Date.now(), mode, agentUser, command: trimmed, stdout: "", stderr: data.error || "Błąd tłumaczenia polecenia", exitCode: 1, timestamp: new Date().toLocaleTimeString() }, ...prev]);
+        setLogs((prev) => [
+          {
+            id: Date.now(),
+            mode,
+            agentUser,
+            command: trimmed,
+            stdout: "",
+            stderr: data.error || "Błąd tłumaczenia polecenia",
+            exitCode: 1,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+          ...prev,
+        ]);
         return;
       }
-      if (data.ok) {
-        setCommand(data.generatedCommand);
-        const entry: TerminalLogEntry = {
+      setCommand(data.generatedCommand);
+      const entry: TerminalLogEntry = {
+        id: Date.now(),
+        mode,
+        agentUser:
+          mode === "AGENT_USER"
+            ? agentUser
+            : String(data.execution_identity?.uid ?? "server"),
+        naturalPrompt: trimmed,
+        command: data.generatedCommand,
+        stdout: data.stdout || "",
+        stderr: data.stderr || "",
+        exitCode: data.exitCode ?? 0,
+        timestamp: new Date().toLocaleTimeString(),
+      };
+      setLogs((prev) => [entry, ...prev]);
+      setNaturalPrompt("");
+      onRefresh();
+    } catch (error) {
+      setLogs((prev) => [
+        {
           id: Date.now(),
           mode,
-          agentUser: mode === "AGENT_USER" ? agentUser : String(data.execution_identity?.uid ?? "server"),
-          naturalPrompt: trimmed,
-          command: data.generatedCommand,
-          stdout: data.stdout || "",
-          stderr: data.stderr || "",
-          exitCode: data.exitCode ?? 0,
+          agentUser,
+          command: trimmed,
+          stdout: "",
+          stderr: error instanceof Error ? error.message : "Błąd połączenia",
+          exitCode: 1,
           timestamp: new Date().toLocaleTimeString(),
-        };
-        setLogs((prev) => [entry, ...prev]);
-        setNaturalPrompt("");
-        onRefresh();
-      }
-    } catch (error) {
-      setLogs(prev => [{ id: Date.now(), mode, agentUser, command: trimmed, stdout: "", stderr: error instanceof Error ? error.message : "Błąd połączenia", exitCode: 1, timestamp: new Date().toLocaleTimeString() }, ...prev]);
+        },
+        ...prev,
+      ]);
     } finally {
       setTranslatingNlp(false);
     }
@@ -421,17 +476,40 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
                 rows={mode === "PYTHON_ROOT" ? 3 : 2}
                 value={command}
                 onChange={(e) => setCommand(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "ArrowUp" && e.altKey && cmdHistory.length > 0) {
+                    e.preventDefault();
+                    const nextIdx = Math.min(historyCursor + 1, cmdHistory.length - 1);
+                    setHistoryCursor(nextIdx);
+                    setCommand(cmdHistory[nextIdx]);
+                  } else if (e.key === "ArrowDown" && e.altKey && historyCursor >= 0) {
+                    e.preventDefault();
+                    const nextIdx = historyCursor - 1;
+                    setHistoryCursor(nextIdx);
+                    if (nextIdx >= 0) setCommand(cmdHistory[nextIdx]);
+                  }
+                }}
                 className="flex-1 p-2.5 rounded-lg bg-[#07090e] border border-slate-700 font-mono-tabular text-xs text-emerald-300 focus:outline-none focus:border-violet-500"
               />
-              <button
-                type="button"
-                onClick={() => executeTerminalCommand()}
-                disabled={running}
-                className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 self-start"
-              >
-                <Play className="w-3.5 h-3.5" />
-                {running ? "Wykonywanie..." : "Wykonaj"}
-              </button>
+              {running ? (
+                <button
+                  type="button"
+                  onClick={stopRunningCommand}
+                  className="min-h-11 px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 self-start"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  Zatrzymaj
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void executeTerminalCommand()}
+                  className="min-h-11 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 self-start"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  Wykonaj
+                </button>
+              )}
             </div>
           </div>
 

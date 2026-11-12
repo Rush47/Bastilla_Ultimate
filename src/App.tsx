@@ -6,6 +6,12 @@ import type {
   WorkspaceTab,
 } from "./types/bastilla";
 import { BastillaDesktopView } from "./components/BastillaDesktopView";
+import {
+  apiFetchJson,
+  ApiError,
+  buildApiUrl,
+  onApiUnauthorized,
+} from "./utils/apiClient";
 const ChatWorkView = React.lazy(() => import("./components/ChatWorkView").then(m => ({ default: m.ChatWorkView })));
 const TerminalsView = React.lazy(() => import("./components/TerminalsView").then(m => ({ default: m.TerminalsView })));
 const AgentsMemoryView = React.lazy(() => import("./components/AgentsMemoryView").then(m => ({ default: m.AgentsMemoryView })));
@@ -22,6 +28,8 @@ export default function App() {
   const [accessToken, setAccessToken] = useState("");
   const [accessError, setAccessError] = useState("");
   const [loading, setLoading] = useState<boolean>(true);
+  const [syncing, setSyncing] = useState<boolean>(false);
+  const [syncNotice, setSyncNotice] = useState<string | null>(null);
 
   const [continuousMission, setContinuousMission] = useState<{
     active: boolean;
@@ -41,18 +49,23 @@ export default function App() {
   } | null>(null);
   const [triggeringCycle, setTriggeringCycle] = useState(false);
 
+  useEffect(() => {
+    return onApiUnauthorized(() => setNeedsLogin(true));
+  }, []);
+
   const fetchOverview = useCallback(async () => {
     try {
-      const res = await fetch("/api/system/overview");
-      if (res.status === 401) { setNeedsLogin(true); return; }
-      const contentType = res.headers.get("content-type") || "";
-      if (res.ok && contentType.includes("application/json")) {
-        const data = await res.json();
-        if (data.ok) {
-          setOverview(data);
-        }
+      const data = await apiFetchJson<SystemOverviewResponse>("/api/system/overview", {
+        timeoutMs: 12000,
+      });
+      if (data.ok) {
+        setOverview(data);
       }
     } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        setNeedsLogin(true);
+        return;
+      }
       console.error("Failed to fetch Bastilla OS overview:", e);
     } finally {
       setLoading(false);
@@ -61,13 +74,12 @@ export default function App() {
 
   const fetchContinuousMission = useCallback(async () => {
     try {
-      const res = await fetch("/api/missions/continuous/status");
-      const contentType = res.headers.get("content-type") || "";
-      if (res.ok && contentType.includes("application/json")) {
-        const data = await res.json();
-        if (data.ok) {
-          setContinuousMission(data.mission);
-        }
+      const data = await apiFetchJson<{ ok: boolean; mission: any }>(
+        "/api/missions/continuous/status",
+        { timeoutMs: 8000 }
+      );
+      if (data.ok) {
+        setContinuousMission(data.mission);
       }
     } catch {}
   }, []);
@@ -84,31 +96,67 @@ export default function App() {
     return () => clearInterval(interval);
   }, [fetchContinuousMission]);
 
+  useEffect(() => {
+    if (needsLogin || typeof EventSource === "undefined") return;
+    const es = new EventSource(buildApiUrl("/api/events/stream"));
+    const handleRefreshEvent = () => {
+      void fetchOverview();
+      void fetchContinuousMission();
+    };
+    es.addEventListener("sync", handleRefreshEvent);
+    es.addEventListener("mission_cycle", handleRefreshEvent);
+    es.addEventListener("image_generated", handleRefreshEvent);
+    return () => {
+      es.close();
+    };
+  }, [needsLogin, fetchOverview, fetchContinuousMission]);
+
   const toggleMission = async () => {
     try {
-      const res = await fetch("/api/missions/continuous/toggle", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      const contentType = res.headers.get("content-type") || "";
-      if (res.ok && contentType.includes("application/json")) {
-        const data = await res.json();
-        if (data.ok) setContinuousMission(data.mission);
-      }
+      const data = await apiFetchJson<{ ok: boolean; mission: any }>(
+        "/api/missions/continuous/toggle",
+        { method: "POST", body: "{}" }
+      );
+      if (data.ok) setContinuousMission(data.mission);
     } catch {}
   };
 
   const triggerMissionCycle = async () => {
     setTriggeringCycle(true);
     try {
-      const res = await fetch("/api/missions/continuous/trigger", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      const contentType = res.headers.get("content-type") || "";
-      if (res.ok && contentType.includes("application/json")) {
-        const data = await res.json();
-        if (data.ok) {
-          setContinuousMission(data.mission);
-          fetchOverview();
-        }
+      const data = await apiFetchJson<{ ok: boolean; mission: any }>(
+        "/api/missions/continuous/trigger",
+        { method: "POST", body: "{}" }
+      );
+      if (data.ok) {
+        setContinuousMission(data.mission);
+        void fetchOverview();
       }
+    } catch {
     } finally {
       setTriggeringCycle(false);
+    }
+  };
+
+  const handleGlobalSync = async () => {
+    setSyncing(true);
+    setSyncNotice(null);
+    try {
+      const data = await apiFetchJson<{
+        ok: boolean;
+        git_sync?: { ahead?: number; behind?: number; branch?: string };
+        error?: string;
+      }>("/api/system/sync", { method: "POST", body: "{}", timeoutMs: 25000 });
+      await Promise.all([fetchOverview(), fetchContinuousMission()]);
+      if (data.ok) {
+        const ahead = data.git_sync?.ahead ?? 0;
+        const behind = data.git_sync?.behind ?? 0;
+        setSyncNotice(`Zsynchronizowano (${data.git_sync?.branch || "main"} · +${ahead}/-${behind})`);
+      }
+    } catch (err: any) {
+      setSyncNotice(err?.message || "Błąd synchronizacji");
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -117,8 +165,10 @@ export default function App() {
     <form className="space-y-3" onSubmit={async e => {
       e.preventDefault();
       try {
-        const response = await fetch("/api/access/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: accessToken }) });
-        if (!response.ok) throw new Error("Nieautoryzowane. Sprawdź token dostępu.");
+        await apiFetchJson("/api/access/login", {
+          method: "POST",
+          body: JSON.stringify({ token: accessToken }),
+        });
         setAccessToken(""); setAccessError(""); setNeedsLogin(false); void fetchOverview();
       } catch (error) { setAccessError(error instanceof Error ? error.message : "Błąd połączenia."); }
     }}>
@@ -129,9 +179,15 @@ export default function App() {
   </main>;
 
   return (
-    <div className="min-h-screen bg-[#07090e] text-slate-100 flex flex-col">
+    <div
+      className={`${
+        activeTab === "chat"
+          ? "h-[100dvh] overflow-hidden"
+          : "min-h-screen overflow-x-hidden"
+      } bg-[#07090e] text-slate-100 flex flex-col`}
+    >
       {/* Responsive Compact Top Bar */}
-      <header className="flex flex-wrap lg:flex-nowrap items-center justify-between gap-3 px-3 sm:px-6 py-3 border-b border-slate-800 bg-[#0a0d14]">
+      <header className="flex flex-wrap lg:flex-nowrap items-center justify-between gap-2 sm:gap-3 px-3 sm:px-6 py-2 border-b border-slate-800 bg-[#0a0d14] shrink-0">
         {/* Zone 1: Single text element wordmark */}
         <a
           href="#desktop"
@@ -139,7 +195,7 @@ export default function App() {
             e.preventDefault();
             setActiveTab("desktop");
           }}
-          className="font-display text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+          className="font-display text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
         >
           Bastilla OS Ultimate
         </a>
@@ -147,13 +203,13 @@ export default function App() {
         {/* Zone 2: 5 concise single-line text navigation links */}
         <nav
           aria-label="Główna nawigacja systemu"
-          className="order-3 lg:order-none flex w-full lg:w-auto min-w-0 items-center gap-5 text-sm font-medium text-slate-300 overflow-x-auto"
+          className="order-3 lg:order-none flex w-full lg:w-auto min-w-0 items-center gap-4 sm:gap-5 text-xs sm:text-sm font-medium text-slate-300 overflow-x-auto no-scrollbar"
         >
           <button type="button" onClick={() => setActiveTab("control")} className={`min-h-11 whitespace-nowrap shrink-0 border-b-2 ${activeTab === "control" ? "border-violet-500 text-white" : "border-transparent text-slate-400"}`}>Sterowanie</button>
           <button
             type="button"
             onClick={() => setActiveTab("desktop")}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
               activeTab === "desktop"
                 ? "text-white border-violet-500"
                 : "text-slate-400 border-transparent hover:text-white"
@@ -164,7 +220,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab("chat")}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
               activeTab === "chat"
                 ? "text-white border-violet-500"
                 : "text-slate-400 border-transparent hover:text-white"
@@ -175,7 +231,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab("terminals")}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
               activeTab === "terminals"
                 ? "text-white border-violet-500"
                 : "text-slate-400 border-transparent hover:text-white"
@@ -186,7 +242,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab("agents")}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
               activeTab === "agents"
                 ? "text-white border-violet-500"
                 : "text-slate-400 border-transparent hover:text-white"
@@ -197,7 +253,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab("space3d")}
-            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
               activeTab === "space3d"
                 ? "text-white border-violet-500"
                 : "text-slate-400 border-transparent hover:text-white"
@@ -207,12 +263,12 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: 1 primary action */}
-        <div className="flex items-center shrink-0">
+        {/* Zone 3: Primary actions */}
+        <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={() => setActiveTab("diagnostics")}
-            className={`px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
+            className={`min-h-11 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
               activeTab === "diagnostics"
                 ? "bg-violet-500 text-white"
                 : "bg-violet-600 hover:bg-violet-500 text-white"
@@ -224,7 +280,7 @@ export default function App() {
       </header>
 
       {/* Continuous Autonomous Background Mission Bar (Aria, Alex, Astyria, Aurelius) */}
-      <div className="bg-[#0b0f1a] border-b border-violet-900/40 px-3 sm:px-6 py-1.5 flex flex-wrap items-center justify-between gap-2 text-xs font-mono-tabular">
+      <div className="bg-[#0b0f1a] border-b border-violet-900/40 px-3 sm:px-6 py-1.5 flex flex-wrap items-center justify-between gap-1.5 sm:gap-2 text-xs font-mono-tabular shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="relative flex h-2.5 w-2.5 shrink-0">
             {continuousMission?.active && (
@@ -237,32 +293,40 @@ export default function App() {
             />
           </span>
           <span className="font-bold text-white uppercase text-[11px] tracking-wide shrink-0 flex items-center gap-1.5">
-            {continuousMission?.active ? "🟢 KONTROLA SQLITE AKTYWNA" : "🟡 KONTROLA SQLITE WSTRZYMANA"}
+            {continuousMission?.active ? "KONTROLA SQLITE AKTYWNA" : "KONTROLA SQLITE WSTRZYMANA"}
           </span>
           <span className="px-1.5 py-0.5 rounded bg-violet-950/80 border border-violet-700/50 text-violet-300 text-[10px] shrink-0 font-bold">
             Cykl #{continuousMission?.cycle ?? 0}
           </span>
           <span className="text-slate-400 hidden md:inline truncate max-w-sm lg:max-w-xl text-[11px]">
-            {continuousMission?.lastAction || "Kontrola SQLite wykonywana przez serwer"}
+            {syncNotice || continuousMission?.lastAction || "Kontrola SQLite wykonywana przez serwer"}
           </span>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 flex-wrap">
           <span className="text-[10px] text-slate-400 hidden xl:inline">
             RAM zwolniony: <strong className="text-cyan-300">+{continuousMission?.stats?.memoryFreedMb || 0} MB</strong>
           </span>
           <button
             type="button"
+            onClick={handleGlobalSync}
+            disabled={syncing}
+            className="min-h-9 sm:min-h-7 px-2.5 sm:px-3 py-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 whitespace-nowrap"
+          >
+            {syncing ? "Synchronizacja..." : "Synchronizuj"}
+          </button>
+          <button
+            type="button"
             onClick={triggerMissionCycle}
             disabled={triggeringCycle}
-            className="px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 flex items-center gap-1"
+            className="min-h-9 sm:min-h-7 px-2 sm:px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap"
           >
-            <span>{triggeringCycle ? "Wykonywanie..." : "⚡ Wymuś cykl"}</span>
+            <span>{triggeringCycle ? "Wykonywanie..." : "Wymuś cykl"}</span>
           </button>
           <button
             type="button"
             onClick={toggleMission}
-            className={`px-2.5 py-1 rounded text-[11px] font-semibold transition-colors ${
+            className={`min-h-9 sm:min-h-7 px-2 sm:px-2.5 py-1 rounded text-[11px] font-semibold transition-colors whitespace-nowrap ${
               continuousMission?.active
                 ? "bg-slate-800 hover:bg-slate-700 text-slate-300"
                 : "bg-emerald-600 hover:bg-emerald-500 text-white"
@@ -274,8 +338,12 @@ export default function App() {
       </div>
 
       {/* Main Content Stage */}
-      {overview?.host.legacy_records_unverified && <p className="px-3 sm:px-6 py-3 text-sm text-amber-200 border-b border-amber-900">Zachowano historię starszej wersji, która może zawierać dane demonstracyjne. Dostęp agentów i rzeczywiste wyniki sprawdź w zakładce Sterowanie.</p>}
-      <main className="flex-1 min-w-0">
+      {overview?.host.legacy_records_unverified && (
+        <p className={`px-3 sm:px-6 py-1.5 sm:py-2.5 text-xs sm:text-sm text-amber-200 border-b border-amber-900 shrink-0 ${activeTab === "chat" ? "hidden sm:block" : ""}`}>
+          Zachowano historię starszej wersji, która może zawierać dane demonstracyjne. Dostęp agentów i rzeczywiste wyniki sprawdź w zakładce Sterowanie.
+        </p>
+      )}
+      <main className={`flex-1 min-w-0 ${activeTab === "chat" ? "min-h-0 flex flex-col overflow-hidden" : ""}`}>
         <React.Suspense fallback={<p className="p-6">Ładowanie panelu…</p>}>
         {loading && !overview ? (
           <div className="p-8 max-w-5xl mx-auto space-y-4">

@@ -16,6 +16,7 @@ import {
   ShieldCheck,
   FlaskConical,
 } from "lucide-react";
+import { apiFetchJson, buildApiUrl } from "../utils/apiClient";
 
 export interface CodexTask {
   id: number;
@@ -120,28 +121,25 @@ export function CodexTasksPanel({
 
   const fetchCodexStatus = useCallback(async () => {
     try {
-      const res = await fetch("/api/codex/status");
-      if (res.ok) {
-        const data = await res.json();
-        if (data.ok) {
-          setCodexStatus({
-            installed: Boolean(data.installed),
-            auth_ready: Boolean(data.auth_ready),
-            login_status: String(data.login_status || "unavailable"),
-            message: String(data.message || ""),
-          });
-        }
+      const data = await apiFetchJson<any>("/api/codex/status");
+      if (data.ok) {
+        setCodexStatus({
+          installed: Boolean(data.installed),
+          auth_ready: Boolean(data.auth_ready),
+          login_status: String(data.login_status || "unavailable"),
+          message: String(data.message || ""),
+        });
       }
     } catch {}
   }, []);
 
   const fetchTasks = useCallback(async () => {
     try {
-      const res = await fetch(`/api/codex/tasks?sessionId=${encodeURIComponent(sessionId)}`);
-      const data = await res.json();
+      const data = await apiFetchJson<any>(
+        `/api/codex/tasks?sessionId=${encodeURIComponent(sessionId)}`
+      );
       if (data.ok && Array.isArray(data.tasks)) {
         setTasks(data.tasks);
-        // Auto-reconnect to running or most recent task if none selected
         if (data.tasks.length > 0) {
           const running = data.tasks.find((t: CodexTask) => t.status === "running");
           if (running && activeLogTaskId === null) {
@@ -161,8 +159,7 @@ export function CodexTasksPanel({
 
   const fetchGitSummary = useCallback(async () => {
     try {
-      const res = await fetch("/api/codex/git-summary");
-      const data = await res.json();
+      const data = await apiFetchJson<any>("/api/codex/git-summary");
       if (data.ok) {
         setGitSummary({
           repository: data.repository || "https://github.com/Rush47/Bastilla_Ultimate",
@@ -218,7 +215,9 @@ export function CodexTasksPanel({
 
     const connectStream = () => {
       if (unmounted) return;
-      eventSource = new EventSource(`/api/codex/tasks/${activeLogTaskId}/stream`);
+      eventSource = new EventSource(
+        buildApiUrl(`/api/codex/tasks/${activeLogTaskId}/stream`)
+      );
       eventSource.onopen = () => {
         if (!unmounted) setSseConnected(true);
       };
@@ -273,11 +272,8 @@ export function CodexTasksPanel({
     setSubmitting(true);
     setDispatchError("");
     try {
-      const res = await fetch("/api/codex/tasks", {
+      const data = await apiFetchJson<any>("/api/codex/tasks", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
         body: JSON.stringify({
           agentId: activeAgent,
           sessionId,
@@ -286,9 +282,8 @@ export function CodexTasksPanel({
           autoStart,
         }),
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        setDispatchError(data.error || `Błąd serwera (${res.status}) podczas zlecania zadania.`);
+      if (!data.ok) {
+        setDispatchError(data.error || "Błąd serwera podczas zlecania zadania.");
         return;
       }
       if (data.taskId) {
@@ -296,7 +291,7 @@ export function CodexTasksPanel({
         setStdinInput("");
         selectLogTask(data.taskId);
         setActiveTab("queue");
-        fetchTasks();
+        void fetchTasks();
       }
     } catch (err: any) {
       setDispatchError(err?.message || "Nie udało się połączyć z backendem.");
@@ -311,32 +306,41 @@ export function CodexTasksPanel({
   };
 
   const handleStart = async (taskId: number) => {
-    await fetch(`/api/codex/tasks/${taskId}/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    selectLogTask(taskId);
-    fetchTasks();
+    try {
+      await apiFetchJson(`/api/codex/tasks/${taskId}/start`, {
+        method: "POST",
+        body: "{}",
+      });
+      selectLogTask(taskId);
+      void fetchTasks();
+    } catch (err: any) {
+      setDispatchError(err?.message || "Nie udało się uruchomić zadania.");
+    }
   };
 
   const handleCancel = async (taskId: number) => {
-    await fetch(`/api/codex/tasks/${taskId}/cancel`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    fetchTasks();
+    try {
+      await apiFetchJson(`/api/codex/tasks/${taskId}/cancel`, {
+        method: "POST",
+        body: "{}",
+      });
+      void fetchTasks();
+    } catch (err: any) {
+      setDispatchError(err?.message || "Nie udało się anulować zadania.");
+    }
   };
 
   const handleRetry = async (taskId: number) => {
-    await fetch(`/api/codex/tasks/${taskId}/retry`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    selectLogTask(taskId);
-    fetchTasks();
+    try {
+      await apiFetchJson(`/api/codex/tasks/${taskId}/retry`, {
+        method: "POST",
+        body: "{}",
+      });
+      selectLogTask(taskId);
+      void fetchTasks();
+    } catch (err: any) {
+      setDispatchError(err?.message || "Nie udało się ponowić zadania.");
+    }
   };
 
   const activeTask = tasks.find((t) => t.id === activeLogTaskId);

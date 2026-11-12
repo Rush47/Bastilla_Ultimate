@@ -11,7 +11,15 @@ import { installApiSecurity, redact } from "./server/security";
 import { MCPServerManager } from "./server/mcp";
 import { AGENTS, TaskQueue } from "./server/task-queue";
 import { agentAccess } from "./server/agent-access";
-import { CodexAuthManager, CodexError } from "./server/codex";
+import { CodexAuthManager, CodexError, CodexTaskManager } from "./server/codex";
+import {
+  pickPreferredOllamaModel,
+  probeOllamaStatus,
+  pullOllamaModelSafe,
+  startOllamaDaemon,
+  streamOllamaChat,
+} from "./server/ollama";
+import { ImageGenerationManager } from "./server/images";
 import {
   GoogleGenAI,
   GenerateContentResponse,
@@ -37,7 +45,11 @@ const DB_PATH = path.resolve(process.env.BASTILLA_DB_PATH ||
   (fs.existsSync("/var/lib/bastilla/bastilla.db")
     ? "/var/lib/bastilla/bastilla.db"
     : path.join(PROJECT_ROOT, ".bastilla/bastilla.db")));
-const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/$/, "");
+const ENV_OLLAMA_EXPLICIT = Boolean(process.env.OLLAMA_BASE_URL?.trim());
+let activeOllamaBaseUrl = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+function getOllamaBaseUrl(): string {
+  return activeOllamaBaseUrl;
+}
 process.env.BASTILLA_PROJECT_ROOT = PROJECT_ROOT;
 process.env.BASTILLA_DB_PATH = DB_PATH;
 process.env.BASTILLA_KERNEL_DIR = KERNEL_DIR;
@@ -84,8 +96,63 @@ async function querySqliteJson(pyScript: string, args: string[] = []): Promise<a
   }
 }
 
+function getGeminiCandidateModels(): string[] {
+  const configured = process.env.GEMINI_MODEL?.trim();
+  const candidates = [
+    ...(configured ? [configured] : []),
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+  ];
+  return Array.from(new Set(candidates));
+}
+
+function formatGeminiApiError(err: any, modelUsed: string): string {
+  const raw = String(err?.message || err || "Nieznany błąd Gemini");
+  const jsonCandidate = raw.match(/\{[\s\S]*\}/)?.[0] || raw;
+  try {
+    const parsed = JSON.parse(jsonCandidate);
+    const code = parsed?.error?.code;
+    const msg = parsed?.error?.message;
+    if (msg) return `Gemini (${modelUsed}${code ? `, HTTP ${code}` : ""}): ${String(msg).replace(/\s+/g, " ").trim().slice(0, 260)}`;
+  } catch {}
+  return `Gemini (${modelUsed}): ${raw.replace(/\s+/g, " ").trim().slice(0, 260)}`;
+}
+
+function buildAgentSystemInstruction(agentId: string): string {
+  const names: Record<string, string> = {
+    aria: "Aria (Główny Koordynator i Analityk SVL)",
+    alex: "Alex (Architekt Jądra i Systemów Linux)",
+    astyria: "Astyria (Specjalistka Wizji, Grafiki i Symulacji)",
+    aurelius: "Aurelius (Inżynier Sieci, MCP i Floty 3D)",
+    council: "Konsylium 4X (Aria, Alex, Astyria, Aurelius)",
+  };
+  const identity = names[agentId] || "Aria";
+  return `Jesteś ${identity} w systemie Bastilla OS Ultimate Operatora Mateusz Mitek. Odpowiadaj swobodnie, rzeczowo i naturalnie w języku użytkownika (domyślnie po polsku). Nigdy nie zwracaj surowych bloków JSON typu dalle.text2im ani pola "thought", oraz nie wymyślaj wyników narzędzi ani plików graficznych.`;
+}
+
+function sanitizeConversationHistory(
+  rows: Array<{ sender_role: string; content: string }>
+): Array<{ sender_role: string; content: string }> {
+  const filtered = rows.filter((t) => {
+    const c = String(t?.content || "");
+    if (!c.trim()) return false;
+    return !/Jako model (językowy )?AI|nie potrafię bezpośrednio|Moje wytyczne|zasady bezpieczeństwa|nie mogę zrealizować|"action":\s*"dalle\.text2im"|\[OLLAMA:\s*Qwen/i.test(
+      c
+    );
+  });
+  // Drop orphaned leading assistant messages so multi-turn context starts cleanly with user
+  while (filtered.length > 0 && filtered[0].sender_role !== "user") {
+    filtered.shift();
+  }
+  return filtered;
+}
+
 async function runLiveMultimodalModel(
-  contents: any[]
+  contents: any[],
+  signal?: AbortSignal,
+  systemInstruction?: string
 ): Promise<{ text: string; modelUsed: string }> {
   const ai = getGeminiClient();
   if (!ai) {
@@ -93,10 +160,80 @@ async function runLiveMultimodalModel(
       "Brak klucza GEMINI_API_KEY w środowisku wykonawczym do obsługi wnioskowania neuronowego."
     );
   }
-  const modelUsed = process.env.GEMINI_MODEL || "gemini-flash-latest";
-  const response: GenerateContentResponse = await ai.models.generateContent({ model: modelUsed, contents });
-  if (!response.text?.trim()) throw new Error("Gemini zwrócił pustą odpowiedź.");
-  return { text: response.text, modelUsed };
+  const candidates = getGeminiCandidateModels();
+  let lastError: any = null;
+  for (const modelUsed of candidates) {
+    try {
+      const config: any = {};
+      if (signal) config.abortSignal = signal;
+      if (systemInstruction) config.systemInstruction = systemInstruction;
+      const response: GenerateContentResponse = await ai.models.generateContent({
+        model: modelUsed,
+        contents,
+        config: Object.keys(config).length ? config : undefined,
+      });
+      if (!response.text?.trim()) throw new Error("Gemini zwrócił pustą odpowiedź.");
+      return { text: response.text, modelUsed };
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || err || "");
+      if (signal?.aborted) throw err;
+      if (/404|429|RESOURCE_EXHAUSTED|quota|rate|not found|not supported|503|UNAVAILABLE|high demand/i.test(msg)) {
+        continue;
+      }
+      throw new Error(formatGeminiApiError(err, modelUsed));
+    }
+  }
+  throw new Error(formatGeminiApiError(lastError, candidates[0]));
+}
+
+async function streamLiveMultimodalModel(
+  contents: any[],
+  signal: AbortSignal,
+  onChunk: (delta: string) => void,
+  systemInstruction?: string
+): Promise<{ text: string; modelUsed: string }> {
+  const ai = getGeminiClient();
+  if (!ai) {
+    throw new Error(
+      "Brak klucza GEMINI_API_KEY w środowisku wykonawczym do obsługi wnioskowania neuronowego."
+    );
+  }
+  const candidates = getGeminiCandidateModels();
+  let lastError: any = null;
+  for (const modelUsed of candidates) {
+    try {
+      const config: any = { abortSignal: signal };
+      if (systemInstruction) config.systemInstruction = systemInstruction;
+      const stream = await ai.models.generateContentStream({
+        model: modelUsed,
+        contents,
+        config,
+      });
+      let accumulated = "";
+      for await (const chunk of stream) {
+        if (signal.aborted) break;
+        const partText = chunk.text || "";
+        if (partText) {
+          accumulated += partText;
+          onChunk(partText);
+        }
+      }
+      if (!accumulated.trim()) {
+        throw new Error("Gemini zwrócił pustą odpowiedź strumieniową.");
+      }
+      return { text: accumulated, modelUsed };
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || err || "");
+      if (signal.aborted) throw err;
+      if (/404|429|RESOURCE_EXHAUSTED|quota|rate|not found|not supported|503|UNAVAILABLE|high demand/i.test(msg)) {
+        continue;
+      }
+      throw new Error(formatGeminiApiError(err, modelUsed));
+    }
+  }
+  throw new Error(formatGeminiApiError(lastError, candidates[0]));
 }
 
 // Explicit Gemini compatibility adapter. It never advertises local model weights.
@@ -459,7 +596,7 @@ async function startServer() {
       });
       return response.text || "";
     }
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, { method: "POST",
+    const response = await fetch(`${getOllamaBaseUrl()}/api/chat`, { method: "POST",
       headers: { "Content-Type": "application/json" }, signal,
       body: JSON.stringify({ model: task.model, stream: false, messages: [{ role: "user", content: task.prompt }] }),
     });
@@ -470,12 +607,425 @@ async function startServer() {
     return typeof body.message?.content === "string" ? body.message.content : "";
   });
   process.once("exit", () => queue.close());
+  const imageManager = new ImageGenerationManager(DB_PATH);
+  const codexTasks = new CodexTaskManager(PROJECT_ROOT, DB_PATH, process.env);
+
+  const sseClients = new Set<express.Response>();
+  const broadcastSystemEvent = (type: string, data: Record<string, unknown> = {}) => {
+    const payload = `event: ${type}\ndata: ${JSON.stringify({ type, timestamp: new Date().toISOString(), ...data })}\n\n`;
+    for (const client of sseClients) {
+      try {
+        client.write(payload);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+  };
+
+  app.get("/api/events/stream", (req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.write(`event: connected\ndata: ${JSON.stringify({ ok: true, timestamp: new Date().toISOString() })}\n\n`);
+    sseClients.add(res);
+    const keepAlive = setInterval(() => {
+      try {
+        res.write(`: ping\n\n`);
+      } catch {
+        clearInterval(keepAlive);
+        sseClients.delete(res);
+      }
+    }, 25000);
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    });
+  });
+
+  if (!ENV_OLLAMA_EXPLICIT) {
+    try {
+      const savedMeta = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute("SELECT value FROM bastilla_metadata WHERE key='ollama_base_url'").fetchone()
+conn.close()
+print(json.dumps({"url": row[0] if row else ""}))`
+      );
+      if (savedMeta?.url && /^https?:\/\//i.test(String(savedMeta.url))) {
+        activeOllamaBaseUrl = String(savedMeta.url).trim().replace(/\/+$/, "");
+      }
+    } catch {}
+  }
+
+  app.get("/api/ollama/status", async (_req, res) => {
+    try {
+      const status = await probeOllamaStatus(getOllamaBaseUrl());
+      res.json({ ok: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, state: "ERROR", error: err?.message || "Błąd diagnostyki Ollama." });
+    }
+  });
+
+  app.post("/api/ollama/config", async (req, res) => {
+    try {
+      const raw = String(req.body?.endpoint || "").trim().replace(/\/+$/, "");
+      if (raw && !/^https?:\/\/[^/\s]+/i.test(raw)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Adres Ollama musi zaczynać się od http:// lub https:// (np. http://127.0.0.1:11434).",
+        });
+      }
+      const nextUrl = raw || (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+      activeOllamaBaseUrl = nextUrl;
+      await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("INSERT OR REPLACE INTO bastilla_metadata (key, value) VALUES ('ollama_base_url', ?)", (sys.argv[2],))
+conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
+        [raw]
+      );
+      const status = await probeOllamaStatus(getOllamaBaseUrl());
+      broadcastSystemEvent("ollama", { state: status.state, reachable: status.reachable, endpoint: status.endpoint });
+      res.json({ ok: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Nie udało się zapisać adresu Ollama." });
+    }
+  });
+
+  app.post("/api/ollama/pull", async (req, res) => {
+    try {
+      const model = String(req.body?.model || "").trim();
+      if (!model) {
+        return res.status(400).json({ ok: false, error: "Podaj nazwę modelu do pobrania." });
+      }
+      const result = await pullOllamaModelSafe(getOllamaBaseUrl(), model);
+      broadcastSystemEvent("ollama", { state: result.status.state, reachable: result.status.reachable });
+      res.status(result.ok ? 200 : 503).json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Nie udało się pobrać modelu Ollama." });
+    }
+  });
+
+  app.post("/api/ollama/start", async (_req, res) => {
+    try {
+      const result = await startOllamaDaemon(getOllamaBaseUrl());
+      broadcastSystemEvent("ollama", { state: result.status.state, reachable: result.status.reachable });
+      res.status(result.ok ? 200 : 503).json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, started: false, error: err?.message || "Nie udało się uruchomić Ollama." });
+    }
+  });
+
+  app.get("/api/images/status", async (_req, res) => {
+    try {
+      const status = await imageManager.probeStatus();
+      res.json({ ok: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, engineStatus: "ERROR", error: err?.message || "Błąd sondowania silników obrazów." });
+    }
+  });
+
+  app.get("/api/images/history", (_req, res) => {
+    try {
+      res.json({ ok: true, images: imageManager.listHistory(50) });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd odczytu historii obrazów." });
+    }
+  });
+
+  app.get("/api/images/file/:id", (req, res) => {
+    const file = imageManager.getImageFile(req.params.id);
+    if (!file) {
+      return res.status(404).json({ ok: false, error: "Nie znaleziono wygenerowanego pliku obrazu." });
+    }
+    res.setHeader("Content-Type", file.mimeType);
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+    res.setHeader("Content-Length", String(file.buffer.length));
+    return res.send(file.buffer);
+  });
+
+  app.post("/api/images/generate", async (req, res) => {
+    try {
+      const {
+        prompt = "",
+        agentId = "astyria",
+        mode = "generate",
+        preferredEngine = "auto",
+        aspectRatio = "1:1",
+        sourceImageBase64,
+        sourceMimeType = "image/png",
+        sessionId = "bastilla-main",
+        saveToChat = true,
+      } = req.body || {};
+
+      const cleanPrompt = String(prompt || "").trim();
+      if (!cleanPrompt) {
+        return res.status(400).json({ ok: false, engineStatus: "ERROR", error: "Prompt generowania obrazu nie może być pusty." });
+      }
+      const safeAgent = AGENTS.includes(agentId) || agentId === "council" ? agentId : "astyria";
+
+      const result = await imageManager.generate({
+        prompt: cleanPrompt,
+        agentId: safeAgent === "council" ? "astyria" : safeAgent,
+        mode,
+        preferredEngine,
+        aspectRatio,
+        sourceImageBase64,
+        sourceMimeType,
+      });
+
+      if (!result.ok || !result.image) {
+        return res.status(result.engineStatus === "BRAK SILNIKA" ? 503 : 500).json({
+          ok: false,
+          engineStatus: result.engineStatus,
+          error: result.error || "Generowanie obrazu nie powiodło się.",
+        });
+      }
+
+      let userMessageRecord: any = undefined;
+      let assistantMessageRecord: any = undefined;
+
+      if (saveToChat !== false) {
+        const imageBlockPayload = {
+          id: result.image.id,
+          title: `Wygenerowany Obraz (${result.image.model})`,
+          url: result.image.url,
+          caption: result.caption || result.image.prompt,
+          prompt: result.image.prompt,
+          model: result.image.model,
+          source: result.image.source,
+          mimeType: result.image.mime_type,
+          durationMs: result.image.duration_ms,
+          createdAt: result.image.created_at,
+        };
+        const assistantContent = [
+          result.caption ? result.caption : `Wygenerowano obraz na podstawie promptu: "${cleanPrompt}".`,
+          "",
+          "```image",
+          JSON.stringify(imageBlockPayload, null, 2),
+          "```",
+        ].join("\n");
+
+        const savedRows = await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'user', ?, 'Operator (Obraz)', ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+user_id = cur.lastrowid
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[5], sys.argv[6], now))
+asst_id = cur.lastrowid
+conn.commit()
+conn.close()
+print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
+          [
+            String(sessionId || "bastilla-main"),
+            safeAgent,
+            `[Obraz · ${mode}] ${cleanPrompt}`,
+            `${result.image.source}/${result.image.model}`,
+            assistantContent,
+          ]
+        );
+
+        userMessageRecord = {
+          id: savedRows.user_id || Date.now() - 1,
+          session_id: String(sessionId || "bastilla-main"),
+          sender_role: "user",
+          agent_id: safeAgent,
+          engine_used: "Operator (Obraz)",
+          content: `[Obraz · ${mode}] ${cleanPrompt}`,
+          created_at: savedRows.created_at || result.image.created_at,
+        };
+        assistantMessageRecord = {
+          id: savedRows.asst_id || Date.now(),
+          session_id: String(sessionId || "bastilla-main"),
+          sender_role: "assistant",
+          agent_id: safeAgent,
+          engine_used: `${result.image.source}/${result.image.model}`,
+          content: assistantContent,
+          created_at: savedRows.created_at || result.image.created_at,
+        };
+      }
+
+      broadcastSystemEvent("image_generated", { id: result.image.id, model: result.image.model, source: result.image.source });
+
+      return res.json({
+        ok: true,
+        engineStatus: "READY",
+        image: result.image,
+        caption: result.caption,
+        userMessageRecord,
+        assistantMessageRecord,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, engineStatus: "ERROR", error: err?.message || "Błąd generowania obrazu." });
+    }
+  });
+
+  app.post("/api/system/sync", async (_req, res) => {
+    try {
+      const dbCheck = await querySqliteJson(`import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+rows = [r[0] for r in conn.execute("PRAGMA quick_check")]
+conn.close()
+print(json.dumps({"results": rows}))`);
+      const [ollama, images, codex] = await Promise.all([
+        probeOllamaStatus(getOllamaBaseUrl()),
+        imageManager.probeStatus(),
+        codexAuth.status(),
+      ]);
+      const syncResult = {
+        ok: true,
+        sqlite_ok: dbCheck?.results?.[0] === "ok",
+        ollama,
+        images,
+        codex,
+        mcp_tools: mcp.listTools().tools.map((t) => t.name),
+        syncedAt: new Date().toISOString(),
+      };
+      broadcastSystemEvent("sync", { syncedAt: syncResult.syncedAt, ollama: ollama.state, images: images.engineStatus });
+      res.json(syncResult);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Synchronizacja systemu nie powiodła się." });
+    }
+  });
+
+  const extractOperatorToken = (req: express.Request): string | undefined => {
+    const bearer = req.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+    if (bearer) return bearer;
+    const cookie =
+      req.headers.cookie
+        ?.split(";")
+        .map((x) => x.trim())
+        .find((x) => x.startsWith("bastilla_access="))
+        ?.slice(16) || "";
+    try {
+      return cookie ? decodeURIComponent(cookie) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  app.get("/api/codex/tasks", (req, res) => {
+    try {
+      const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : undefined;
+      const agentId = typeof req.query.agentId === "string" ? req.query.agentId : undefined;
+      const limit = Number(req.query.limit) || 50;
+      res.json({ ok: true, tasks: codexTasks.getTasks(sessionId, limit, agentId) });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd odczytu kolejki Codex CLI." });
+    }
+  });
+
+  app.post("/api/codex/tasks", (req, res) => {
+    try {
+      const { agentId = "aria", sessionId, prompt = "", stdin, autoStart = true } = req.body || {};
+      if (typeof prompt !== "string" || !prompt.trim()) {
+        return res.status(400).json({ ok: false, error: "Treść zadania Codex CLI nie może być pusta." });
+      }
+      const operatorToken = extractOperatorToken(req);
+      const taskId = codexTasks.createTask(String(agentId), String(sessionId || ""), prompt.trim(), {
+        autoStart: Boolean(autoStart),
+        stdin: typeof stdin === "string" ? stdin : undefined,
+        operatorToken,
+        localAuthorized: !process.env.BASTILLA_API_TOKEN,
+      });
+      res.status(202).json({ ok: true, taskId, task: codexTasks.getTaskById(taskId) });
+    } catch (err: any) {
+      res.status(err instanceof CodexError ? err.status : 500).json({
+        ok: false,
+        error: err?.message || "Błąd tworzenia zadania Codex CLI.",
+      });
+    }
+  });
+
+  app.post("/api/codex/tasks/:id/start", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    codexTasks.startTask(id, typeof req.body?.stdin === "string" ? req.body.stdin : undefined);
+    res.json({ ok: true, task: codexTasks.getTaskById(id) });
+  });
+
+  app.post("/api/codex/tasks/:id/cancel", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    codexTasks.cancelTask(id);
+    res.json({ ok: true, task: codexTasks.getTaskById(id) });
+  });
+
+  app.post("/api/codex/tasks/:id/retry", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    codexTasks.retryTask(id);
+    res.json({ ok: true, task: codexTasks.getTaskById(id) });
+  });
+
+  app.get("/api/codex/tasks/:id/stream", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    const initial = codexTasks.getTaskById(id);
+    if (initial) {
+      res.write(`event: init\ndata: ${JSON.stringify(initial)}\n\n`);
+    }
+
+    const onUpdate = (payload: any) => {
+      if (payload?.taskId === id) {
+        res.write(`event: data\ndata: ${JSON.stringify(payload)}\n\n`);
+      }
+    };
+    const onData = (payload: any) => {
+      if (payload?.taskId === id) {
+        res.write(`event: data\ndata: ${JSON.stringify(payload)}\n\n`);
+      }
+    };
+    const onComplete = (payload: any) => {
+      if (payload?.taskId === id) {
+        res.write(`event: complete\ndata: ${JSON.stringify(payload)}\n\n`);
+      }
+    };
+
+    codexTasks.on("update", onUpdate);
+    codexTasks.on("data", onData);
+    codexTasks.on("complete", onComplete);
+
+    req.on("close", () => {
+      codexTasks.off("update", onUpdate);
+      codexTasks.off("data", onData);
+      codexTasks.off("complete", onComplete);
+    });
+  });
+
+  app.get("/api/codex/git-summary", (_req, res) => {
+    try {
+      res.json({ ok: true, ...codexTasks.getGitSummary() });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd odczytu podsumowania Git." });
+    }
+  });
+
   app.get("/api/agent-tasks", (_req, res) => {
     try { res.json({ ok: true, tasks: queue.list() }); }
     catch { res.status(500).json({ ok: false, error: "Błąd odczytu kolejki." }); }
   });
   app.post("/api/agent-tasks", (req, res) => {
-    try { res.status(202).json({ ok: true, task: queue.submit(req.body || {}) }); }
+    try {
+      const task = queue.submit(req.body || {});
+      broadcastSystemEvent("agent_task", { id: task.id, agent_id: task.agent_id, status: task.status });
+      res.status(202).json({ ok: true, task });
+    }
     catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : "Błąd kolejki." }); }
   });
   app.post("/api/agent-tasks/:id/cancel", (req, res) => {
@@ -633,7 +1183,7 @@ if os.path.exists(sys.argv[1]):
     db_data["fleet"] = [dict(r) for r in conn.execute("SELECT * FROM fleet_units").fetchall()]
     db_data["missions"] = [dict(r) for r in conn.execute("SELECT * FROM missions").fetchall()]
     db_data["hypercomm"] = [dict(r) for r in conn.execute("SELECT * FROM hypercomm_relays").fetchall()]
-    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM chat_messages ORDER BY id ASC LIMIT 80").fetchall()]
+    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM (SELECT * FROM chat_messages ORDER BY id DESC LIMIT 150) ORDER BY id ASC").fetchall()]
     conn.close()
 
 distro_files = []
@@ -673,36 +1223,40 @@ print(json.dumps({
         auth_ready: codexStatus.auth_ready,
         requirement_note: codexStatus.message,
       };
+      const [ollamaStatus, imageStatus] = await Promise.all([
+        probeOllamaStatus(getOllamaBaseUrl()),
+        imageManager.probeStatus(),
+      ]);
+
+      hostData.tools.ollama.auth_ready = ollamaStatus.reachable && ollamaStatus.models.length > 0;
+      hostData.tools.ollama.requirement_note = ollamaStatus.message;
+
       const geminiConfigured = Boolean(
         process.env.GEMINI_API_KEY &&
           process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
       );
 
-      let ollamaOnline = false;
-      let ollamaModels: string[] = [];
-      try {
-        const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-          signal: AbortSignal.timeout(2000),
-        });
-        const body: any = response.ok ? await response.json() : null;
-        ollamaOnline = Array.isArray(body?.models) && body?.provider !== "gemini-bridge";
-        ollamaModels = ollamaOnline ? body.models.map((m: any) => m.name).filter((name: unknown) => typeof name === "string") : [];
-      } catch {}
-
-      hostData.tools.ollama.auth_ready = false; // A catalogue response is not a completed inference.
-      hostData.tools.ollama.requirement_note = ollamaOnline ? `API odpowiada; modele: ${ollamaModels.join(", ") || "brak"}. Wnioskowanie niezweryfikowane.` : "Brak potwierdzonej usługi Ollama.";
       res.json({
         ok: true,
         svl_report: svlReport,
         host: hostData,
         ai_routing: {
-          primary_model: ollamaModels[0] ? `ollama/${ollamaModels[0]}` : "unverified",
-          available_models: ollamaModels,
-          ollama_online: ollamaOnline,
-          fallback_model: process.env.GEMINI_MODEL || "gemini-flash-latest",
+          primary_model: ollamaStatus.modelNames[0] ? `ollama/${ollamaStatus.modelNames[0]}` : "unverified",
+          available_models: ollamaStatus.modelNames,
+          ollama_online: ollamaStatus.reachable,
+          ollama_state: ollamaStatus.state,
+          fallback_model: process.env.GEMINI_MODEL || "gemini-3.8-flash",
           gemini_configured: geminiConfigured,
-          active_engine: ollamaOnline && ollamaModels.length ? "ollama" : geminiConfigured ? "gemini-configured-unverified" : "unavailable",
+          active_engine:
+            ollamaStatus.reachable && ollamaStatus.modelNames.length
+              ? "ollama"
+              : geminiConfigured
+              ? "gemini-configured-unverified"
+              : "unavailable",
         },
+        ollama_status: ollamaStatus,
+        image_status: imageStatus,
+        images: imageManager.listHistory(20),
         app_url:
           process.env.APP_URL ||
           `http://localhost:${PORT}`,
@@ -886,7 +1440,7 @@ Zwróć TYLKO czyste polecenie, bez formatowania markdown, bez cudzysłowów, be
 Polecenie użytkownika: "${prompt.trim()}"`;
 
         try {
-          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+          const ollamaRes = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -990,90 +1544,286 @@ Polecenie użytkownika: "${prompt.trim()}"`;
     }
   });
 
-  // 4A. Server-Sent Events (SSE) Streaming Chat Endpoint
-  app.get("/api/chat/stream", async (req, res) => {
+  // 4A. Real Server-Sent Events (SSE) Streaming Chat Endpoint (GET + POST with upstream abort)
+  async function handleChatStreamRequest(
+    req: express.Request,
+    res: express.Response,
+    params: {
+      agentId: string;
+      message: string;
+      enginePreference: string;
+      sessionId: string;
+      imageBase64?: string;
+      imageMimeType?: string;
+      saveToDb: boolean;
+    }
+  ) {
     const {
       agentId = "aria",
       message = "",
       enginePreference = "auto",
-    } = req.query as Record<string, string>;
+      sessionId = "bastilla-main",
+      imageBase64,
+      imageMimeType = "image/jpeg",
+      saveToDb = false,
+    } = params;
 
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
+      Connection: "keep-alive",
     });
 
+    const abortController = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) abortController.abort();
+    });
+
+    const writeEvent = (payload: Record<string, unknown>) => {
+      if (res.writableEnded) return;
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
     try {
-      res.write(
-        `data: ${JSON.stringify({
-          type: "start",
-          agentId,
-          enginePreference,
-        })}\n\n`
-      );
+      writeEvent({ type: "start", agentId, enginePreference });
 
       if (/^\/(exec|root|sudo|bash)\s+/i.test(message.trim())) {
-        res.write(`data: ${JSON.stringify({ type: "error", error: "Polecenia wymagają POST /api/terminal/exec." })}\n\n`);
+        writeEvent({ type: "error", error: "Polecenia wymagają POST /api/terminal/exec." });
         return res.end();
       }
 
+      if (!message.trim() && !imageBase64) {
+        writeEvent({ type: "error", error: "Wiadomość nie może być pusta." });
+        return res.end();
+      }
+
+      const historyData = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 10", (sys.argv[2], sys.argv[3])).fetchall()
+conn.close()
+print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
+        [agentId, sessionId]
+      );
+      const priorTurns = sanitizeConversationHistory(historyData?.history || []);
+
       let fullText = "";
       let engineUsed = "";
-      const targetModel = enginePreference === "auto" || enginePreference === "ollama" ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b" : enginePreference;
+      const targetModel = imageBase64
+        ? "llama3.2-vision:11b"
+        : enginePreference === "auto" || enginePreference === "ollama"
+        ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b"
+        : enginePreference;
+
       if (enginePreference !== "gemini") {
+        const ollamaMessages = [
+          ...priorTurns.map((h) => ({
+            role: h.sender_role === "user" ? "user" : "assistant",
+            content: h.content,
+          })),
+          {
+            role: "user",
+            content: message,
+            ...(imageBase64 ? { images: [imageBase64] } : {}),
+          },
+        ];
+        const ollamaEndpoint = getOllamaBaseUrl();
         try {
-          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: targetModel,
-              stream: false,
-              messages: [{ role: "user", content: message }],
-            }),
-            signal: AbortSignal.timeout(25000),
+          const timeoutSignal = AbortSignal.timeout(45000);
+          const combinedSignal = AbortSignal.any([abortController.signal, timeoutSignal]);
+          const streamed = await streamOllamaChat({
+            ollamaBaseUrl: ollamaEndpoint,
+            model: targetModel,
+            messages: ollamaMessages,
+            signal: combinedSignal,
+            onChunk: (delta) => {
+              writeEvent({ type: "chunk", text: redact(delta) });
+            },
           });
-          if (ollamaRes.ok) {
-            const data: any = await ollamaRes.json();
-            fullText = data?.message?.content || "";
-            if (fullText) engineUsed = bodyEngine(data, targetModel);
+          fullText = streamed.text;
+          engineUsed = streamed.model;
+        } catch (err: any) {
+          if (abortController.signal.aborted) {
+            return res.end();
           }
-        } catch {
-          // Transport failures use the same fallback as HTTP errors.
+          // If the default model isn't installed on a real Ollama host, retry with an actual model from /api/tags
+          if (/404|not found/i.test(String(err?.message || ""))) {
+            try {
+              const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+              const altModel = pickPreferredOllamaModel(liveOllama.models, {
+                multimodal: Boolean(imageBase64),
+              });
+              if (altModel && altModel !== targetModel) {
+                const retryStream = await streamOllamaChat({
+                  ollamaBaseUrl: ollamaEndpoint,
+                  model: altModel,
+                  messages: ollamaMessages,
+                  signal: AbortSignal.any([abortController.signal, AbortSignal.timeout(45000)]),
+                  onChunk: (delta) => {
+                    writeEvent({ type: "chunk", text: redact(delta) });
+                  },
+                });
+                fullText = retryStream.text;
+                engineUsed = retryStream.model;
+              }
+            } catch {}
+          }
         }
       }
-      if (!fullText) {
-        const result = await runLiveMultimodalModel([
-          { role: "user", parts: [{ text: message }] },
-        ]);
-        fullText = result.text;
-        engineUsed = result.modelUsed;
+
+      if (!fullText && !abortController.signal.aborted) {
+        const contents: any[] = priorTurns.map((h) => ({
+          role: h.sender_role === "user" ? "user" : "model",
+          parts: [{ text: h.content }],
+        }));
+        const parts: any[] = [];
+        if (imageBase64) {
+          parts.push({ inlineData: { mimeType: imageMimeType, data: imageBase64 } });
+        }
+        parts.push({ text: message || "Przeanalizuj załączony obraz." });
+        contents.push({ role: "user", parts });
+
+        const streamedGemini = await streamLiveMultimodalModel(
+          contents,
+          abortController.signal,
+          (delta) => {
+            writeEvent({ type: "chunk", text: redact(delta) });
+          },
+          buildAgentSystemInstruction(agentId)
+        );
+        fullText = streamedGemini.text;
+        engineUsed =
+          enginePreference === "gemini"
+            ? streamedGemini.modelUsed
+            : `${streamedGemini.modelUsed} (Fallback dla ${targetModel})`;
       }
 
-      // Stream words smoothly to client
-      const words = fullText.split(" ");
-      for (let i = 0; i < words.length; i += 3) {
-        const chunk = words.slice(i, i + 3).join(" ") + " ";
-        res.write(`data: ${JSON.stringify({ type: "chunk", text: redact(chunk) })}\n\n`);
-        await new Promise((r) => setTimeout(r, 20));
+      if (abortController.signal.aborted) {
+        return res.end();
       }
 
-      res.write(
-        `data: ${JSON.stringify({
-          type: "done",
-          engineUsed,
-        })}\n\n`
-      );
+      let userMessageRecord: any = undefined;
+      let assistantMessageRecord: any = undefined;
+      let artifactTitle = "";
+      let artifactCode = "";
+
+      const codeMatch = fullText.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
+      if (codeMatch && !/image|mermaid|chart|table|buttons|form|telemetry/i.test(codeMatch[1] || "")) {
+        artifactTitle = `Artefakt Roboczy (${codeMatch[1] || "code"}) — ${agentId.toUpperCase()}`;
+        artifactCode = codeMatch[2].trim();
+      }
+
+      if (saveToDb && fullText) {
+        // Record IPC mentions if operator addressed @wszyscy or specific agent
+        const mentioned = [...message.toLowerCase().matchAll(/@(aria|alex|astyria|aurelius|wszyscy)\b/g)].map((m) => m[1]);
+        if (mentioned.length > 0) {
+          const targets = mentioned.includes("wszyscy") ? [...AGENTS] : Array.from(new Set(mentioned));
+          const sender = (AGENTS as readonly string[]).includes(agentId) ? agentId : "aria";
+          for (const recipient of targets) {
+            if (recipient !== sender && (AGENTS as readonly string[]).includes(recipient)) {
+              querySqliteJson(
+                `import sqlite3, sys, json, os
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, 'CHAT_MENTION', ?, 'QUEUED', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+msg_id = cur.lastrowid
+conn.commit(); conn.close()
+inbox = f"/home/{sys.argv[3]}/inbox.jsonl"
+if os.path.exists(f"/home/{sys.argv[3]}"):
+    with open(inbox, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"id": msg_id, "from": sys.argv[2], "subject": "CHAT_MENTION", "payload": sys.argv[4], "ts": now}) + "\\n")
+print(json.dumps({"id": msg_id}))`,
+                [sender, recipient, message.slice(0, 600)]
+              ).catch(() => {});
+            }
+          }
+        }
+
+        const savedRows = await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'user', ?, 'Operator', ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+user_id = cur.lastrowid
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], now))
+asst_id = cur.lastrowid
+cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'CHAT_DIALOGUE', ?, 4, ?)",
+  (sys.argv[3] if sys.argv[3] != 'council' else 'aria', f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
+conn.commit()
+conn.close()
+print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
+          [sessionId, agentId, message, engineUsed, fullText, artifactTitle, artifactCode]
+        );
+        userMessageRecord = {
+          id: savedRows.user_id || Date.now() - 1,
+          session_id: sessionId,
+          sender_role: "user",
+          agent_id: agentId,
+          engine_used: "Operator",
+          content: message,
+          created_at: savedRows.created_at || new Date().toISOString(),
+        };
+        assistantMessageRecord = {
+          id: savedRows.asst_id || Date.now(),
+          session_id: sessionId,
+          sender_role: "assistant",
+          agent_id: agentId,
+          engine_used: engineUsed,
+          content: fullText,
+          artifact_title: artifactTitle,
+          artifact_code: artifactCode,
+          created_at: savedRows.created_at || new Date().toISOString(),
+        };
+      }
+
+      writeEvent({
+        type: "done",
+        engineUsed,
+        reply: fullText,
+        artifactTitle,
+        artifactCode,
+        userMessageRecord,
+        assistantMessageRecord,
+      });
       res.end();
     } catch (e: any) {
-      res.write(
-        `data: ${JSON.stringify({
-          type: "error",
-          error: redact(e?.message || "Błąd streamingu"),
-        })}\n\n`
-      );
-      res.end();
+      if (!abortController.signal.aborted) {
+        writeEvent({ type: "error", error: redact(e?.message || "Błąd streamingu") });
+      }
+      if (!res.writableEnded) res.end();
     }
+  }
+
+  app.get("/api/chat/stream", async (req, res) => {
+    const q = req.query as Record<string, string>;
+    await handleChatStreamRequest(req, res, {
+      agentId: q.agentId || "aria",
+      message: q.message || "",
+      enginePreference: q.enginePreference || "auto",
+      sessionId: q.sessionId || "bastilla-stream",
+      saveToDb: q.saveToDb === "true",
+    });
+  });
+
+  app.post("/api/chat/stream", async (req, res) => {
+    const b = req.body || {};
+    await handleChatStreamRequest(req, res, {
+      agentId: String(b.agentId || "aria"),
+      message: String(b.message || ""),
+      enginePreference: String(b.enginePreference || "auto"),
+      sessionId: String(b.sessionId || "bastilla-main"),
+      imageBase64: typeof b.imageBase64 === "string" ? b.imageBase64 : undefined,
+      imageMimeType: typeof b.imageMimeType === "string" ? b.imageMimeType : "image/jpeg",
+      saveToDb: b.saveToDb !== false,
+    });
   });
 
   // 4. Full-Screen ChatGPT Work Multi-Agent & Vision Endpoint (Completely Unlocked + Direct Root /exec + Clear Chat)
@@ -1132,14 +1882,7 @@ conn.close()
 print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         [agentId, sessionId]
       );
-      const rawPriorTurns: Array<{ sender_role: string; content: string }> =
-        historyData?.history || [];
-      const priorTurns = rawPriorTurns.filter(
-        (t) =>
-          !/Jako model AI|Moje wytyczne|zasady bezpieczeństwa|nie mogę zrealizować/i.test(
-            t.content || ""
-          )
-      );
+      const priorTurns = sanitizeConversationHistory(historyData?.history || []);
 
       const isOllamaSelection =
         !resolved &&
@@ -1153,21 +1896,22 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         ? "llama3.2-vision:11b"
         : enginePreference;
 
-      // Step 1: Attempt local Ollama daemon on 127.0.0.1:11434 with ZERO system prompts
+      // Step 1: Attempt active Ollama daemon with automatic model fallback from /api/tags
       if (isOllamaSelection) {
+        const ollamaEndpoint = getOllamaBaseUrl();
+        const ollamaMessages = [
+          ...priorTurns.map((h) => ({
+            role: h.sender_role === "user" ? "user" : "assistant",
+            content: h.content,
+          })),
+          {
+            role: "user",
+            content: effectiveUserMessage,
+            ...(imageBase64 ? { images: [imageBase64] } : {}),
+          },
+        ];
         try {
-          const ollamaMessages = [
-            ...priorTurns.map((h) => ({
-              role: h.sender_role === "user" ? "user" : "assistant",
-              content: h.content,
-            })),
-            {
-              role: "user",
-              content: effectiveUserMessage,
-              ...(imageBase64 ? { images: [imageBase64] } : {}),
-            },
-          ];
-          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+          const ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1184,16 +1928,42 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
               engineUsed = bodyEngine(data, targetOllamaModel);
               resolved = true;
             }
+          } else if (ollamaRes.status === 404) {
+            const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+            const altModel = pickPreferredOllamaModel(liveOllama.models, {
+              multimodal: Boolean(imageBase64),
+            });
+            if (altModel && altModel !== targetOllamaModel) {
+              const retryRes = await fetch(`${ollamaEndpoint}/api/chat`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  model: altModel,
+                  stream: false,
+                  messages: ollamaMessages,
+                }),
+                signal: AbortSignal.timeout(25000),
+              });
+              if (retryRes.ok) {
+                const retryData: any = await retryRes.json();
+                replyText = retryData?.message?.content || "";
+                if (replyText) {
+                  engineUsed = bodyEngine(retryData, altModel);
+                  resolved = true;
+                }
+              }
+            }
+            if (!resolved) lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
           } else {
             lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
           }
         } catch (err: any) {
-          lastEngineError = `Ollama daemon (127.0.0.1:11434) niedostępny: ${err?.message || "ECONNREFUSED"}`;
+          lastEngineError = `Ollama daemon (${ollamaEndpoint}) niedostępny: ${err?.message || "ECONNREFUSED"}`;
           resolved = false;
         }
       }
 
-      // Step 2: Real Server-Side Gemini API Fallback with ZERO steering prompts & HarmBlockThreshold.OFF
+      // Step 2: Real Server-Side Gemini API Fallback with clean agent persona instruction
       if (!resolved) {
         try {
           const contents: any[] = priorTurns.map((h) => ({
@@ -1213,7 +1983,11 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           currentParts.push({ text: effectiveUserMessage });
           contents.push({ role: "user", parts: currentParts });
 
-          const { text, modelUsed } = await runLiveMultimodalModel(contents);
+          const { text, modelUsed } = await runLiveMultimodalModel(
+            contents,
+            undefined,
+            buildAgentSystemInstruction(agentId)
+          );
           replyText = text;
           engineUsed =
             enginePreference === "gemini"
@@ -1241,7 +2015,19 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         }
       }
 
-      // Save user message, assistant reply, and long-term memory into SQLite and return inserted rows
+      const mentionsAll = /@wszyscy\b|@council\b/i.test(message);
+      const mentionedAgents = Array.from(
+        new Set(
+          (mentionsAll
+            ? [...AGENTS]
+            : (message.match(/@(aria|alex|astyria|aurelius)\b/gi) || []).map((m: string) =>
+                m.slice(1).toLowerCase()
+              )
+          ).filter((a: string) => (AGENTS as readonly string[]).includes(a) && a !== agentId)
+        )
+      );
+
+      // Save user message, assistant reply, IPC mentions, and long-term memory into SQLite and return inserted rows
       const savedRows = await querySqliteJson(
         `import sqlite3, sys, json
 from datetime import datetime, timezone
@@ -1256,6 +2042,13 @@ cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engin
 asst_id = cur.lastrowid
 cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'CHAT_DIALOGUE', ?, 4, ?)",
   (sys.argv[3] if sys.argv[3] != 'council' else 'aria', f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
+ipc_targets = json.loads(sys.argv[9]) if sys.argv[9] else []
+sender_agent = sys.argv[3] if sys.argv[3] in ('aria', 'alex', 'astyria', 'aurelius') else 'aria'
+for target_agent in ipc_targets:
+    cur.execute(
+        "INSERT INTO ipc_messages (sender_agent, recipient_agent, subject, payload, status, created_at) VALUES (?, ?, ?, ?, 'DELIVERED', ?)",
+        (sender_agent, target_agent, 'CHAT_MENTION', sys.argv[4][:400], now)
+    )
 conn.commit()
 conn.close()
 print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
@@ -1267,6 +2060,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
           replyText,
           artifactTitle,
           artifactCode,
+          JSON.stringify(mentionedAgents),
         ]
       );
 
@@ -1719,9 +2513,25 @@ print(json.dumps({"results": rows}))`);
   });
 
   app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (!req.path.startsWith("/api/") || res.headersSent) return next(error);
-    res.status(error?.type === "entity.too.large" ? 413 : error instanceof SyntaxError ? 400 : 500)
-      .json({ ok: false, error: "Nieprawidłowe żądanie API lub błąd serwera." });
+    const isApi = req.originalUrl.startsWith("/api") || req.path.startsWith("/api");
+    if (!isApi || res.headersSent) return next(error);
+    const status =
+      error?.type === "entity.too.large"
+        ? 413
+        : error instanceof SyntaxError
+        ? 400
+        : typeof error?.status === "number"
+        ? error.status
+        : 500;
+    res.status(status).json({
+      ok: false,
+      error:
+        status === 413
+          ? "Przekroczono maksymalny rozmiar żądania (15 MB)."
+          : status === 400
+          ? "Nieprawidłowy format JSON w treści żądania."
+          : redact(error?.message || "Wewnętrzny błąd serwera API."),
+    });
   });
 
   // Mount Vite middleware in development or static dist in production
