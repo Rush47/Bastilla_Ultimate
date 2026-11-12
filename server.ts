@@ -7,6 +7,7 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
+import { CodexAuthManager, CodexError } from "./server/codex";
 import {
   GoogleGenAI,
   GenerateContentResponse,
@@ -35,6 +36,10 @@ process.env.BASTILLA_PROJECT_ROOT = PROJECT_ROOT;
 process.env.BASTILLA_DB_PATH = DB_PATH;
 process.env.BASTILLA_KERNEL_DIR = KERNEL_DIR;
 process.env.PYTHONPATH = [KERNEL_DIR, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
+const codexAuth = new CodexAuthManager({ projectRoot: PROJECT_ROOT });
+process.once("exit", () => codexAuth.dispose());
+process.once("SIGTERM", () => { codexAuth.dispose(); process.exit(0); });
+process.once("SIGINT", () => { codexAuth.dispose(); process.exit(0); });
 
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY;
@@ -609,7 +614,7 @@ async function executeTerminalCommandInternal(
         maxBuffer: 2 * 1024 * 1024,
         env: {
           ...process.env,
-          PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`,
+          PATH: `${path.join(PROJECT_ROOT, "node_modules/.bin")}:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`,
           PYTHONPATH: process.env.PYTHONPATH,
         },
       });
@@ -706,7 +711,7 @@ for offset in range(0, len(data), 16):
       const out = await execAsync(command, {
         cwd: PROJECT_ROOT,
         timeout: 10000,
-        env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` },
+        env: { ...process.env, PATH: `${path.join(PROJECT_ROOT, "node_modules/.bin")}:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` },
       });
       stdout = out.stdout;
       stderr = out.stderr;
@@ -821,13 +826,6 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
     })
 
 tools = {
-    "codex": {
-        "installed": os.path.exists("/usr/local/bin/codex") or bool(cmd_out("which codex")),
-        "version": cmd_out("codex --version"),
-        "binary_path": cmd_out("which codex") or "/usr/local/bin/codex",
-        "auth_ready": bool(os.environ.get("OPENAI_API_KEY")) or os.path.exists("/root/.codex/auth.json"),
-        "requirement_note": "Wymaga logowania kontem ChatGPT (codex login --device-auth) lub klucza OPENAI_API_KEY"
-    },
     "gh": {
         "installed": os.path.exists("/usr/local/bin/gh") or bool(cmd_out("which gh")),
         "version": cmd_out("gh --version | head -n 1"),
@@ -914,6 +912,14 @@ print(json.dumps({
 }))
 `;
       const hostData = await querySqliteJson(hostProbeScript);
+      const codexStatus = await codexAuth.status();
+      hostData.tools.codex = {
+        installed: codexStatus.installed,
+        version: codexStatus.version,
+        binary_path: codexStatus.binary_path,
+        auth_ready: codexStatus.auth_ready,
+        requirement_note: codexStatus.message,
+      };
       const geminiConfigured = Boolean(
         process.env.GEMINI_API_KEY &&
           process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
@@ -1186,102 +1192,37 @@ Polecenie użytkownika: "${prompt.trim()}"`;
     }
   });
 
-  // 3C. OpenAI Codex CLI Auth Manager (Fix Token, Remove Locks, Verify Status)
+  // Codex owns credential storage and validates the current authentication state.
+  app.get("/api/codex/status", async (_req, res) => {
+    res.json({ ok: true, ...await codexAuth.status() });
+  });
+
   app.post("/api/codex/auth", async (req, res) => {
     try {
-      const {
-        action = "status",
-        apiKey,
-        accessToken,
-        refreshToken,
-        expiresInSec = 86400 * 30,
-      } = req.body || {};
-
-      // Ensure directory exists and clean stale lock files
-      await execAsync(
-        "mkdir -p /root/.codex /home/aria/.codex /home/alex/.codex /home/astyria/.codex /home/aurelius/.codex && rm -f /root/.codex/*.lock /home/*/.codex/*.lock /tmp/codex* 2>/dev/null || true"
-      );
-
-      if (action === "set_token" || action === "set_api_key") {
-        let authData: Record<string, any> = {};
-        if (apiKey && apiKey.trim()) {
-          authData = { api_key: apiKey.trim() };
-        } else if (accessToken && accessToken.trim()) {
-          authData = {
-            access_token: accessToken.trim(),
-            refresh_token: refreshToken
-              ? refreshToken.trim()
-              : `refresh_${Date.now()}`,
-            expires_at: Math.floor(Date.now() / 1000) + expiresInSec,
-          };
-        } else {
-          authData = {
-            access_token: `codex_tk_${Buffer.from(String(Date.now())).toString(
-              "hex"
-            )}`,
-            refresh_token: `codex_rf_${Date.now()}`,
-            expires_at: Math.floor(Date.now() / 1000) + expiresInSec,
-          };
-        }
-
-        const authJsonStr = JSON.stringify(authData, null, 2);
-        fs.writeFileSync("/root/.codex/auth.json", authJsonStr, { mode: 0o600 });
-        for (const a of ["aria", "alex", "astyria", "aurelius"]) {
-          try {
-            fs.writeFileSync(`/home/${a}/.codex/auth.json`, authJsonStr, {
-              mode: 0o600,
-            });
-            await execAsync(
-              `chown -R ${a}:root /home/${a}/.codex 2>/dev/null || true`
-            );
-          } catch {}
-        }
-      } else if (action === "clean_locks") {
-        await execAsync(
-          "rm -f /root/.codex/*.lock /home/*/.codex/*.lock /tmp/codex* 2>/dev/null || true"
-        );
+      const { action = "status", apiKey, accessToken, refreshToken } = req.body || {};
+      if (apiKey !== undefined || accessToken !== undefined || refreshToken !== undefined) {
+        throw new CodexError(400, "Użyj logowania przez ChatGPT lub OPENAI_API_KEY z sekretów serwera.");
       }
-
-      // Check live status
-      let loginStatusOut = "";
-      try {
-        const { stdout, stderr } = await execAsync("codex login status", {
-          timeout: 4000,
-        });
-        loginStatusOut = (stdout || stderr || "").trim();
-      } catch (e: any) {
-        loginStatusOut = (e.stdout || e.stderr || e.message || "").trim();
+      if (action === "status") return res.json({ ok: true, ...await codexAuth.status() });
+      if (action === "device_login") {
+        const status = await codexAuth.status();
+        if (!status.installed) throw new CodexError(503, status.message);
+        codexAuth.startDeviceLogin();
+        return res.status(202).json({ ok: true, ...await codexAuth.status() });
       }
-
-      const authFileExists = fs.existsSync("/root/.codex/auth.json");
-      let authContent: any = null;
-      if (authFileExists) {
-        try {
-          authContent = JSON.parse(
-            fs.readFileSync("/root/.codex/auth.json", "utf-8")
-          );
-        } catch {}
+      if (action === "cancel_login") {
+        codexAuth.cancelDeviceLogin();
+        return res.json({ ok: true, ...await codexAuth.status() });
       }
-
-      res.json({
-        ok: true,
-        action,
-        login_status: loginStatusOut,
-        auth_ready: loginStatusOut.includes("Logged in") || Boolean(authContent),
-        has_auth_json: authFileExists,
-        token_type: authContent?.api_key
-          ? "API_KEY"
-          : authContent?.access_token
-          ? "OAUTH_BEARER"
-          : "NONE",
-        message: loginStatusOut.includes("Logged in")
-          ? "Codex CLI jest prawidłowo uwierzytelniony (zalogowany kontem ChatGPT)."
-          : `Stan uwierzytelnienia Codex: ${
-              loginStatusOut || "Gotowy do zapisu klucza/tokenu."
-            }`,
+      if (action === "use_api_key" || action === "set_api_key") {
+        return res.json({ ok: true, ...await codexAuth.useEnvironmentApiKey() });
+      }
+      throw new CodexError(400, "Wybierz status, logowanie przez ChatGPT lub klucz z serwera. Generowanie tokenów i usuwanie blokad nie są obsługiwane.");
+    } catch (error) {
+      res.status(error instanceof CodexError ? error.status : 500).json({
+        ok: false,
+        error: error instanceof CodexError ? error.message : "Operacja Codex CLI nie powiodła się.",
       });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || String(err) });
     }
   });
 

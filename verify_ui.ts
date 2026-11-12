@@ -38,6 +38,17 @@ async function main() {
         await page.keyboard.press("Escape");
         await page.getByTitle("Włącz pełny ekran").waitFor();
       }
+      if (name === "Terminale") {
+        const panel = page.getByRole("region", { name: "Logowanie Codex CLI" });
+        await panel.getByRole("button", { name: "Sprawdź status Codex" }).click();
+        if (process.env.TEST_CODEX_DEVICE_FLOW === "true") {
+          // Enable only when the test server uses tests/fixtures/codex.mjs.
+          await panel.getByRole("button", { name: "Zaloguj przez ChatGPT" }).click();
+          await panel.getByText("ABCD-EFGHI", { exact: true }).waitFor();
+          await panel.getByRole("button", { name: "Anuluj logowanie" }).click();
+          await panel.getByText("Logowanie anulowane.", { exact: true }).waitFor();
+        }
+      }
     }
     assert.deepEqual(pageErrors, [], "Tabs must render without runtime errors");
     assert.deepEqual(failedAssets, [], "Built assets must be served successfully");

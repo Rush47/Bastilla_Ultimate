@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from "react";
+import { CodexAuthPanel } from "./CodexAuthPanel";
 import type { SystemOverviewResponse } from "../types/bastilla";
 import {
   GitBranch,
   ShieldAlert,
-  CheckCircle2,
   Terminal,
   Cloud,
   Monitor,
@@ -102,12 +102,12 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
                     {key}
                   </td>
                   <td className="py-3 px-3 text-slate-300">{t.binary_path}</td>
-                  <td className="py-3 px-3 text-cyan-300">{t.version || "Zainstalowano"}</td>
+                  <td className="py-3 px-3 text-cyan-300">{t.version || "Brak zweryfikowanej wersji"}</td>
                   <td className="py-3 px-3">
                     {t.installed ? (
                       <span className="text-emerald-400">ZAINSTALOWANY</span>
                     ) : (
-                      <span className="text-amber-400">FALLBACK AKTYWNY</span>
+                      <span className="text-amber-400">NIEDOSTĘPNY</span>
                     )}
                   </td>
                   <td className="py-3 px-3 font-sans text-slate-300">
@@ -119,36 +119,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
           </table>
         </div>
 
-        {/* Interactive OpenAI Codex CLI Token & Auth Manager */}
-        <div className="mt-5 p-4 rounded-lg bg-[#111723] border border-violet-500/40 space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <div className="text-xs font-semibold text-white font-display flex items-center gap-1.5">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                Menedżer Tokenu OpenAI Codex CLI (Naprawa i Uwierzytelnianie)
-              </div>
-              <p className="text-[11px] text-slate-400 mt-0.5">
-                Usuwa uszkodzone blokady ~/.codex/*.lock, generuje poprawny token OAuth lub pozwala zapisać klucz OPENAI_API_KEY
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={async () => {
-                const res = await fetch("/api/codex/auth", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ action: "set_token" }),
-                });
-                const data = await res.json();
-                alert(data.message || "Zaktualizowano token Codex");
-                onRefresh();
-              }}
-              className="px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold whitespace-nowrap"
-            >
-              Napraw / Wygeneruj Token Codex
-            </button>
-          </div>
-        </div>
+        <div className="mt-5"><CodexAuthPanel /></div>
       </section>
 
       {/* Section 2: GitHub Bastilla_OS_Ultimate (main branch) Auto-Sync & AgenticLinux Base */}

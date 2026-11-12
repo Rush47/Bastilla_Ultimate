@@ -4,6 +4,7 @@ dist/
 coverage/
 .bastilla/
 __pycache__/
+.codex/
 .DS_Store
 *.log
 .env*

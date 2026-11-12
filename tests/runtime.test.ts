@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { once } from "node:events";
@@ -11,6 +11,8 @@ const projectRoot = path.resolve(import.meta.dirname, "..");
 const stateDir = mkdtempSync(path.join(tmpdir(), "bastilla-test-"));
 const dbPath = path.join(stateDir, "state.db");
 const initDb = path.join(projectRoot, "distro/bastilla-overlay/init_db.py");
+const codexHome = path.join(stateDir, "codex");
+const codexBinary = path.join(projectRoot, "tests/fixtures/codex.mjs");
 let server: ChildProcess;
 let baseUrl: string;
 let ollamaAvailable = true;
@@ -49,6 +51,8 @@ async function post(route: string, body: object) {
 }
 
 before(async () => {
+  chmodSync(codexBinary, 0o755);
+  mkdirSync(codexHome);
   // Exercise an upgrade from the schema shipped in the original repository.
   execFileSync("python3", [initDb, dbPath]);
   sql("conn.execute('ALTER TABLE agents DROP COLUMN avatar_url')\nconn.execute('ALTER TABLE agents DROP COLUMN svl_locked')");
@@ -69,6 +73,9 @@ before(async () => {
       BASTILLA_CONTINUOUS_MISSION: "false",
       BASTILLA_OLLAMA_BRIDGE: "false",
       GEMINI_API_KEY: "",
+      OPENAI_API_KEY: "synthetic-runtime-api-key",
+      CODEX_HOME: codexHome,
+      BASTILLA_CODEX_BIN: codexBinary,
       OLLAMA_BASE_URL: `http://127.0.0.1:${address.port}`,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -183,4 +190,25 @@ test("failed database writes return an HTTP error", async () => {
   } finally {
     sql("conn.execute('ALTER TABLE saved_memories RENAME TO agent_memories')");
   }
+});
+
+test("Codex endpoints reject fabricated tokens and report only CLI-confirmed authentication", async () => {
+  const original = '{"api_key":"legacy-invalid-key"}';
+  writeFileSync(path.join(codexHome, "auth.json"), original);
+  writeFileSync(path.join(codexHome, "session.lock"), "keep");
+  const status = await fetch(`${baseUrl}/api/codex/status`);
+  const data: any = await status.json();
+  assert.equal(data.auth_ready, false);
+  for (const action of ["set_token", "clean_locks", "unknown"]) {
+    assert.equal((await post("/api/codex/auth", { action })).status, 400);
+  }
+  assert.equal((await post("/api/codex/auth", { action: "set_api_key", apiKey: "do-not-accept-raw-keys" })).status, 400);
+  assert.equal(readFileSync(path.join(codexHome, "auth.json"), "utf8"), original);
+  assert.equal(readFileSync(path.join(codexHome, "session.lock"), "utf8"), "keep");
+  const login = await post("/api/codex/auth", { action: "use_api_key" });
+  assert.equal(login.status, 200);
+  assert.equal(login.body.auth_ready, true);
+  assert.equal(JSON.stringify(login.body).includes("synthetic-runtime-api-key"), false);
+  const overview: any = await (await fetch(`${baseUrl}/api/system/overview`)).json();
+  assert.equal(overview.host.tools.codex.auth_ready, true);
 });
