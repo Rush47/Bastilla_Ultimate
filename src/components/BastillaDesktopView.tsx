@@ -1,4 +1,9 @@
 import React, { useState, useRef } from "react";
+import ariaAvatar from "../assets/images/agent_aria_avatar_1794463014168.jpg";
+import alexAvatar from "../assets/images/agent_alex_avatar_1794463014976.jpg";
+import astyriaAvatar from "../assets/images/agent_astyria_avatar_1794463015211.jpg";
+import aureliusAvatar from "../assets/images/agent_aurelius_avatar_1794463016020.jpg";
+import wallpaper from "../assets/images/bastilla_violet_wallpaper_1794463012010.jpg";
 import type { SystemOverviewResponse, WorkspaceTab, AgentId } from "../types/bastilla";
 import {
   Terminal,
@@ -16,13 +21,13 @@ import {
 } from "lucide-react";
 
 export const AGENT_AVATARS: Record<AgentId, string> = {
-  aria: "/src/assets/images/agent_aria_avatar_1794463014168.jpg",
-  alex: "/src/assets/images/agent_alex_avatar_1794463014976.jpg",
-  astyria: "/src/assets/images/agent_astyria_avatar_1794463015211.jpg",
-  aurelius: "/src/assets/images/agent_aurelius_avatar_1794463016020.jpg",
+  aria: ariaAvatar,
+  alex: alexAvatar,
+  astyria: astyriaAvatar,
+  aurelius: aureliusAvatar,
 };
 
-const WALLPAPER_PATH = "/src/assets/images/bastilla_violet_wallpaper_1794463012010.jpg";
+const WALLPAPER_PATH = wallpaper;
 
 interface BastillaDesktopViewProps {
   overview: SystemOverviewResponse | null;

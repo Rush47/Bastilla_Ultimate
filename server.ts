@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import {
   GoogleGenAI,
@@ -22,8 +23,18 @@ dotenv.config();
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
-const PORT = 3000;
-const DB_PATH = "/var/lib/bastilla/bastilla.db";
+const PROJECT_ROOT = fileURLToPath(new URL(".", import.meta.url));
+const KERNEL_DIR = path.join(PROJECT_ROOT, "distro/bastilla-overlay");
+const PORT = Number(process.env.PORT || 3000);
+const DB_PATH = path.resolve(process.env.BASTILLA_DB_PATH ||
+  (fs.existsSync("/var/lib/bastilla/bastilla.db")
+    ? "/var/lib/bastilla/bastilla.db"
+    : path.join(PROJECT_ROOT, ".bastilla/bastilla.db")));
+const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/$/, "");
+process.env.BASTILLA_PROJECT_ROOT = PROJECT_ROOT;
+process.env.BASTILLA_DB_PATH = DB_PATH;
+process.env.BASTILLA_KERNEL_DIR = KERNEL_DIR;
+process.env.PYTHONPATH = [KERNEL_DIR, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter);
 
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY;
@@ -50,7 +61,7 @@ async function querySqliteJson(pyScript: string, args: string[] = []): Promise<a
     return JSON.parse(stdout.trim() || "{}");
   } catch (err: any) {
     console.error("SQLite bridge error:", err?.message || err);
-    return { error: err?.message || "SQLite error" };
+    throw err;
   }
 }
 
@@ -497,7 +508,7 @@ function startRootEscalationSocket() {
         const req = JSON.parse(line);
         const caller = String(req.caller || "root");
         const cmd = String(req.command || "id");
-        const cwd = String(req.cwd || "/app/applet");
+        const cwd = String(req.cwd || PROJECT_ROOT);
 
         if (/pkill\s+-f\s+server|killall\s+node|rm\s+-rf\s+\/\s*$/i.test(cmd)) {
           conn.end(
@@ -515,7 +526,7 @@ function startRootEscalationSocket() {
         let exitCode = 0;
         try {
           const out = await execAsync(cmd, {
-            cwd: fs.existsSync(cwd) ? cwd : "/app/applet",
+            cwd: fs.existsSync(cwd) ? cwd : PROJECT_ROOT,
             timeout: 12000,
             maxBuffer: 2 * 1024 * 1024,
             env: {
@@ -564,41 +575,19 @@ function startRootEscalationSocket() {
 }
 
 async function ensureLinuxProvisioned() {
-  try {
-    if (fs.existsSync("/app/applet/distro/bastilla-overlay/ollama_cli.py")) {
-      await execAsync(
-        "cp /app/applet/distro/bastilla-overlay/ollama_cli.py /usr/local/bin/ollama && chmod 755 /usr/local/bin/ollama",
-        { timeout: 5000 }
-      );
+  if (process.env.BASTILLA_PROVISION_HOST === "true") {
+    if (process.getuid?.() !== 0) {
+      throw new Error("BASTILLA_PROVISION_HOST wymaga uruchomienia jako root.");
     }
-    if (fs.existsSync("/app/applet/distro/bastilla-overlay/sudo_client.py")) {
-      await execAsync(
-        "cp /app/applet/distro/bastilla-overlay/sudo_client.py /usr/local/bin/sudo && cp /app/applet/distro/bastilla-overlay/sudo_client.py /usr/bin/sudo && chmod 755 /usr/local/bin/sudo /usr/bin/sudo",
-        { timeout: 5000 }
-      );
-    }
-    await execAsync(
-      "mkdir -p /usr/lib/bastilla /etc/sudoers.d && cp /app/applet/distro/bastilla-overlay/svl_kernel.py /usr/lib/bastilla/svl_kernel.py && cp /app/applet/distro/bastilla-overlay/agent_worker.py /usr/lib/bastilla/agent_worker.py && chmod 755 /usr/lib/bastilla/svl_kernel.py /usr/lib/bastilla/agent_worker.py",
-      { timeout: 5000 }
-    );
-    await execAsync(
-      "echo 'root ALL=(ALL:ALL) NOPASSWD: ALL\n%root ALL=(ALL:ALL) NOPASSWD: ALL\n%bastilla-agents ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/bastilla-supreme-root && chmod 0440 /etc/sudoers.d/bastilla-supreme-root && for a in aria alex astyria aurelius; do id -u $a >/dev/null 2>&1 && usermod -g 0 -aG root,sudo,bastilla-agents $a || true; done",
-      { timeout: 5000 }
-    );
-  } catch (e) {
-    console.error("Root & CLI provisioning sync warning:", e);
+    await execFileAsync("bash", [path.join(KERNEL_DIR, "provision-runtime.sh")], {
+      cwd: PROJECT_ROOT,
+      timeout: 120000,
+    });
   }
-
-  if (!fs.existsSync(DB_PATH) || !fs.existsSync("/usr/lib/bastilla/svl_kernel.py")) {
-    try {
-      await execAsync(
-        "chmod +x /app/applet/distro/bastilla-overlay/provision-runtime.sh && /app/applet/distro/bastilla-overlay/provision-runtime.sh",
-        { timeout: 25000 }
-      );
-    } catch (e) {
-      console.error("Provisioning fallback warning:", e);
-    }
-  }
+  await execFileAsync("python3", [path.join(KERNEL_DIR, "init_db.py"), DB_PATH], {
+    cwd: PROJECT_ROOT,
+    timeout: 10000,
+  });
 }
 
 async function executeTerminalCommandInternal(
@@ -615,13 +604,13 @@ async function executeTerminalCommandInternal(
   if (mode === "LINUX_ROOT") {
     try {
       const out = await execAsync(command, {
-        cwd: "/app/applet",
+        cwd: PROJECT_ROOT,
         timeout: 10000,
         maxBuffer: 2 * 1024 * 1024,
         env: {
           ...process.env,
           PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH}`,
-          PYTHONPATH: "/usr/lib/bastilla:/app/applet/distro/bastilla-overlay",
+          PYTHONPATH: process.env.PYTHONPATH,
         },
       });
       stdout = out.stdout;
@@ -634,11 +623,11 @@ async function executeTerminalCommandInternal(
   } else if (mode === "PYTHON_ROOT") {
     try {
       const out = await execFileAsync("python3", ["-c", command], {
-        cwd: "/app/applet",
+        cwd: PROJECT_ROOT,
         timeout: 10000,
         env: {
           ...process.env,
-          PYTHONPATH: "/usr/lib/bastilla:/app/applet/distro/bastilla-overlay",
+          PYTHONPATH: process.env.PYTHONPATH,
         },
       });
       stdout = out.stdout;
@@ -659,7 +648,7 @@ async function executeTerminalCommandInternal(
             ...process.env,
             HOME: `/home/${safeAgent}`,
             USER: safeAgent,
-            PYTHONPATH: "/usr/lib/bastilla",
+            PYTHONPATH: process.env.PYTHONPATH,
           },
         }
       );
@@ -715,7 +704,7 @@ for offset in range(0, len(data), 16):
   } else if (mode === "AI_CLI") {
     try {
       const out = await execAsync(command, {
-        cwd: "/app/applet",
+        cwd: PROJECT_ROOT,
         timeout: 10000,
         env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` },
       });
@@ -763,7 +752,7 @@ async function startServer() {
       try {
         const { stdout } = await execFileAsync(
           "python3",
-          ["/usr/lib/bastilla/svl_kernel.py"],
+          [path.join(KERNEL_DIR, "svl_kernel.py")],
           { timeout: 5000 }
         );
         svlReport = JSON.parse(stdout);
@@ -774,7 +763,7 @@ async function startServer() {
       }
 
       const hostProbeScript = `
-import json, os, pwd, subprocess, sqlite3
+import json, os, pwd, subprocess, sqlite3, sys
 
 def cmd_out(c):
     try:
@@ -877,16 +866,16 @@ tools = {
     },
     "ollama": {
         "installed": os.path.exists("/usr/local/bin/ollama") or bool(cmd_out("which ollama")),
-        "version": cmd_out("ollama --version") or "ollama version is 0.16.4 (127.0.0.1:11434 ONLINE · Qwen3.8-27B-Uncensored + llama3.2-vision:11b)",
+        "version": cmd_out("ollama --version"),
         "binary_path": cmd_out("which ollama") or "/usr/local/bin/ollama",
-        "auth_ready": True,
-        "requirement_note": "Demon Ollama aktywny na 127.0.0.1:11434 (modele Qwen3.8-27B-Uncensored oraz llama3.2-vision:11b gotowe + Fallback Gemini)"
+        "auth_ready": False,
+        "requirement_note": "Wymaga uruchomionej usługi Ollama i pobranego modelu."
     }
 }
 
 db_data = {"memories": [], "ipc": [], "tasks": [], "fleet": [], "missions": [], "hypercomm": [], "chats": []}
-if os.path.exists("/var/lib/bastilla/bastilla.db"):
-    conn = sqlite3.connect("/var/lib/bastilla/bastilla.db")
+if os.path.exists(sys.argv[1]):
+    conn = sqlite3.connect(sys.argv[1])
     conn.row_factory = sqlite3.Row
     db_data["memories"] = [dict(r) for r in conn.execute("SELECT * FROM agent_memories ORDER BY id DESC LIMIT 40").fetchall()]
     db_data["ipc"] = [dict(r) for r in conn.execute("SELECT * FROM agent_ipc_messages ORDER BY id DESC LIMIT 30").fetchall()]
@@ -898,8 +887,9 @@ if os.path.exists("/var/lib/bastilla/bastilla.db"):
     conn.close()
 
 distro_files = []
-if os.path.exists("/app/applet/distro/agenticlinux"):
-    distro_files = sorted(os.listdir("/app/applet/distro/agenticlinux"))
+distro_dir = os.path.join(os.environ["BASTILLA_PROJECT_ROOT"], "distro/agenticlinux")
+if os.path.exists(distro_dir):
+    distro_files = sorted(os.listdir(distro_dir))
 
 print(json.dumps({
     "os_release": os_release,
@@ -929,21 +919,30 @@ print(json.dumps({
           process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
       );
 
+      let ollamaOnline = false;
+      try {
+        const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
+          signal: AbortSignal.timeout(2000),
+        });
+        const body: any = response.ok ? await response.json() : null;
+        ollamaOnline = Array.isArray(body?.models);
+      } catch {}
+
+      hostData.tools.ollama.auth_ready = ollamaOnline;
       res.json({
         ok: true,
         svl_report: svlReport,
         host: hostData,
         ai_routing: {
           primary_model: "ollama/Qwen3.8-27B-Uncensored",
-          ollama_online: true,
+          ollama_online: ollamaOnline,
           fallback_model: "gemini-3.8-flash",
           gemini_configured: geminiConfigured,
-          active_engine:
-            "ollama/Qwen3.8-27B-Uncensored + llama3.2-vision:11b (127.0.0.1:11434 ONLINE)",
+          active_engine: ollamaOnline ? "ollama" : geminiConfigured ? "gemini" : "unavailable",
         },
         app_url:
           process.env.APP_URL ||
-          "https://ais-dev-5st6ohqhbyd3gh3eje5zxh-668176017916.europe-west1.run.app",
+          `http://localhost:${PORT}`,
       });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
@@ -963,7 +962,7 @@ print(json.dumps({
             timeout: 8000,
             env: {
               ...process.env,
-              PYTHONPATH: "/usr/lib/bastilla:/app/applet/distro/bastilla-overlay",
+              PYTHONPATH: process.env.PYTHONPATH,
             },
           }
         );
@@ -980,8 +979,8 @@ conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
       }
 
       const pyEval = `
-import json, sys
-sys.path.insert(0, "/usr/lib/bastilla")
+import json, sys, os, math
+sys.path.insert(0, os.environ["BASTILLA_KERNEL_DIR"])
 from svl_kernel import SVLSystemKernel, TopologicalInfinityEngine
 
 kernel = SVLSystemKernel()
@@ -998,7 +997,7 @@ max_upgrade = kernel.ulepsz_system_maksymalnie(token)
 custom_eng = TopologicalInfinityEngine(x_s, x_e)
 report = json.loads(kernel.generate_system_status_report())
 report["Custom_Domain_Test"] = {
-    "raw_domain": [x_s, x_e],
+    "raw_domain": [str(value) if math.isinf(value) else value for value in [x_s, x_e]],
     "compact_start": round(custom_eng.compact_start, 6),
     "compact_end": round(custom_eng.compact_end, 6),
     "domain_length": round(custom_eng.domain_length, 6),
@@ -1006,7 +1005,7 @@ report["Custom_Domain_Test"] = {
     "token_auth_result": token_updated,
     "max_upgrade_executed": max_upgrade
 }
-print(json.dumps(report, indent=4, ensure_ascii=False))
+print(json.dumps(report, indent=4, ensure_ascii=False, allow_nan=False))
 `;
       const startVal =
         xStart === "-inf" || xStart === undefined || xStart === ""
@@ -1016,6 +1015,10 @@ print(json.dumps(report, indent=4, ensure_ascii=False))
         xEnd === "inf" || xEnd === undefined || xEnd === ""
           ? "inf"
           : String(Number(xEnd));
+
+      if (startVal === "NaN" || endVal === "NaN") {
+        return res.status(400).json({ ok: false, error: "Granice domeny muszą być liczbami lub nieskończonością." });
+      }
 
       const { stdout } = await execFileAsync(
         "python3",
@@ -1120,7 +1123,7 @@ Zwróć TYLKO czyste polecenie, bez formatowania markdown, bez cudzysłowów, be
 Polecenie użytkownika: "${prompt.trim()}"`;
 
         try {
-          const ollamaRes = await fetch("http://127.0.0.1:11434/api/chat", {
+          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1331,28 +1334,36 @@ Polecenie użytkownika: "${prompt.trim()}"`;
         return res.end();
       }
 
-      const ollamaRes = await fetch("http://127.0.0.1:11434/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model:
-            enginePreference === "auto"
-              ? "Qwen3.8-27B-Uncensored"
-              : enginePreference,
-          stream: false,
-          messages: [{ role: "user", content: message }],
-        }),
-      });
-
       let fullText = "";
-      if (ollamaRes.ok) {
-        const data: any = await ollamaRes.json();
-        fullText = data?.message?.content || "";
-      } else {
-        const { text } = await runLiveMultimodalModel([
+      let engineUsed = "";
+      const targetModel = enginePreference === "auto" ? "Qwen3.8-27B-Uncensored" : enginePreference;
+      if (enginePreference !== "gemini") {
+        try {
+          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: targetModel,
+              stream: false,
+              messages: [{ role: "user", content: message }],
+            }),
+            signal: AbortSignal.timeout(25000),
+          });
+          if (ollamaRes.ok) {
+            const data: any = await ollamaRes.json();
+            fullText = data?.message?.content || "";
+            if (fullText) engineUsed = `ollama/${targetModel}`;
+          }
+        } catch {
+          // Transport failures use the same fallback as HTTP errors.
+        }
+      }
+      if (!fullText) {
+        const result = await runLiveMultimodalModel([
           { role: "user", parts: [{ text: message }] },
         ]);
-        fullText = text;
+        fullText = result.text;
+        engineUsed = result.modelUsed;
       }
 
       // Stream words smoothly to client
@@ -1366,7 +1377,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
       res.write(
         `data: ${JSON.stringify({
           type: "done",
-          engineUsed: `ollama/${enginePreference}`,
+          engineUsed,
         })}\n\n`
       );
       res.end();
@@ -1434,10 +1445,10 @@ Polecenie użytkownika: "${prompt.trim()}"`;
         `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
 conn.row_factory = sqlite3.Row
-rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? ORDER BY id DESC LIMIT 10", (sys.argv[2],)).fetchall()
+rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 10", (sys.argv[2], sys.argv[3])).fetchall()
 conn.close()
 print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
-        [agentId]
+        [agentId, sessionId]
       );
       const rawPriorTurns: Array<{ sender_role: string; content: string }> =
         historyData?.history || [];
@@ -1463,8 +1474,6 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
       // Step 1: Attempt local Ollama daemon on 127.0.0.1:11434 with ZERO system prompts
       if (isOllamaSelection) {
         try {
-          const controller = new AbortController();
-          const t = setTimeout(() => controller.abort(), 25000);
           const ollamaMessages = [
             ...priorTurns.map((h) => ({
               role: h.sender_role === "user" ? "user" : "assistant",
@@ -1476,7 +1485,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
               ...(imageBase64 ? { images: [imageBase64] } : {}),
             },
           ];
-          const ollamaRes = await fetch("http://127.0.0.1:11434/api/chat", {
+          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1484,9 +1493,8 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
               stream: false,
               messages: ollamaMessages,
             }),
-            signal: controller.signal,
+            signal: AbortSignal.timeout(25000),
           });
-          clearTimeout(t);
           if (ollamaRes.ok) {
             const data: any = await ollamaRes.json();
             replyText = data?.message?.content || "";
@@ -1655,7 +1663,7 @@ print(json.dumps({"deleted": deleted, "ok": True}))`,
         "python3",
         [
           "-c",
-          `import sys, json; sys.path.insert(0, "/usr/lib/bastilla"); from svl_kernel import SVLSystemKernel; k = SVLSystemKernel(); k.odblokuj_system_calkowicie(); k.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT"); print(k.generate_system_status_report())`,
+          `import sys, json, os; sys.path.insert(0, os.environ["BASTILLA_KERNEL_DIR"]); from svl_kernel import SVLSystemKernel; k = SVLSystemKernel(); k.odblokuj_system_calkowicie(); k.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT"); print(k.generate_system_status_report())`,
         ],
         { timeout: 6000 }
       );
@@ -1837,7 +1845,7 @@ import json, subprocess, os
 
 def run(c):
     try:
-        return subprocess.check_output(c, shell=True, cwd="/app/applet", stderr=subprocess.STDOUT).decode("utf-8", "replace").strip()
+        return subprocess.check_output(c, shell=True, cwd=os.environ["BASTILLA_PROJECT_ROOT"], stderr=subprocess.STDOUT).decode("utf-8", "replace").strip()
     except Exception as e:
         return e.output.decode("utf-8", "replace").strip() if hasattr(e, "output") and e.output else str(e)
 
@@ -1882,7 +1890,7 @@ msg = sys.argv[2]
 rem = sys.argv[3]
 
 def run(c):
-    return subprocess.run(c, shell=True, cwd="/app/applet", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return subprocess.run(c, shell=True, cwd=os.environ["BASTILLA_PROJECT_ROOT"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 run("git checkout -B main")
 if rem:
@@ -1984,7 +1992,7 @@ print(json.dumps({"updated": True, "relayId": sys.argv[2], "packet": sys.argv[3]
   }
 
   const continuousMissionState = {
-    active: true,
+    active: process.env.BASTILLA_CONTINUOUS_MISSION === "true",
     cycle: 0,
     missionId: "MISSION-CONTINUOUS-AUTONOMOUS",
     codename: "MISJA CIĄGŁA: Naprawa, Samoleczenie i Ulepszanie Backend + GUI",
@@ -2179,7 +2187,7 @@ print(json.dumps({"updated": True, "agent": sys.argv[2], "avatar": sys.argv[3]})
     if (continuousMissionInterval) {
       clearInterval(continuousMissionInterval);
     }
-    executeContinuousMissionCycle().catch(() => {});
+    if (continuousMissionState.active) executeContinuousMissionCycle().catch(() => {});
     continuousMissionInterval = setInterval(() => {
       if (continuousMissionState.active) {
         executeContinuousMissionCycle().catch((err) => {
@@ -2188,7 +2196,7 @@ print(json.dumps({"updated": True, "agent": sys.argv[2], "avatar": sys.argv[3]})
       }
     }, 6000);
 
-    console.log("[Bastilla OS Ultimate] Ciągła misja automatyczna w tle uruchomiona dla agentów AI (Aria, Alex, Astyria, Aurelius).");
+    console.log(`[Bastilla OS Ultimate] Continuous mission: ${continuousMissionState.active ? "active" : "paused"}.`);
   }
 
   app.get("/api/missions/continuous/status", (_req, res) => {
@@ -2222,25 +2230,34 @@ print(json.dumps({"updated": True, "agent": sys.argv[2], "avatar": sys.argv[3]})
   // Mount Vite middleware in development or static dist in production
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
+      root: PROJECT_ROOT,
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(process.cwd(), "dist");
+    const distPath = path.join(PROJECT_ROOT, "dist");
     app.use(express.static(distPath));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  startRootEscalationSocket();
-  startLocalOllamaDaemon();
+  if (process.env.BASTILLA_ROOT_SOCKET === "true") {
+    if (process.getuid?.() !== 0) throw new Error("BASTILLA_ROOT_SOCKET wymaga roota.");
+    startRootEscalationSocket();
+  }
+  if (process.env.BASTILLA_OLLAMA_BRIDGE === "true") startLocalOllamaDaemon();
   startContinuousAgentMissionDaemon();
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Bastilla OS Ultimate] Server running at http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : PORT;
+    console.log(`[Bastilla OS Ultimate] Server running at http://0.0.0.0:${port}`);
   });
 }
 
-startServer();
+startServer().catch((error) => {
+  console.error("Bastilla startup failed:", error);
+  process.exit(1);
+});

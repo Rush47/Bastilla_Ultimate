@@ -329,7 +329,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     "Qwen3.8-27B-Uncensored"
   );
   const [filterByAgent, setFilterByAgent] = useState<boolean>(true);
-  const [isFullscreen, setIsFullscreen] = useState<boolean>(true);
+  const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [showCanvasDrawer, setShowCanvasDrawer] = useState<boolean>(false);
   const [showMobileTools, setShowMobileTools] = useState<boolean>(false);
   const [localMessages, setLocalMessages] = useState<ChatMessageRecord[]>([]);
@@ -346,6 +346,15 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   });
   const [executingArtifact, setExecutingArtifact] = useState<boolean>(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!isFullscreen) return;
+    const exitFullscreen = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsFullscreen(false);
+    };
+    window.addEventListener("keydown", exitFullscreen);
+    return () => window.removeEventListener("keydown", exitFullscreen);
+  }, [isFullscreen]);
 
   useEffect(() => {
     const serverChats = overview?.host?.db?.chats || [];
