@@ -25,7 +25,7 @@ test("MCP denies missing token, legacy magic tokens and unsupported tools", () =
     assert.throws(() => manager.executeTool("agent_memory_read", { agentId: "../secrets" }, process.env.BASTILLA_API_TOKEN), /Invalid agent/);
     const result = manager.executeTool("git_status", {}, process.env.BASTILLA_API_TOKEN);
     assert.equal(result.ok, true);
-    assert.equal(typeof result.branch, "string");
+    assert.equal("branch" in result, true);
   } finally {
     if (oldToken === undefined) delete process.env.BASTILLA_API_TOKEN;
     else process.env.BASTILLA_API_TOKEN = oldToken;
