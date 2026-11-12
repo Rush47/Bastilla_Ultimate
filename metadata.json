@@ -1,0 +1,6 @@
+{
+  "name": "Bastilla OS Ultimate",
+  "description": "AgenticLinux distribution & executive control plane with 4 Linux AI agents (Aria, Alex, Astyria, Aurelius), OpenAI Codex CLI, Ollama Llama 3.2 Vision + Gemini fallback, multi-mode root terminals, Bastilla Violet desktop, and 3D Solar System & Fleet command.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

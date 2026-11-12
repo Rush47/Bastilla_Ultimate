@@ -1,0 +1,129 @@
+# One package per line; '#' starts a comment. Every package here exists on
+# both Fedora and CentOS Stream (with EPEL and RPM Fusion).
+
+# --- Docker Engine ----------------------------------------------------------
+docker-ce
+docker-ce-cli
+docker-ce-rootless-extras  # rootless mode; docker-ce only recommends it
+containerd.io
+docker-buildx-plugin
+docker-compose-plugin
+
+# --- Container-based development environments -------------------------------
+distrobox
+toolbox
+
+# --- Virtual machines (KVM, the host's architecture) ------------------------
+qemu-kvm  # /usr/bin/qemu-kvm on Fedora, /usr/libexec/qemu-kvm on CentOS
+qemu-img
+
+# --- GPU (ROCm and the NVIDIA driver are handled in build.sh) ---------------
+vulkan-loader
+vulkan-tools
+mesa-vulkan-drivers
+akmods
+nvidia-container-toolkit
+
+# --- Wayland utilities ------------------------------------------------------
+xdg-desktop-portal
+xdg-desktop-portal-gtk
+wl-clipboard
+ddcutil
+gnome-keyring
+libsecret
+qt6-qtimageformats
+qt6-qtmultimedia
+python3-gobject
+
+# --- Terminal / shell / CLI -------------------------------------------------
+bash-completion
+fzf
+fd-find
+ripgrep
+bat
+jq
+gum
+tmux
+less
+man-db
+unzip
+whois
+socat
+plocate
+btop
+nvtop
+vim-enhanced  # the full vim (the vim command), not vim-minimal's vi
+tldr
+
+# --- Development ------------------------------------------------------------
+git
+gh  # GitHub CLI: gh auth login, gh pr create; a git credential helper too
+mise
+clang
+llvm
+ruby
+libyaml
+mariadb-connector-c
+libpq
+dotnet-runtime-10.0
+python3-poetry-core
+
+# --- GUI applications (Google Chrome is in build.sh, from Google's repo) ----
+nautilus
+nautilus-python
+gnome-disk-utility
+papers
+mpv
+xournalpp
+kdenlive
+
+# --- Desktop apps' runtime (ChatGPT and OpenCode are Electron apps; what
+# their RPMs require, so the base variant has it too) ------------------------
+libnotify
+libXtst
+libXScrnSaver
+libappindicator-gtk3
+xdg-utils
+
+# --- CodexBar's runtime (system Qt; Sign in opens a terminal) --------------
+qt6-qtdeclarative
+qt6-qtsvg
+qt6-qtwayland
+xdg-terminal-exec
+
+# --- Media / imaging / OCR --------------------------------------------------
+openh264  # Cisco's, from its repository; replaces the noopenh264 stub
+ImageMagick
+ffmpegthumbnailer
+tesseract
+tesseract-langpack-eng
+zbar
+qrencode
+
+# --- Fonts ------------------------------------------------------------------
+google-noto-sans-fonts
+google-noto-sans-cjk-fonts
+google-noto-color-emoji-fonts
+jetbrains-mono-fonts-all
+fontawesome4-fonts
+fontconfig
+
+# --- Remote desktop ---------------------------------------------------------
+krdp
+
+# --- Hardware / system services ---------------------------------------------
+NetworkManager
+wireless-regdb
+bluez
+bolt
+avahi
+nss-mdns
+wireplumber
+alsa-utils
+cups
+cups-filters
+cups-pk-helper
+gvfs-mtp
+gvfs-smb
+dosfstools
+exfatprogs
