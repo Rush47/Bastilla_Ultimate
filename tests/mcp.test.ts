@@ -1,34 +1,53 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { MCPServerManager, MCP_TOOLS } from "../server/mcp";
 
-test("MCP server lists registered tools", () => {
+test("MCP exposes only read-only allowlisted tools", () => {
+  const manager = new MCPServerManager(path.resolve(import.meta.dirname, ".."), "/tmp/unused.db");
+  const listing = manager.listTools();
+  assert.equal(listing.ok, true);
+  assert.deepEqual(listing.tools.map(t => t.name).sort(), ["agent_memory_read", "git_status"]);
+  assert.equal(MCP_TOOLS.some(t => t.name === "terminal_exec" || t.name === "sqlite_query"), false);
+});
+
+test("MCP denies missing token, legacy magic tokens and unsupported tools", () => {
   const tmp = mkdtempSync(path.join(tmpdir(), "bastilla-mcp-"));
-  const dbPath = path.join(tmp, "bastilla.db");
+  const oldToken = process.env.BASTILLA_API_TOKEN;
+  process.env.BASTILLA_API_TOKEN = "test-operator-token-not-a-real-secret";
   try {
-    const manager = new MCPServerManager(path.resolve(import.meta.dirname, ".."), dbPath);
-    const listing = manager.listTools();
-    assert.equal(listing.ok, true);
-    assert.equal(listing.tools.length, MCP_TOOLS.length);
-    assert.equal(listing.tools.some((t) => t.name === "sqlite_query"), true);
-    assert.equal(listing.tools.some((t) => t.name === "terminal_exec"), true);
+    const manager = new MCPServerManager(path.resolve(import.meta.dirname, ".."), path.join(tmp, "db"));
+    assert.throws(() => manager.executeTool("git_status", {}), /authenticated/);
+    assert.throws(() => manager.executeTool("git_status", {}, "364_OMNIKLUCZ_ROOT"), /authenticated/);
+    assert.throws(() => manager.executeTool("terminal_exec", { command: "id" }, process.env.BASTILLA_API_TOKEN), /Unknown|Nieznane/);
+    assert.throws(() => manager.executeTool("agent_memory_read", { agentId: "../secrets" }, process.env.BASTILLA_API_TOKEN), /Invalid agent/);
+    const result = manager.executeTool("git_status", {}, process.env.BASTILLA_API_TOKEN);
+    assert.equal(result.ok, true);
+    assert.equal("branch" in result, true);
   } finally {
+    if (oldToken === undefined) delete process.env.BASTILLA_API_TOKEN;
+    else process.env.BASTILLA_API_TOKEN = oldToken;
     rmSync(tmp, { recursive: true, force: true });
   }
 });
 
-test("MCP server executes terminal_exec and git_status securely", () => {
-  const tmp = mkdtempSync(path.join(tmpdir(), "bastilla-mcp-"));
-  const dbPath = path.join(tmp, "bastilla.db");
+test("MCP agent memory does not follow symlinks or read global fallback", () => {
+  const tmp = mkdtempSync(path.join(tmpdir(), "bastilla-mcp-memory-"));
+  const oldToken = process.env.BASTILLA_API_TOKEN;
+  process.env.BASTILLA_API_TOKEN = "test-operator-token-not-a-real-secret";
   try {
-    const manager = new MCPServerManager(path.resolve(import.meta.dirname, ".."), dbPath);
-    const res = manager.executeTool("git_status", {}, "364_OMNIKLUCZ_ROOT");
-    assert.equal(res.ok, true);
-    assert.equal(typeof res.branch, "string");
+    const manager = new MCPServerManager(tmp, path.join(tmp, "db"));
+    writeFileSync(path.join(tmp, "memory.json"), JSON.stringify({ secret: "global-not-for-agent" }));
+    const empty = manager.executeTool("agent_memory_read", { agentId: "aria" }, process.env.BASTILLA_API_TOKEN);
+    assert.deepEqual(empty, { ok: true, agentId: "aria", memory: {} });
+    mkdirSync(path.join(tmp, "home", "aria"), { recursive: true });
+    symlinkSync(path.join(tmp, "memory.json"), path.join(tmp, "home", "aria", "memory.json"));
+    assert.throws(() => manager.executeTool("agent_memory_read", { agentId: "aria" }, process.env.BASTILLA_API_TOKEN), /regular file/);
   } finally {
+    if (oldToken === undefined) delete process.env.BASTILLA_API_TOKEN;
+    else process.env.BASTILLA_API_TOKEN = oldToken;
     rmSync(tmp, { recursive: true, force: true });
   }
 });
