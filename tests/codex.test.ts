@@ -145,6 +145,7 @@ test("CodexTaskManager isolates agent sessions, runs codex exec, streams events,
       BASTILLA_CODEX_BIN: binary,
       OPENAI_API_KEY: secretKey,
       TEST_CODEX_EXEC_SLEEP_MS: "40",
+      BASTILLA_API_TOKEN: "synthetic-operator-token-for-tests",
     });
 
     // Reject unauthorized token
@@ -158,9 +159,9 @@ test("CodexTaskManager isolates agent sessions, runs codex exec, streams events,
     tasks.on("complete", (c) => events.push(`complete:${c.taskId}:${c.status}`));
 
     // Enqueue two tasks in codex-aria (sequential queue) and one in codex-alex (isolated session)
-    const id1 = tasks.createTask("aria", "auto", `Sprawdź status ${secretKey}`, { operatorToken: "364_OMNIKLUCZ_ROOT" });
-    const id2 = tasks.createTask("aria", "codex-aria", "Drugi krok w kolejce Aria");
-    const idAlex = tasks.createTask("alex", "codex-alex", "Zadanie w osobnej sesji Alex");
+    const id1 = tasks.createTask("aria", "auto", `Sprawdź status ${secretKey}`, { operatorToken: "synthetic-operator-token-for-tests" });
+    const id2 = tasks.createTask("aria", "codex-aria", "Drugi krok w kolejce Aria", { operatorToken: "synthetic-operator-token-for-tests" });
+    const idAlex = tasks.createTask("alex", "codex-alex", "Zadanie w osobnej sesji Alex", { operatorToken: "synthetic-operator-token-for-tests" });
 
     // Immediately after creation, id2 should still be pending while id1 is running
     const initialAria = tasks.getTasks("codex-aria");
@@ -209,16 +210,17 @@ test("CodexTaskManager supports cancellation, retry, error handling, and GitHub 
       CODEX_HOME: f.home,
       BASTILLA_CODEX_BIN: binary,
       TEST_CODEX_EXEC_SLEEP_MS: "250",
+      BASTILLA_API_TOKEN: "synthetic-operator-token-for-tests",
     });
 
     // 1. Test cancelTask on a running task in codex-astyria
-    const cancelId = tasks.createTask("astyria", "codex-astyria", "Dlugie zadanie do anulowania");
+    const cancelId = tasks.createTask("astyria", "codex-astyria", "Dlugie zadanie do anulowania", { operatorToken: "synthetic-operator-token-for-tests" });
     await until(async () => tasks.getTaskById(cancelId)?.status === "running");
     tasks.cancelTask(cancelId);
     assert.equal(tasks.getTaskById(cancelId)?.status, "cancelled");
 
     // 2. Test error status when codex exec fails in codex-aurelius
-    const failId = tasks.createTask("aurelius", "codex-aurelius", "FAIL_TASK test bledu");
+    const failId = tasks.createTask("aurelius", "codex-aurelius", "FAIL_TASK test bledu", { operatorToken: "synthetic-operator-token-for-tests" });
     await until(async () => tasks.getTaskById(failId)?.status === "error");
     assert.equal(tasks.getTaskById(failId)?.status, "error");
     assert.match(tasks.getTaskById(failId)?.error || "", /Błąd wykonania zadania/);
