@@ -10,6 +10,7 @@ export interface LiveLinuxAgent {
   shell: string;
   pid: number;
   running: boolean;
+  avatar_url?: string;
   worker_status: {
     agent?: string;
     display_name?: string;
@@ -210,6 +211,7 @@ export interface SystemOverviewResponse {
   svl_report: SVLKernelReport;
   host: {
     legacy_records_unverified?: boolean;
+    operator_avatar_url?: string;
     os_release: Record<string, string>;
     uname: string;
     loadavg: string[];

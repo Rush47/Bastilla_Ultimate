@@ -5,7 +5,11 @@ import type {
   SystemOverviewResponse,
   WorkspaceTab,
 } from "./types/bastilla";
-import { BastillaDesktopView } from "./components/BastillaDesktopView";
+import {
+  BastillaDesktopView,
+  OPERATOR_AVATAR,
+  getOperatorAvatarUrl,
+} from "./components/BastillaDesktopView";
 import {
   apiFetchJson,
   ApiError,
@@ -304,8 +308,22 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: Primary actions */}
+        {/* Zone 3: Operator Avatar + Primary actions */}
         <div className="flex items-center gap-2 shrink-0">
+          <div className="hidden sm:flex items-center gap-2 px-2.5 py-1 rounded-lg bg-[#111723] border border-slate-800 text-xs text-slate-200">
+            <img
+              src={getOperatorAvatarUrl(overview)}
+              alt="Operator Mateusz Mitek"
+              referrerPolicy="no-referrer"
+              className="w-6 h-6 rounded-full object-cover border border-violet-500/70 shrink-0"
+              onError={(e) => {
+                (e.currentTarget as HTMLImageElement).src = OPERATOR_AVATAR;
+              }}
+            />
+            <span className="font-semibold truncate max-w-[130px]">
+              {overview?.svl_report?.Operator || "Mateusz Mitek"}
+            </span>
+          </div>
           <button
             type="button"
             onClick={() => setActiveTab("diagnostics")}

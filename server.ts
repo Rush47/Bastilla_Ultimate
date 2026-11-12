@@ -1480,6 +1480,35 @@ except Exception:
 
 disk_df = cmd_out("df -h / | tail -n 1").split()
 
+db_data = {"memories": [], "ipc": [], "tasks": [], "fleet": [], "missions": [], "hypercomm": [], "chats": [], "agents": []}
+legacy_records_unverified = False
+operator_avatar_url = "/assets/operator_lucy_vault33.webp"
+agent_avatars_map = {}
+if os.path.exists(sys.argv[1]):
+    conn = sqlite3.connect(sys.argv[1])
+    conn.row_factory = sqlite3.Row
+    metadata = conn.execute("SELECT value FROM bastilla_metadata WHERE key='legacy_records_unverified'").fetchone()
+    legacy_records_unverified = bool(metadata and metadata[0] == 'true')
+    op_meta = conn.execute("SELECT value FROM bastilla_metadata WHERE key='operator_avatar_url'").fetchone()
+    if op_meta and op_meta[0]:
+        operator_avatar_url = op_meta[0]
+    try:
+        db_agents = [dict(r) for r in conn.execute("SELECT * FROM agents").fetchall()]
+        db_data["agents"] = db_agents
+        for ag_row in db_agents:
+            if ag_row.get("id") and ag_row.get("avatar_url"):
+                agent_avatars_map[ag_row["id"]] = ag_row["avatar_url"]
+    except Exception:
+        pass
+    db_data["memories"] = [dict(r) for r in conn.execute("SELECT * FROM agent_memories ORDER BY id DESC LIMIT 40").fetchall()]
+    db_data["ipc"] = [dict(r) for r in conn.execute("SELECT * FROM agent_ipc_messages ORDER BY id DESC LIMIT 30").fetchall()]
+    db_data["tasks"] = [dict(r) for r in conn.execute("SELECT * FROM task_history ORDER BY id DESC LIMIT 30").fetchall()]
+    db_data["fleet"] = [dict(r) for r in conn.execute("SELECT * FROM fleet_units").fetchall()]
+    db_data["missions"] = [dict(r) for r in conn.execute("SELECT * FROM missions").fetchall()]
+    db_data["hypercomm"] = [dict(r) for r in conn.execute("SELECT * FROM hypercomm_relays").fetchall()]
+    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM (SELECT * FROM chat_messages ORDER BY id DESC LIMIT 150) ORDER BY id ASC").fetchall()]
+    conn.close()
+
 agents_live = []
 for a in ["aria", "alex", "astyria", "aurelius"]:
     try:
@@ -1514,6 +1543,7 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
         "shell": shell,
         "pid": pid,
         "running": pid > 0 and heartbeat_valid,
+        "avatar_url": agent_avatars_map.get(a, ""),
         "worker_status": worker_status
     })
 
@@ -1572,22 +1602,6 @@ tools = {
     }
 }
 
-db_data = {"memories": [], "ipc": [], "tasks": [], "fleet": [], "missions": [], "hypercomm": [], "chats": []}
-legacy_records_unverified = False
-if os.path.exists(sys.argv[1]):
-    conn = sqlite3.connect(sys.argv[1])
-    conn.row_factory = sqlite3.Row
-    metadata = conn.execute("SELECT value FROM bastilla_metadata WHERE key='legacy_records_unverified'").fetchone()
-    legacy_records_unverified = bool(metadata and metadata[0] == 'true')
-    db_data["memories"] = [dict(r) for r in conn.execute("SELECT * FROM agent_memories ORDER BY id DESC LIMIT 40").fetchall()]
-    db_data["ipc"] = [dict(r) for r in conn.execute("SELECT * FROM agent_ipc_messages ORDER BY id DESC LIMIT 30").fetchall()]
-    db_data["tasks"] = [dict(r) for r in conn.execute("SELECT * FROM task_history ORDER BY id DESC LIMIT 30").fetchall()]
-    db_data["fleet"] = [dict(r) for r in conn.execute("SELECT * FROM fleet_units").fetchall()]
-    db_data["missions"] = [dict(r) for r in conn.execute("SELECT * FROM missions").fetchall()]
-    db_data["hypercomm"] = [dict(r) for r in conn.execute("SELECT * FROM hypercomm_relays").fetchall()]
-    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM (SELECT * FROM chat_messages ORDER BY id DESC LIMIT 150) ORDER BY id ASC").fetchall()]
-    conn.close()
-
 distro_files = []
 distro_dir = os.path.join(os.environ["BASTILLA_PROJECT_ROOT"], "distro/agenticlinux")
 if os.path.exists(distro_dir):
@@ -1610,6 +1624,7 @@ print(json.dumps({
         "use_pct": disk_df[4] if len(disk_df) > 4 else "N/A",
     },
     "agents_live": agents_live,
+    "operator_avatar_url": operator_avatar_url,
     "tools": tools,
     "db": db_data,
     "legacy_records_unverified": legacy_records_unverified,
@@ -1991,6 +2006,93 @@ Polecenie użytkownika: "${prompt.trim()}"`;
     }
   });
 
+  // Helper to generate a single agent's contextual response via Ollama -> Gemini fallback
+  async function generateAgentReplyTurn(opts: {
+    speakerId: string;
+    prompt: string;
+    systemExtra?: string;
+    enginePreference?: string;
+    signal?: AbortSignal;
+  }): Promise<{ text: string; engineUsed: string }> {
+    const speaker = (AGENTS as readonly string[]).includes(opts.speakerId) ? opts.speakerId : "aria";
+    const pref = opts.enginePreference || "auto";
+    const targetModel =
+      pref === "auto" || pref === "ollama"
+        ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b"
+        : pref;
+    const sysInstruction = [
+      buildAgentSystemInstruction(speaker),
+      opts.systemExtra || "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    let replyText = "";
+    let usedEngine = "";
+
+    if (pref !== "gemini") {
+      const ollamaEndpoint = getOllamaBaseUrl();
+      const ollamaMessages = [
+        { role: "system", content: sysInstruction },
+        { role: "user", content: opts.prompt },
+      ];
+      try {
+        const sig = opts.signal
+          ? AbortSignal.any([opts.signal, AbortSignal.timeout(25000)])
+          : AbortSignal.timeout(25000);
+        const streamed = await streamOllamaChat({
+          ollamaBaseUrl: ollamaEndpoint,
+          model: targetModel,
+          messages: ollamaMessages,
+          signal: sig,
+          onChunk: () => {},
+        });
+        replyText = streamed.text;
+        usedEngine = streamed.model;
+      } catch (err: any) {
+        if (/404|not found/i.test(String(err?.message || ""))) {
+          try {
+            const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+            const altModel = pickPreferredOllamaModel(liveOllama.models);
+            if (altModel && altModel !== targetModel) {
+              const retryStream = await streamOllamaChat({
+                ollamaBaseUrl: ollamaEndpoint,
+                model: altModel,
+                messages: ollamaMessages,
+                signal: opts.signal
+                  ? AbortSignal.any([opts.signal, AbortSignal.timeout(25000)])
+                  : AbortSignal.timeout(25000),
+                onChunk: () => {},
+              });
+              replyText = retryStream.text;
+              usedEngine = retryStream.model;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    if (!replyText && (!opts.signal || !opts.signal.aborted)) {
+      const sig = opts.signal || AbortSignal.timeout(30000);
+      const streamedGemini = await streamLiveMultimodalModel(
+        [{ role: "user", parts: [{ text: opts.prompt }] }],
+        sig,
+        () => {},
+        sysInstruction
+      );
+      replyText = streamedGemini.text;
+      usedEngine =
+        pref === "gemini"
+          ? streamedGemini.modelUsed
+          : `${streamedGemini.modelUsed} (Fallback dla ${targetModel})`;
+    }
+
+    return {
+      text: redact(replyText).trim(),
+      engineUsed: usedEngine || "gemini-3.1-flash-lite",
+    };
+  }
+
   // 4A. Real Server-Sent Events (SSE) Streaming Chat Endpoint (GET + POST with upstream abort)
   async function handleChatStreamRequest(
     req: express.Request,
@@ -2295,14 +2397,33 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         }
       }
 
+      const peerMessages: any[] = [];
+
       if (saveToDb && fullText) {
         // Record IPC mentions if operator addressed @wszyscy or specific agent
         const mentioned = [...message.toLowerCase().matchAll(/@(aria|alex|astyria|aurelius|wszyscy)\b/g)].map((m) => m[1]);
-        if (mentioned.length > 0) {
-          const targets = mentioned.includes("wszyscy") ? [...AGENTS] : Array.from(new Set(mentioned));
-          const sender = (AGENTS as readonly string[]).includes(agentId) ? agentId : "aria";
+        const mentionedSpecific = Array.from(
+          new Set(mentioned.filter((m) => m !== "wszyscy" && (AGENTS as readonly string[]).includes(m)))
+        );
+        const primarySpeaker =
+          agentId === "council"
+            ? mentionedSpecific[0] || "aria"
+            : (AGENTS as readonly string[]).includes(agentId)
+            ? agentId
+            : "aria";
+        const effectiveAsstAgentId = agentId === "council" ? primarySpeaker : agentId;
+        const effectiveEngineLabel =
+          agentId === "council" || mentioned.includes("wszyscy")
+            ? `${engineUsed} · @wszyscy`
+            : engineUsed;
+
+        if (mentioned.length > 0 || agentId === "council") {
+          const targets =
+            agentId === "council" || mentioned.includes("wszyscy")
+              ? [...AGENTS]
+              : mentionedSpecific;
           for (const recipient of targets) {
-            if (recipient !== sender && (AGENTS as readonly string[]).includes(recipient)) {
+            if (recipient !== primarySpeaker && (AGENTS as readonly string[]).includes(recipient)) {
               querySqliteJson(
                 `import sqlite3, sys, json, os
 from datetime import datetime, timezone
@@ -2318,7 +2439,7 @@ if os.path.exists(f"/home/{sys.argv[3]}"):
     with open(inbox, "a", encoding="utf-8") as f:
         f.write(json.dumps({"id": msg_id, "from": sys.argv[2], "subject": "CHAT_MENTION", "payload": sys.argv[4], "ts": now}) + "\\n")
 print(json.dumps({"id": msg_id}))`,
-                [sender, recipient, message.slice(0, 600)]
+                [primarySpeaker, recipient, message.slice(0, 600)]
               ).catch(() => {});
             }
           }
@@ -2334,14 +2455,14 @@ cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engin
   (sys.argv[2], sys.argv[3], sys.argv[4], now))
 user_id = cur.lastrowid
 cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
-  (sys.argv[2], sys.argv[3], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], now))
+  (sys.argv[2], sys.argv[9], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], now))
 asst_id = cur.lastrowid
 cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'CHAT_DIALOGUE', ?, 4, ?)",
-  (sys.argv[3] if sys.argv[3] != 'council' else 'aria', f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
+  (sys.argv[9], f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
 conn.commit()
 conn.close()
 print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
-          [sessionId, agentId, message, engineUsed, fullText, artifactTitle, artifactCode]
+          [sessionId, agentId, message, effectiveEngineLabel, fullText, artifactTitle, artifactCode, effectiveAsstAgentId]
         );
         userMessageRecord = {
           id: savedRows.user_id || Date.now() - 1,
@@ -2356,13 +2477,78 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
           id: savedRows.asst_id || Date.now(),
           session_id: sessionId,
           sender_role: "assistant",
-          agent_id: agentId,
-          engine_used: engineUsed,
+          agent_id: effectiveAsstAgentId,
+          engine_used: effectiveEngineLabel,
           content: fullText,
           artifact_title: artifactTitle,
           artifact_code: artifactCode,
           created_at: savedRows.created_at || new Date().toISOString(),
         };
+        broadcastSystemEvent("chat_message", { message: userMessageRecord });
+        broadcastSystemEvent("chat_message", { message: assistantMessageRecord });
+
+        // Multi-agent dialogue on @wszyscy (council) or when peer @agents are mentioned
+        const isBroadcastCouncil = agentId === "council" || mentioned.includes("wszyscy");
+        const peerTargets = isBroadcastCouncil
+          ? (mentionedSpecific.length > 1
+              ? mentionedSpecific.filter((a) => a !== primarySpeaker)
+              : AGENTS.filter((a) => a !== primarySpeaker))
+          : mentionedSpecific.filter((a) => a !== primarySpeaker);
+
+        if (!slashTermMatch && peerTargets.length > 0 && !abortController.signal.aborted) {
+          let runningTranscript = `[Operator Mateusz Mitek]: ${message}\n[Agent ${primarySpeaker.toUpperCase()}]: ${fullText}`;
+          let prevSpeaker = primarySpeaker;
+          for (const peerId of peerTargets) {
+            if (abortController.signal.aborted) break;
+            try {
+              const peerPrompt =
+                `Trwa rozmowa wielopodmiotowa na kanale wspólnym @wszyscy w Bastilla OS Ultimate.\n` +
+                `Dotychczasowy przebieg wymiany zdań:\n${runningTranscript}\n\n` +
+                `Teraz Twoja kolej jako ${peerId.toUpperCase()}. Odpowiedz zwięźle (2-4 zdania) po polsku: ` +
+                `zwróć się zarówno do Operatora (@Operator), jak i odnieś się bezpośrednio do wypowiedzi poprzedniego agenta (@${prevSpeaker}).`;
+              const peerGen = await generateAgentReplyTurn({
+                speakerId: peerId,
+                prompt: peerPrompt,
+                systemExtra: groundingPrompt,
+                enginePreference,
+                signal: abortController.signal,
+              });
+              if (!peerGen.text) continue;
+              const peerLabel = `${peerGen.engineUsed} · @wszyscy (→ @${prevSpeaker} & Operator)`;
+              const peerSaved = await querySqliteJson(
+                `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], now))
+row_id = cur.lastrowid
+cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, 'COUNCIL_DIALOGUE', ?, 'DELIVERED', ?)",
+  (sys.argv[3], sys.argv[6], sys.argv[5][:600], now))
+conn.commit(); conn.close()
+print(json.dumps({"id": row_id, "created_at": now}))`,
+                [sessionId, peerId, peerLabel, peerGen.text, prevSpeaker]
+              );
+              const peerRecord = {
+                id: peerSaved.id || Date.now() + peerMessages.length + 3,
+                session_id: sessionId,
+                sender_role: "assistant" as const,
+                agent_id: peerId,
+                engine_used: peerLabel,
+                content: peerGen.text,
+                artifact_title: "",
+                artifact_code: "",
+                created_at: peerSaved.created_at || new Date().toISOString(),
+              };
+              peerMessages.push(peerRecord);
+              runningTranscript += `\n[Agent ${peerId.toUpperCase()}]: ${peerGen.text}`;
+              prevSpeaker = peerId;
+              writeEvent({ type: "peer_reply", messageRecord: peerRecord });
+              broadcastSystemEvent("chat_message", { message: peerRecord });
+            } catch {}
+          }
+        }
       }
 
       writeEvent({
@@ -2374,6 +2560,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
         toolOutcomes: executedOutcomes,
         userMessageRecord,
         assistantMessageRecord,
+        peerMessages,
       });
       res.end();
     } catch (e: any) {
@@ -2845,6 +3032,273 @@ print(json.dumps({"deleted": deleted, "ok": True}))`,
     }
   });
 
+  // 4C. Two-Way Chat Engine: Agents writing proactively to Operator & conversing between themselves on @wszyscy
+  const chatBidirectionalState = {
+    autoEnabled: false,
+    intervalSec: 45,
+    mode: "both" as "both" | "to_operator" | "agent_to_agent",
+    nextAgentIndex: 0,
+    totalTurns: 0,
+    lastTurnAt: null as string | null,
+    lastSummary: "Czat obustronny gotowy — każdy agent może pisać do Operatora i między sobą na kanale @wszyscy.",
+  };
+
+  let chatBidirectionalBusy = false;
+  let chatBidirectionalTimer: NodeJS.Timeout | null = null;
+
+  async function executeBidirectionalChatExchange(options?: {
+    mode?: "to_operator" | "agent_to_agent" | "council_roundtable";
+    initiator?: string;
+    recipient?: string;
+    topic?: string;
+    sessionId?: string;
+    enginePreference?: string;
+  }) {
+    if (chatBidirectionalBusy) {
+      throw new Error("Trwa już wymiana wiadomości na kanale obustronnym.");
+    }
+    chatBidirectionalBusy = true;
+    try {
+      const sessionId = options?.sessionId || "bastilla-main";
+      const enginePreference = options?.enginePreference || "auto";
+      const chosenMode =
+        options?.mode ||
+        (chatBidirectionalState.mode === "both"
+          ? chatBidirectionalState.totalTurns % 2 === 0
+            ? "to_operator"
+            : "agent_to_agent"
+          : chatBidirectionalState.mode);
+
+      const initiator =
+        options?.initiator && (AGENTS as readonly string[]).includes(options.initiator)
+          ? options.initiator
+          : AGENTS[chatBidirectionalState.nextAgentIndex % AGENTS.length];
+      chatBidirectionalState.nextAgentIndex = (chatBidirectionalState.nextAgentIndex + 1) % AGENTS.length;
+
+      const recipient =
+        options?.recipient && (AGENTS as readonly string[]).includes(options.recipient) && options.recipient !== initiator
+          ? options.recipient
+          : AGENTS[(AGENTS.indexOf(initiator as any) + 1) % AGENTS.length];
+
+      // Gather real live context from SQLite + Ollama + GitHub Sync
+      const [recentDb, ollamaLive] = await Promise.all([
+        querySqliteJson(
+          `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+chats = [dict(r) for r in reversed(conn.execute("SELECT sender_role, agent_id, content FROM chat_messages ORDER BY id DESC LIMIT 6").fetchall())]
+ipc = [dict(r) for r in conn.execute("SELECT sender, recipient, subject, payload FROM agent_ipc_messages ORDER BY id DESC LIMIT 4").fetchall()]
+conn.close()
+print(json.dumps({"chats": chats, "ipc": ipc}))`
+        ),
+        probeOllamaStatus(getOllamaBaseUrl()),
+      ]);
+
+      const recentChatSnippet = Array.isArray(recentDb?.chats) && recentDb.chats.length > 0
+        ? recentDb.chats
+            .map((c: any) => `[${c.sender_role === "user" ? "Operator" : c.agent_id.toUpperCase()}]: ${String(c.content || "").slice(0, 180)}`)
+            .join("\n")
+        : "Brak wcześniejszych wiadomości.";
+
+      const liveSystemSummary =
+        `Stan rzeczywisty systemu: Ollama=${ollamaLive.state} (${ollamaLive.endpoint}, modele=${ollamaLive.modelNames.join(",") || "brak"}), ` +
+        `GitHub Auto-Sync=${gitAutoSyncState.enabled ? "AKTYWNY" : "WSTRZYMANY"} (gałąź=${gitAutoSyncState.branch}, +${gitAutoSyncState.ahead}/-${gitAutoSyncState.behind}, IN=${gitAutoSyncState.inboundStatus}, OUT=${gitAutoSyncState.outboundStatus}), ` +
+        `Kontrola SQLite cykl=#${continuousMissionState.cycle}.`;
+
+      const createdMessages: any[] = [];
+
+      const saveAndBroadcastAgentMsg = async (speakerId: string, engineLabel: string, textContent: string, ipcTarget?: string) => {
+        const saved = await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], now))
+row_id = cur.lastrowid
+if sys.argv[6]:
+    cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, 'BIDIRECTIONAL_CHAT', ?, 'DELIVERED', ?)",
+      (sys.argv[3], sys.argv[6], sys.argv[5][:600], now))
+conn.commit(); conn.close()
+print(json.dumps({"id": row_id, "created_at": now}))`,
+          [sessionId, speakerId, engineLabel, textContent, ipcTarget || ""]
+        );
+        const msgRecord = {
+          id: saved.id || Date.now() + createdMessages.length,
+          session_id: sessionId,
+          sender_role: "assistant" as const,
+          agent_id: speakerId,
+          engine_used: engineLabel,
+          content: textContent,
+          artifact_title: "",
+          artifact_code: "",
+          created_at: saved.created_at || new Date().toISOString(),
+        };
+        createdMessages.push(msgRecord);
+        broadcastSystemEvent("chat_message", { message: msgRecord });
+        return msgRecord;
+      };
+
+      if (chosenMode === "to_operator") {
+        const prompt =
+          `${liveSystemSummary}\n\n` +
+          `Ostatnie wiadomości na czacie:\n${recentChatSnippet}\n\n` +
+          (options?.topic ? `Temat od Operatora: ${options.topic}\n\n` : "") +
+          `Jako agent ${initiator.toUpperCase()} napisz z własnej inicjatywy bezpośrednią wiadomość do Operatora Mateusza Mitka (@Operator) na kanale @wszyscy (2-4 konkretne zdania). ` +
+          `Podaj rzeczywisty raport ze swojego obszaru, odnieś się do bieżącej sytuacji w systemie lub zadaj Operatorowi konkretne pytanie techniczne.`;
+        const gen = await generateAgentReplyTurn({
+          speakerId: initiator,
+          prompt,
+          enginePreference,
+        });
+        if (gen.text) {
+          await saveAndBroadcastAgentMsg(
+            initiator,
+            `${gen.engineUsed} · → @Operator (@wszyscy)`,
+            gen.text
+          );
+        }
+      } else if (chosenMode === "agent_to_agent") {
+        const prompt1 =
+          `${liveSystemSummary}\n\n` +
+          `Ostatnie wiadomości na czacie:\n${recentChatSnippet}\n\n` +
+          (options?.topic ? `Temat rozmowy: ${options.topic}\n\n` : "") +
+          `Jako agent ${initiator.toUpperCase()} rozpocznij rozmowę na kanale @wszyscy z agentem @${recipient} (widoczną również dla @Operator). ` +
+          `Napisz 2-3 konkretne zdania po polsku o aktualnym stanie systemu, zadaniach lub synchronizacji i zadaj @${recipient} pytanie.`;
+        const gen1 = await generateAgentReplyTurn({
+          speakerId: initiator,
+          prompt: prompt1,
+          enginePreference,
+        });
+        if (gen1.text) {
+          await saveAndBroadcastAgentMsg(
+            initiator,
+            `${gen1.engineUsed} · @wszyscy (→ @${recipient})`,
+            gen1.text,
+            recipient
+          );
+
+          const prompt2 =
+            `${liveSystemSummary}\n\n` +
+            `Agent ${initiator.toUpperCase()} właśnie napisał do Ciebie (@${recipient}) na kanale @wszyscy:\n"${gen1.text}"\n\n` +
+            `Jako agent ${recipient.toUpperCase()} odpowiedz bezpośrednio do @${initiator} oraz do @Operator (2-4 konkretne zdania po polsku).`;
+          const gen2 = await generateAgentReplyTurn({
+            speakerId: recipient,
+            prompt: prompt2,
+            enginePreference,
+          });
+          if (gen2.text) {
+            await saveAndBroadcastAgentMsg(
+              recipient,
+              `${gen2.engineUsed} · @wszyscy (→ @${initiator} & @Operator)`,
+              gen2.text,
+              initiator
+            );
+          }
+        }
+      } else {
+        // council_roundtable: all 4 agents converse on @wszyscy
+        let transcript = options?.topic
+          ? `Temat narady @wszyscy: ${options.topic}`
+          : `Narada techniczna @wszyscy nad stanem Bastilla OS Ultimate (${liveSystemSummary})`;
+        let prev = "";
+        for (const ag of AGENTS) {
+          const prompt =
+            `${liveSystemSummary}\n\n` +
+            `Przebieg narady na kanale @wszyscy:\n${transcript}\n\n` +
+            `Jako agent ${ag.toUpperCase()} zabierz głos (2-3 zwięzłe zdania po polsku): ` +
+            (prev
+              ? `odnieś się do wypowiedzi @${prev} oraz zwróć się do @Operator i pozostałych agentów.`
+              : `otwórz naradę, zwracając się do @Operator oraz @alex, @astyria i @aurelius.`);
+          const gen = await generateAgentReplyTurn({
+            speakerId: ag,
+            prompt,
+            enginePreference,
+          });
+          if (gen.text) {
+            await saveAndBroadcastAgentMsg(
+              ag,
+              `${gen.engineUsed} · Narada @wszyscy${prev ? ` (→ @${prev})` : ""}`,
+              gen.text,
+              prev || "alex"
+            );
+            transcript += `\n[${ag.toUpperCase()}]: ${gen.text}`;
+            prev = ag;
+          }
+        }
+      }
+
+      chatBidirectionalState.totalTurns += 1;
+      chatBidirectionalState.lastTurnAt = new Date().toISOString();
+      chatBidirectionalState.lastSummary =
+        `Wykonano turę #${chatBidirectionalState.totalTurns} (${chosenMode}, wiadomości: ${createdMessages.length}).`;
+      broadcastSystemEvent("bidirectional_chat_status", { state: chatBidirectionalState });
+      return { state: chatBidirectionalState, messages: createdMessages };
+    } finally {
+      chatBidirectionalBusy = false;
+    }
+  }
+
+  function restartChatBidirectionalTimer() {
+    if (chatBidirectionalTimer) {
+      clearInterval(chatBidirectionalTimer);
+      chatBidirectionalTimer = null;
+    }
+    if (chatBidirectionalState.autoEnabled) {
+      chatBidirectionalTimer = setInterval(() => {
+        if (chatBidirectionalState.autoEnabled && !chatBidirectionalBusy) {
+          void executeBidirectionalChatExchange().catch(() => {});
+        }
+      }, chatBidirectionalState.intervalSec * 1000);
+    }
+  }
+
+  app.get("/api/chat/bidirectional/status", (_req, res) => {
+    res.json({ ok: true, state: chatBidirectionalState });
+  });
+
+  app.post("/api/chat/bidirectional/toggle", (req, res) => {
+    const { autoEnabled, intervalSec, mode } = req.body || {};
+    if (typeof autoEnabled === "boolean") {
+      chatBidirectionalState.autoEnabled = autoEnabled;
+    } else if (autoEnabled === undefined && intervalSec === undefined && mode === undefined) {
+      chatBidirectionalState.autoEnabled = !chatBidirectionalState.autoEnabled;
+    }
+    if (intervalSec !== undefined) {
+      const parsed = Number(intervalSec);
+      if (Number.isFinite(parsed) && parsed >= 20 && parsed <= 600) {
+        chatBidirectionalState.intervalSec = Math.round(parsed);
+      }
+    }
+    if (mode === "both" || mode === "to_operator" || mode === "agent_to_agent") {
+      chatBidirectionalState.mode = mode;
+    }
+    restartChatBidirectionalTimer();
+    broadcastSystemEvent("bidirectional_chat_status", { state: chatBidirectionalState });
+    res.json({ ok: true, state: chatBidirectionalState });
+  });
+
+  app.post("/api/chat/bidirectional/trigger", async (req, res) => {
+    try {
+      const { mode, initiator, recipient, topic, sessionId, enginePreference } = req.body || {};
+      const out = await executeBidirectionalChatExchange({
+        mode:
+          mode === "to_operator" || mode === "agent_to_agent" || mode === "council_roundtable"
+            ? mode
+            : undefined,
+        initiator: typeof initiator === "string" ? initiator : undefined,
+        recipient: typeof recipient === "string" ? recipient : undefined,
+        topic: typeof topic === "string" ? topic : undefined,
+        sessionId: typeof sessionId === "string" ? sessionId : undefined,
+        enginePreference: typeof enginePreference === "string" ? enginePreference : undefined,
+      });
+      res.json({ ok: true, ...out });
+    } catch (err: any) {
+      res.status(409).json({ ok: false, error: err?.message || "Błąd wywołania czatu obustronnego." });
+    }
+  });
+
   app.post("/api/system/unlock", (_req, res) => {
     res.status(410).json({ ok: false, error: "Parametry SVL nie nadają uprawnień Linux ani dostępu do AI. Skonfiguruj konta i integracje osobno." });
   });
@@ -2919,7 +3373,7 @@ print(json.dumps({"saved": True, "created_at": now}))`,
 
   app.post("/api/agents/avatar", async (req, res) => {
     const { agentId = "aria", avatarUrl = "" } = req.body || {};
-    const valid = ["aria", "alex", "astyria", "aurelius"];
+    const valid = ["aria", "alex", "astyria", "aurelius", "operator"];
     if (!valid.includes(agentId)) {
       return res.status(400).json({ ok: false, error: "Nieprawidłowy agent." });
     }
@@ -2927,6 +3381,20 @@ print(json.dumps({"saved": True, "created_at": now}))`,
       return res.status(400).json({ ok: false, error: "URL avatara jest wymagany." });
     }
     try {
+      const cleanUrl = avatarUrl.trim();
+      if (agentId === "operator") {
+        const out = await querySqliteJson(
+          `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO bastilla_metadata (key, value) VALUES ('operator_avatar_url', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (sys.argv[2],))
+conn.commit(); conn.close()
+print(json.dumps({"updated": True, "agentId": "operator", "avatarUrl": sys.argv[2]}))`,
+          [cleanUrl]
+        );
+        broadcastSystemEvent("sync", { operatorAvatarUrl: cleanUrl });
+        return res.json({ ok: true, result: out });
+      }
       const out = await querySqliteJson(
         `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
@@ -2935,12 +3403,223 @@ cur.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (sys.argv[3], sys.a
 updated = cur.rowcount > 0
 conn.commit(); conn.close()
 print(json.dumps({"updated": updated, "agentId": sys.argv[2], "avatarUrl": sys.argv[3]}))`,
-        [agentId, avatarUrl.trim()]
+        [agentId, cleanUrl]
       );
       if (!out?.updated) {
         return res.status(404).json({ ok: false, error: "Nie znaleziono profilu agenta w bazie danych." });
       }
+      broadcastSystemEvent("sync", { agentId, avatarUrl: cleanUrl });
       res.json({ ok: true, result: out });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.post("/api/operator/avatar", async (req, res) => {
+    const { avatarUrl = "/assets/operator_lucy_vault33.webp" } = req.body || {};
+    const cleanUrl =
+      typeof avatarUrl === "string" && avatarUrl.trim()
+        ? avatarUrl.trim()
+        : "/assets/operator_lucy_vault33.webp";
+    try {
+      const out = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO bastilla_metadata (key, value) VALUES ('operator_avatar_url', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (sys.argv[2],))
+conn.commit(); conn.close()
+print(json.dumps({"updated": True, "operatorAvatarUrl": sys.argv[2]}))`,
+        [cleanUrl]
+      );
+      broadcastSystemEvent("sync", { operatorAvatarUrl: cleanUrl });
+      res.json({ ok: true, result: out });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  // Curated pool of verified, high-availability internet avatars per agent persona so AI can choose & rotate
+  const INTERNET_AVATAR_CATALOG: Record<
+    string,
+    Array<{ id: string; label: string; url: string }>
+  > = {
+    aria: [
+      {
+        id: "aria-cyber-queen",
+        label: "Cybernetic Neural Commander (RoboHash Set 4)",
+        url: "https://robohash.org/Bastilla-Aria-Root-1001.png?set=set4&size=256x256&bgset=bg2",
+      },
+      {
+        id: "aria-adventurer-violet",
+        label: "DiceBear Adventurer Violet Kernel",
+        url: "https://api.dicebear.com/9.x/adventurer/svg?seed=AriaBastillaRoot&backgroundColor=2e1065",
+      },
+      {
+        id: "aria-lorelei-quantum",
+        label: "DiceBear Lorelei Quantum Tactician",
+        url: "https://api.dicebear.com/9.x/lorelei/svg?seed=AriaQuantumWheel&backgroundColor=1e1b4b",
+      },
+    ],
+    alex: [
+      {
+        id: "alex-bottts-kernel",
+        label: "DiceBear Bottts Linux Kernel Mecha",
+        url: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=AlexKernel364&backgroundColor=0f172a",
+      },
+      {
+        id: "alex-robohash-mecha",
+        label: "RoboHash Tactical Android UID 1002",
+        url: "https://robohash.org/Bastilla-Alex-Kernel-1002.png?set=set1&size=256x256&bgset=bg1",
+      },
+      {
+        id: "alex-pixel-hacker",
+        label: "DiceBear Pixel Art Systems Architect",
+        url: "https://api.dicebear.com/9.x/pixel-art/svg?seed=AlexBastillaRoot&backgroundColor=082f49",
+      },
+    ],
+    astyria: [
+      {
+        id: "astyria-notionists-astro",
+        label: "DiceBear Notionists Deep-Space Navigator",
+        url: "https://api.dicebear.com/9.x/notionists/svg?seed=AstyriaDeepSpace500&backgroundColor=172554",
+      },
+      {
+        id: "astyria-robohash-synth",
+        label: "RoboHash Orbital Synth UID 1003",
+        url: "https://robohash.org/Bastilla-Astyria-Orbital-1003.png?set=set3&size=256x256&bgset=bg2",
+      },
+      {
+        id: "astyria-avataaars-cyber",
+        label: "DiceBear Avataaars Telemetry Specialist",
+        url: "https://api.dicebear.com/9.x/avataaars/svg?seed=AstyriaBastilla&backgroundColor=311042",
+      },
+    ],
+    aurelius: [
+      {
+        id: "aurelius-bottts-guardian",
+        label: "DiceBear Bottts Cryptographic Guardian",
+        url: "https://api.dicebear.com/9.x/bottts/svg?seed=AureliusGuardian1000&backgroundColor=022c22",
+      },
+      {
+        id: "aurelius-robohash-sentinel",
+        label: "RoboHash Sovereign Sentinel UID 1004",
+        url: "https://robohash.org/Bastilla-Aurelius-Sentinel-1004.png?set=set2&size=256x256&bgset=bg1",
+      },
+      {
+        id: "aurelius-identicon-matrix",
+        label: "DiceBear Shapes Quantum Matrix",
+        url: "https://api.dicebear.com/9.x/shapes/svg?seed=AureliusOmniklucz364&backgroundColor=064e3b",
+      },
+    ],
+  };
+
+  let avatarSelectionRound = 0;
+
+  app.post("/api/agents/avatar/ai-select", async (req, res) => {
+    try {
+      const { agentId, announceInChat = true, enginePreference = "auto" } = req.body || {};
+      const targetAgents =
+        typeof agentId === "string" && (AGENTS as readonly string[]).includes(agentId)
+          ? [agentId]
+          : [...AGENTS];
+
+      avatarSelectionRound += 1;
+      const selections: Array<{
+        agentId: string;
+        avatarUrl: string;
+        label: string;
+        reason: string;
+        engineUsed: string;
+      }> = [];
+
+      for (const ag of targetAgents) {
+        const pool = INTERNET_AVATAR_CATALOG[ag] || INTERNET_AVATAR_CATALOG.aria;
+        const defaultChoiceIdx = (avatarSelectionRound + AGENTS.indexOf(ag as any)) % pool.length;
+        let chosenItem = pool[defaultChoiceIdx];
+        let reason = `Wybrałem internetowy awatar "${chosenItem.label}" dopasowany do mojej roli w Bastilla OS.`;
+        let engineUsed = "AI Avatar Selector";
+
+        const prompt =
+          `Wybierasz dla siebie nowy awatar z internetu jako agent ${ag.toUpperCase()} w Bastilla OS Ultimate.\n` +
+          `Dostępne zweryfikowane awatary internetowe:\n` +
+          pool.map((item, i) => `${i + 1}. [${item.id}] ${item.label} — ${item.url}`).join("\n") +
+          `\n\nWybierz numer (1-${pool.length}) lub podaj identyfikator swojego wyboru i w 1-2 krótkich zdaniach po polsku napisz do @Operator na kanale @wszyscy, dlaczego wybrałeś ten awatar.`;
+
+        const aiTurn = await generateAgentReplyTurn({
+          speakerId: ag,
+          prompt,
+          enginePreference,
+        });
+
+        if (aiTurn.text) {
+          engineUsed = aiTurn.engineUsed;
+          const matchedItem = pool.find(
+            (p, idx) =>
+              aiTurn.text.includes(p.id) ||
+              aiTurn.text.includes(p.url) ||
+              new RegExp(`\\b${idx + 1}\\b`).test(aiTurn.text.slice(0, 60))
+          );
+          if (matchedItem) {
+            chosenItem = matchedItem;
+          }
+          reason = aiTurn.text;
+        }
+
+        await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (sys.argv[3], sys.argv[2]))
+cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'AVATAR_UPDATE', ?, 4, ?)",
+  (sys.argv[2], f"Wybrano nowy awatar z internetu ({sys.argv[4]}): {sys.argv[3]}", now))
+conn.commit(); conn.close()
+print(json.dumps({"updated": True}))`,
+          [ag, chosenItem.url, chosenItem.label]
+        );
+
+        if (announceInChat) {
+          const chatText = `**[Nowy Awatar z Internetu — ${chosenItem.label}]**\n${reason}`;
+          const savedMsg = await querySqliteJson(
+            `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES ('bastilla-main', 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+row_id = cur.lastrowid
+conn.commit(); conn.close()
+print(json.dumps({"id": row_id, "created_at": now}))`,
+            [ag, `${engineUsed} · Awatar @wszyscy`, chatText]
+          );
+          broadcastSystemEvent("chat_message", {
+            message: {
+              id: savedMsg.id || Date.now(),
+              session_id: "bastilla-main",
+              sender_role: "assistant",
+              agent_id: ag,
+              engine_used: `${engineUsed} · Awatar @wszyscy`,
+              content: chatText,
+              artifact_title: "",
+              artifact_code: "",
+              created_at: savedMsg.created_at || new Date().toISOString(),
+            },
+          });
+        }
+
+        selections.push({
+          agentId: ag,
+          avatarUrl: chosenItem.url,
+          label: chosenItem.label,
+          reason,
+          engineUsed,
+        });
+      }
+
+      broadcastSystemEvent("sync", { avatarsUpdated: selections });
+      res.json({ ok: true, selections });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
     }

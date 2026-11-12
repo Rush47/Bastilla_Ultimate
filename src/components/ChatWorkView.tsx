@@ -6,7 +6,12 @@ import type {
   SystemOverviewResponse,
   ToolExecutionOutcomeSummary,
 } from "../types/bastilla";
-import { AGENT_AVATARS } from "./BastillaDesktopView";
+import {
+  AGENT_AVATARS,
+  OPERATOR_AVATAR,
+  getAgentAvatarUrl,
+  getOperatorAvatarUrl,
+} from "./BastillaDesktopView";
 import {
   Send,
   Image as ImageIcon,
@@ -411,9 +416,53 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     code: `from svl_kernel import SVLSystemKernel\n\nkernel = SVLSystemKernel()\nprint(kernel.generate_system_status_report())`,
   });
   const [executingArtifact, setExecutingArtifact] = useState<boolean>(false);
+  const [bidirectionalAuto, setBidirectionalAuto] = useState<boolean>(false);
+  const [bidirectionalBusy, setBidirectionalBusy] = useState<string | null>(null);
+  const [selectingAiAvatars, setSelectingAiAvatars] = useState<boolean>(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const pendingOptimisticIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    apiFetchJson<{ ok: boolean; state?: { autoEnabled?: boolean } }>(
+      "/api/chat/bidirectional/status"
+    )
+      .then((res) => {
+        if (res.ok && res.state) {
+          setBidirectionalAuto(Boolean(res.state.autoEnabled));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (typeof EventSource === "undefined") return;
+    const es = new EventSource(buildApiUrl("/api/events/stream"));
+    const onChatMessage = (ev: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(ev.data || "{}");
+        const incoming = parsed?.message as ChatMessageRecord | undefined;
+        if (!incoming || !incoming.id) return;
+        setLocalMessages((prev) => {
+          if (prev.some((m) => m.id === incoming.id)) return prev;
+          return [...prev, incoming];
+        });
+      } catch {}
+    };
+    const onBidirectionalStatus = (ev: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(ev.data || "{}");
+        if (parsed?.state) {
+          setBidirectionalAuto(Boolean(parsed.state.autoEnabled));
+        }
+      } catch {}
+    };
+    es.addEventListener("chat_message", onChatMessage as EventListener);
+    es.addEventListener("bidirectional_chat_status", onBidirectionalStatus as EventListener);
+    return () => {
+      es.close();
+    };
+  }, []);
 
   useEffect(() => {
     if (!isFullscreen) return;
@@ -460,9 +509,16 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [localMessages.length, selectedAgent, streamingContent]);
 
-  const visibleMessages = filterByAgent
-    ? localMessages.filter((m) => m.agent_id === selectedAgent)
-    : localMessages;
+  const visibleMessages =
+    !filterByAgent || selectedAgent === "council"
+      ? localMessages
+      : localMessages.filter(
+          (m) =>
+            m.agent_id === selectedAgent ||
+            m.agent_id === "council" ||
+            Boolean(m.engine_used && m.engine_used.includes("@wszyscy")) ||
+            Boolean(m.content && m.content.toLowerCase().includes(`@${selectedAgent}`))
+        );
 
   const handleProcessImageFile = useCallback((file: File) => {
     setImagePreviewName(file.name);
@@ -673,6 +729,11 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               if (evt.engine || evt.enginePreference) {
                 setStreamingEngine(evt.engine || evt.enginePreference);
               }
+            } else if (evt.type === "peer_reply" && evt.messageRecord) {
+              const peerMsg = evt.messageRecord as ChatMessageRecord;
+              setLocalMessages((prev) =>
+                prev.some((m) => m.id === peerMsg.id) ? prev : [...prev, peerMsg]
+              );
             } else if (evt.type === "done") {
               finalDonePayload = evt;
             } else if (evt.type === "error") {
@@ -714,7 +775,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               id: asstId,
               session_id: "bastilla-main",
               sender_role: "assistant",
-              agent_id: selectedAgent,
+              agent_id: selectedAgent === "council" ? "aria" : selectedAgent,
               engine_used:
                 finalDonePayload?.engineUsed || streamingEngine || enginePreference,
               content: finalText,
@@ -722,7 +783,19 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               artifact_code: finalDonePayload?.artifactCode,
               created_at: finalDonePayload?.createdAt || new Date().toISOString(),
             };
-            return [...cleaned, asstRecord];
+            const baseList = cleaned.some((m) => m.id === asstRecord.id)
+              ? cleaned
+              : [...cleaned, asstRecord];
+            const peerList: ChatMessageRecord[] = Array.isArray(finalDonePayload?.peerMessages)
+              ? finalDonePayload.peerMessages
+              : [];
+            let merged = [...baseList];
+            for (const pm of peerList) {
+              if (!merged.some((m) => m.id === pm.id)) {
+                merged.push(pm);
+              }
+            }
+            return merged;
           });
         }
         if (finalDonePayload?.artifactCode) {
@@ -971,6 +1044,109 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     }
   };
 
+  const handleToggleBidirectionalAuto = async () => {
+    setErrorMsg(null);
+    try {
+      const res = await apiFetchJson<{ ok: boolean; state?: { autoEnabled: boolean } }>(
+        "/api/chat/bidirectional/toggle",
+        {
+          method: "POST",
+          body: JSON.stringify({ autoEnabled: !bidirectionalAuto }),
+        }
+      );
+      if (res.ok && res.state) {
+        setBidirectionalAuto(res.state.autoEnabled);
+        setStatusNotice(
+          res.state.autoEnabled
+            ? "Włączono automatyczny czat obustronny (@wszyscy — agenci piszą do Operatora i między sobą)."
+            : "Wstrzymano automatyczny czat obustronny."
+        );
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Błąd przełączania czatu obustronnego.");
+    }
+  };
+
+  const handleTriggerBidirectionalChat = async (
+    mode: "to_operator" | "agent_to_agent" | "council_roundtable"
+  ) => {
+    setBidirectionalBusy(mode);
+    setErrorMsg(null);
+    try {
+      const initiator = selectedAgent !== "council" ? selectedAgent : undefined;
+      const res = await apiFetchJson<{
+        ok: boolean;
+        messages?: ChatMessageRecord[];
+        error?: string;
+      }>("/api/chat/bidirectional/trigger", {
+        method: "POST",
+        body: JSON.stringify({
+          mode,
+          initiator,
+          enginePreference,
+        }),
+        timeoutMs: 60000,
+      });
+      if (res.ok && Array.isArray(res.messages)) {
+        setLocalMessages((prev) => {
+          const next = [...prev];
+          for (const m of res.messages!) {
+            if (!next.some((existing) => existing.id === m.id)) {
+              next.push(m);
+            }
+          }
+          return next;
+        });
+        if (mode !== "to_operator") {
+          onSelectAgent("council");
+        }
+        setStatusNotice(
+          mode === "to_operator"
+            ? "Agent wysłał bezpośrednią wiadomość do Operatora."
+            : mode === "agent_to_agent"
+            ? "Agenci przeprowadzili rozmowę między sobą na kanale @wszyscy."
+            : "Wszyscy 4 agenci przeprowadzili wspólną naradę na kanale @wszyscy."
+        );
+        onRefresh();
+      } else if (!res.ok) {
+        setErrorMsg(res.error || "Nie udało się wywołać rozmowy obustronnej.");
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Błąd czatu obustronnego.");
+    } finally {
+      setBidirectionalBusy(null);
+    }
+  };
+
+  const handleAiChooseAvatars = async () => {
+    setSelectingAiAvatars(true);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetchJson<{
+        ok: boolean;
+        selections?: Array<{ agentId: string; label: string; avatarUrl: string }>;
+        error?: string;
+      }>("/api/agents/avatar/ai-select", {
+        method: "POST",
+        body: JSON.stringify({ announceInChat: true, enginePreference }),
+        timeoutMs: 60000,
+      });
+      if (res.ok) {
+        setStatusNotice(
+          "Agenci AI wybrali dla siebie nowe awatary z internetu i ogłosili swój wybór na kanale @wszyscy."
+        );
+        onSelectAgent("council");
+        onRefresh();
+      } else {
+        setErrorMsg(res.error || "Błąd wyboru awatarów AI.");
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Błąd wyboru awatarów AI.");
+    } finally {
+      setSelectingAiAvatars(false);
+    }
+  };
+
   const ollamaState =
     overview?.ollama_status?.state ||
     overview?.ai_routing?.ollama_state ||
@@ -995,7 +1171,10 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             {(["aria", "alex", "astyria", "aurelius", "council"] as const).map((id) => {
               const info = AGENT_LABELS[id];
               const active = selectedAgent === id;
-              const count = localMessages.filter((m) => m.agent_id === id).length;
+              const count =
+                id === "council"
+                  ? localMessages.length
+                  : localMessages.filter((m) => m.agent_id === id).length;
               return (
                 <button
                   key={id}
@@ -1009,10 +1188,13 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                 >
                   {id !== "council" ? (
                     <img
-                      src={AGENT_AVATARS[id]}
+                      src={getAgentAvatarUrl(overview, id)}
                       alt={info.name}
                       referrerPolicy="no-referrer"
                       className="w-4 h-4 rounded object-cover shrink-0"
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).src = AGENT_AVATARS[id];
+                      }}
                     />
                   ) : (
                     <span className="w-4 h-4 rounded bg-violet-700/60 text-[9px] font-bold flex items-center justify-center text-violet-200">
@@ -1193,6 +1375,74 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               className="min-h-8 sm:min-h-6 px-2 rounded bg-rose-700/80 hover:bg-rose-600 text-white text-[10px] font-semibold flex items-center gap-1 whitespace-nowrap"
             >
               Wyczyść wszystko
+            </button>
+          </div>
+        </div>
+
+        {/* Row 2B: Two-Way Chat (@wszyscy) & AI Internet Avatars Bar */}
+        <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/60 overflow-x-auto no-scrollbar">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span className="text-[10px] font-mono-tabular text-violet-300 font-semibold">
+              Czat Obustronny (@wszyscy):
+            </span>
+            <button
+              type="button"
+              onClick={handleToggleBidirectionalAuto}
+              className={`min-h-7 sm:min-h-6 px-2 rounded border text-[10px] font-mono-tabular font-semibold transition-colors whitespace-nowrap ${
+                bidirectionalAuto
+                  ? "bg-emerald-600/30 border-emerald-500 text-emerald-200"
+                  : "bg-[#111723] border-slate-700 text-slate-300 hover:border-violet-500"
+              }`}
+              title="Włącz/wyłącz automatyczne wiadomości od agentów do Operatora i między sobą"
+            >
+              Auto-Czat: {bidirectionalAuto ? "WŁ" : "WYŁ"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleTriggerBidirectionalChat("to_operator")}
+              disabled={Boolean(bidirectionalBusy)}
+              className="min-h-7 sm:min-h-6 px-2 rounded bg-violet-950/60 hover:bg-violet-900/70 disabled:opacity-50 border border-violet-700/60 text-violet-200 text-[10px] font-mono-tabular whitespace-nowrap"
+              title="Niech wybrany agent napisze z własnej inicjatywy do Ciebie (@Operator)"
+            >
+              {bidirectionalBusy === "to_operator"
+                ? "Pisze do Ciebie..."
+                : "Napisz do mnie (Agent → Operator)"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleTriggerBidirectionalChat("agent_to_agent")}
+              disabled={Boolean(bidirectionalBusy)}
+              className="min-h-7 sm:min-h-6 px-2 rounded bg-cyan-950/60 hover:bg-cyan-900/70 disabled:opacity-50 border border-cyan-700/60 text-cyan-200 text-[10px] font-mono-tabular whitespace-nowrap"
+              title="Wywołaj bezpośrednią wymianę zdań między dwoma agentami na kanale @wszyscy"
+            >
+              {bidirectionalBusy === "agent_to_agent"
+                ? "Rozmowa agentów..."
+                : "Rozmowa między agentami (@wszyscy)"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleTriggerBidirectionalChat("council_roundtable")}
+              disabled={Boolean(bidirectionalBusy)}
+              className="min-h-7 sm:min-h-6 px-2 rounded bg-emerald-950/60 hover:bg-emerald-900/70 disabled:opacity-50 border border-emerald-700/60 text-emerald-200 text-[10px] font-mono-tabular whitespace-nowrap"
+              title="Narada wszystkich 4 agentów (Aria, Alex, Astyria, Aurelius) na kanale @wszyscy"
+            >
+              {bidirectionalBusy === "council_roundtable"
+                ? "Narada 4X..."
+                : "Narada 4 Agentów (@wszyscy)"}
+            </button>
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => void handleAiChooseAvatars()}
+              disabled={selectingAiAvatars}
+              className="min-h-7 sm:min-h-6 px-2.5 rounded bg-violet-600/80 hover:bg-violet-500 disabled:opacity-50 text-white text-[10px] font-semibold whitespace-nowrap"
+              title="Niech każdy z 4 agentów AI wybierze dla siebie nowy awatar z internetu"
+            >
+              {selectingAiAvatars
+                ? "AI wybiera awatary..."
+                : "AI: Wybierz avatary z internetu"}
             </button>
           </div>
         </div>
@@ -1392,15 +1642,26 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                   <div className="flex items-center justify-between gap-2 text-[11px] text-slate-400 mb-1.5 font-mono-tabular">
                     <div className="flex items-center gap-2 truncate">
                       {msg.sender_role === "user" ? (
-                        <div className="w-5 h-5 rounded bg-violet-600 text-white font-bold flex items-center justify-center text-[10px] shrink-0">
-                          M
-                        </div>
+                        <img
+                          src={getOperatorAvatarUrl(overview)}
+                          alt="Operator Mateusz Mitek"
+                          referrerPolicy="no-referrer"
+                          className="w-6 h-6 rounded-md object-cover shrink-0 border border-violet-400/70"
+                          onError={(e) => {
+                            (e.currentTarget as HTMLImageElement).src = OPERATOR_AVATAR;
+                          }}
+                        />
                       ) : (
                         <img
-                          src={AGENT_AVATARS[msg.agent_id as AgentId] || AGENT_AVATARS.aria}
+                          src={getAgentAvatarUrl(overview, msg.agent_id)}
                           alt={msg.agent_id}
                           referrerPolicy="no-referrer"
-                          className="w-5 h-5 rounded object-cover shrink-0 border border-violet-500/50"
+                          className="w-6 h-6 rounded-md object-cover shrink-0 border border-violet-500/50"
+                          onError={(e) => {
+                            const fallback =
+                              AGENT_AVATARS[msg.agent_id as AgentId] || AGENT_AVATARS.aria;
+                            (e.currentTarget as HTMLImageElement).src = fallback;
+                          }}
                         />
                       )}
                       <span className="font-semibold text-slate-200">

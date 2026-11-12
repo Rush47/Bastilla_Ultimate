@@ -3,6 +3,7 @@ import ariaAvatar from "../assets/images/agent_aria_avatar_1794463014168.jpg";
 import alexAvatar from "../assets/images/agent_alex_avatar_1794463014976.jpg";
 import astyriaAvatar from "../assets/images/agent_astyria_avatar_1794463015211.jpg";
 import aureliusAvatar from "../assets/images/agent_aurelius_avatar_1794463016020.jpg";
+import operatorLucyAvatar from "../assets/images/operator_lucy_vault33.webp";
 import wallpaper from "../assets/images/bastilla_violet_wallpaper_1794463012010.jpg";
 import type { SystemOverviewResponse, WorkspaceTab, AgentId } from "../types/bastilla";
 import {
@@ -28,6 +29,36 @@ export const AGENT_AVATARS: Record<AgentId, string> = {
   aurelius: aureliusAvatar,
 };
 
+export const OPERATOR_AVATAR: string = operatorLucyAvatar;
+
+export function getAgentAvatarUrl(
+  overview: SystemOverviewResponse | null | undefined,
+  agentId: string
+): string {
+  const safeId = (["aria", "alex", "astyria", "aurelius"].includes(agentId)
+    ? agentId
+    : "aria") as AgentId;
+  const liveUrl = overview?.host?.agents_live?.find((a) => a.id === safeId)?.avatar_url;
+  if (liveUrl && liveUrl.trim().length > 0 && !liveUrl.startsWith("/avatars/")) {
+    return liveUrl.trim();
+  }
+  return AGENT_AVATARS[safeId];
+}
+
+export function getOperatorAvatarUrl(
+  overview?: SystemOverviewResponse | null
+): string {
+  const custom = overview?.host?.operator_avatar_url;
+  if (
+    custom &&
+    custom.trim().length > 0 &&
+    !custom.includes("operator_lucy_vault33.webp")
+  ) {
+    return custom.trim();
+  }
+  return OPERATOR_AVATAR;
+}
+
 const WALLPAPER_PATH = wallpaper;
 
 interface BastillaDesktopViewProps {
@@ -48,6 +79,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
   const [omniToken, setOmniToken] = useState<string>("364_OMNIKLUCZ_ROOT");
   const [svlOutput, setSvlOutput] = useState<string>("");
   const [runningSvl, setRunningSvl] = useState<boolean>(false);
+  const [selectingAvatars, setSelectingAvatars] = useState<boolean>(false);
   const [gestureLog, setGestureLog] = useState<string>(
     "Tryb dotykowy i gesty aktywne: Przesuń poziomo (Swipe) lub użyj gestu wielodotykowego na pulpicie Bastilla Violet."
   );
@@ -56,6 +88,27 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
 
   const svl = overview?.svl_report;
   const host = overview?.host;
+
+  const handleAiSelectAvatars = async () => {
+    setSelectingAvatars(true);
+    try {
+      const res = await apiFetchJson<any>("/api/agents/avatar/ai-select", {
+        method: "POST",
+        body: JSON.stringify({ announceInChat: true }),
+        timeoutMs: 45000,
+      });
+      if (res.ok) {
+        setGestureLog(
+          "Agenci AI (Aria, Alex, Astyria, Aurelius) wybrali nowe awatary z internetu i ogłosili swój wybór na kanale @wszyscy."
+        );
+        onRefresh();
+      }
+    } catch (e: any) {
+      setGestureLog(`Błąd wyboru awatarów: ${e?.message || String(e)}`);
+    } finally {
+      setSelectingAvatars(false);
+    }
+  };
 
   const handleRunSvlMaxUpgrade = async () => {
     setRunningSvl(true);
@@ -153,8 +206,17 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
           <span aria-hidden="true">·</span>
           <span>Linux: {host?.uname || "niezweryfikowany"}</span>
           <span aria-hidden="true">·</span>
-          <span className="text-emerald-400 font-semibold">
-            Operator: {svl?.Operator || "Mateusz Mitek"} · uprawnienia wymagają weryfikacji
+          <span className="inline-flex items-center gap-1.5 text-emerald-400 font-semibold">
+            <img
+              src={getOperatorAvatarUrl(overview)}
+              alt="Operator Mateusz Mitek"
+              referrerPolicy="no-referrer"
+              className="w-5 h-5 rounded-full object-cover border border-emerald-400/70 shrink-0"
+              onError={(e) => {
+                (e.currentTarget as HTMLImageElement).src = OPERATOR_AVATAR;
+              }}
+            />
+            <span>Operator: {svl?.Operator || "Mateusz Mitek"} · uprawnienia wymagają weryfikacji</span>
           </span>
           <span aria-hidden="true">·</span>
           <span>Metryka C: {svl?.Compact_Metric_C ?? 2.5}</span>
@@ -191,7 +253,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
         {/* Left Column (7 cols): 4 Autonomous Linux AI Agents (Aria, Alex, Astyria, Aurelius) */}
         <div className="lg:col-span-7 flex flex-col justify-between bg-[#0c1018]/90 border border-slate-800 rounded-xl p-6">
           <div>
-            <div className="flex items-center justify-between gap-4 mb-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
               <div>
                 <h2 className="font-display text-xl font-bold text-white tracking-tight">
                   01. Czterej Agenci Linux i Konta Systemowe (SVL Core)
@@ -200,13 +262,23 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
                   Profile agentów. Istnienie kont, heartbeat i dostęp wymagają potwierdzenia w diagnostyce.
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => onNavigate("agents")}
-                className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0"
-              >
-                Zarządzaj Workerami i IPC
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleAiSelectAvatars}
+                  disabled={selectingAvatars}
+                  className="px-3 py-1.5 text-xs font-medium bg-violet-600/80 hover:bg-violet-500 disabled:opacity-50 text-white rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  {selectingAvatars ? "AI wybiera awatary..." : "AI: Wybierz avatary z internetu"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onNavigate("agents")}
+                  className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                >
+                  Zarządzaj Workerami i IPC
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -223,6 +295,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
                 const pid = liveAgent?.pid ?? 0;
                 const metricC = svlAgent?.metric_c ?? 2.5;
                 const compactDom = svlAgent?.compact_domain || [-1, 1];
+                const avatarSrc = getAgentAvatarUrl(overview, agentId);
 
                 return (
                   <div
@@ -233,12 +306,12 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
                       <div className="flex items-center gap-3.5">
                         <div className="w-12 h-12 rounded-lg overflow-hidden bg-slate-800 shrink-0 border border-slate-700">
                           <img
-                            src={AGENT_AVATARS[agentId]}
+                            src={avatarSrc}
                             alt={displayName}
                             referrerPolicy="no-referrer"
                             className="w-full h-full object-cover"
                             onError={(e) => {
-                              (e.currentTarget as HTMLImageElement).style.display = "none";
+                              (e.currentTarget as HTMLImageElement).src = AGENT_AVATARS[agentId];
                             }}
                           />
                         </div>
