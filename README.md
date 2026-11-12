@@ -57,3 +57,30 @@ npm run test:ui
 
 `TEST_BASE_URL` ustawia adres testowanego panelu, a
 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` pozwala użyć zainstalowanego Chromium.
+
+## Codex CLI
+
+Oficjalny `@openai/codex` 0.167.2 jest lokalną zależnością aplikacji. Serwer
+korzysta z tego pliku wykonywalnego; `BASTILLA_CODEX_BIN` pozwala wskazać inny.
+Panel logowania jest dostępny w zakładkach **Terminale** oraz **Diagnostyka i GitHub**.
+
+- **Zaloguj przez ChatGPT** uruchamia `codex login --device-auth`. Otwórz
+  wyświetlony adres, wpisz kod i potwierdź logowanie na swoim koncie. Jeżeli
+  potrzeba, włącz logowanie kodem urządzenia w ustawieniach konta lub workspace.
+  Panel sprawdza zakończenie procesu; można też anulować oczekujące logowanie.
+- **Użyj klucza z serwera** przekazuje `OPENAI_API_KEY` z sekretów hostingu do
+  `codex login --with-api-key` przez stdin. Klucz nie jest argumentem procesu
+  ani częścią odpowiedzi API.
+- **Sprawdź status Codex** odczytuje wynik CLI bez zmieniania poświadczeń.
+
+CLI zarządza formatem i magazynem poświadczeń zgodnie z istniejącym `CODEX_HOME`
+oraz konfiguracją Codex. Aplikacja nie kopiuje poświadczeń między kontami Linux.
+Znane sztuczne tokeny `codex_tk_*` / `codex_rf_*` i dawny format `api_key` są
+zgłaszane jako wymagające ponownego logowania. Sam poprawny status lokalnego
+CLI nie potwierdza dostępu do modeli, ważności klucza w usłudze ani dostępnego limitu.
+
+API: `GET /api/codex/status` i `POST /api/codex/auth` z akcją `status`,
+`device_login`, `cancel_login` lub `use_api_key`. Dawne akcje generowania
+tokenów i zbiorczego usuwania blokad zwracają błąd bez zmieniania plików.
+Logowanie wymaga dostępu sieciowego do usług uwierzytelniania OpenAI;
+dziedziczy ustawienia proxy i zaufanych certyfikatów serwera.

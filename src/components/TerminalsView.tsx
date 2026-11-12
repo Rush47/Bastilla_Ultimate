@@ -1,6 +1,7 @@
+import { CodexAuthPanel } from "./CodexAuthPanel";
 import React, { useState } from "react";
 import type { AgentId } from "../types/bastilla";
-import { Play, Sparkles, Terminal, CheckCircle2, ShieldCheck, Key } from "lucide-react";
+import { Play, Sparkles, Terminal, CheckCircle2, ShieldCheck } from "lucide-react";
 
 type TerminalMode =
   | "LINUX_ROOT"
@@ -83,15 +84,15 @@ const MODE_CONFIG: Record<
     defaultCommand:
       "ollama --version && ollama list && ollama ps && ollama show Qwen3.8-27B-Uncensored && codex --version && gh --version | head -n 1 && llmman --version && opencode --version && openclaw --version",
     nlpPlaceholder:
-      "np. 'sprawdź modele ollama', 'sprawdź status logowania codex cli', 'napraw token codex cli'",
+      "np. 'sprawdź modele ollama', 'sprawdź status logowania codex cli', 'sprawdź wersję codex cli'",
     commands: [
       {
         label: "Status Ollama (127.0.0.1:11434): Qwen3.8-27B-Uncensored + llama3.2-vision:11b",
         cmd: "ollama --version && ollama list && ollama ps && ollama show Qwen3.8-27B-Uncensored",
       },
       {
-        label: "Weryfikacja OpenAI Codex CLI & usunięcie blokad tokenu",
-        cmd: "rm -f /root/.codex/*.lock && codex login status",
+        label: "Stan logowania OpenAI Codex CLI",
+        cmd: "codex login status",
       },
       {
         label: "Wersje wszystkich zainstalowanych binariów CLI",
@@ -171,8 +172,6 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
   const [naturalPrompt, setNaturalPrompt] = useState<string>("");
   const [translatingNlp, setTranslatingNlp] = useState<boolean>(false);
   const [running, setRunning] = useState<boolean>(false);
-  const [codexFixing, setCodexFixing] = useState<boolean>(false);
-  const [codexNotice, setCodexNotice] = useState<string | null>(null);
   const [logs, setLogs] = useState<TerminalLogEntry[]>([]);
 
   const handleModeSwitch = (newMode: TerminalMode) => {
@@ -252,33 +251,6 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
     }
   };
 
-  const handleFixCodexToken = async () => {
-    setCodexFixing(true);
-    setCodexNotice(null);
-    try {
-      const res = await fetch("/api/codex/auth", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "set_token",
-        }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        setCodexNotice(
-          `Naprawiono token Codex CLI: ${data.message} (${data.token_type})`
-        );
-        onRefresh();
-      } else {
-        setCodexNotice(`Błąd naprawy tokenu Codex: ${data.error}`);
-      }
-    } catch (e: any) {
-      setCodexNotice(`Błąd połączenia: ${e?.message || e}`);
-    } finally {
-      setCodexFixing(false);
-    }
-  };
-
   const currentCfg = MODE_CONFIG[mode];
 
   return (
@@ -324,35 +296,10 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
               )}
             </div>
           )}
-
-          <button
-            type="button"
-            onClick={handleFixCodexToken}
-            disabled={codexFixing}
-            className="px-2.5 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/50 text-emerald-300 text-xs font-mono-tabular flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
-            title="Usuń uszkodzone blokady i wygeneruj poprawny token OpenAI Codex CLI"
-          >
-            <Key className="w-3.5 h-3.5" />
-            {codexFixing ? "Naprawianie..." : "Napraw Token Codex CLI"}
-          </button>
         </div>
       </div>
 
-      {codexNotice && (
-        <div className="p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-700/60 text-xs text-emerald-200 font-mono-tabular flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>{codexNotice}</span>
-          </div>
-          <button
-            type="button"
-            onClick={() => setCodexNotice(null)}
-            className="text-emerald-400 hover:text-white"
-          >
-            ✕
-          </button>
-        </div>
-      )}
+      <CodexAuthPanel />
 
       {/* Main Terminal Console & Direct Commands */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 flex-1">
