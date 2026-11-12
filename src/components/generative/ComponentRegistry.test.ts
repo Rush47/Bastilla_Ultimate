@@ -304,4 +304,40 @@ test("extractGenerativeUI extracts numbered procedure lists into action_buttons"
   assert.equal(btns?.props.buttons[0].label.includes("Aktualizacja"), true);
 });
 
+test("extractGenerativeUI cleanly strips nested dalle.text2im and thought JSON without emitting Unsplash stock images", () => {
+  const leakedText = `{
+  "action": "dalle.text2im",
+  "action_input": "{\\"prompt\\": \\"Futurystyczne miasto w harmonii z naturą\\", \\"size\\": \\"1024x1024\\"}",
+  "thought": "Wygeneruję dla Ciebie obraz przedstawiający futurystyczne miasto w harmonii z naturą."
+}`;
+  const { cleanText, components } = extractGenerativeUI(leakedText);
+  assert.equal(cleanText.includes('"thought"'), false);
+  assert.equal(cleanText.includes("dalle.text2im"), false);
+  const viewer = components.find((c) => c.type === "image_viewer");
+  assert.notEqual(viewer, undefined);
+  assert.equal(String(viewer?.props.url || "").includes("unsplash.com"), false);
+  assert.equal(viewer?.props.prompt, "Futurystyczne miasto w harmonii z naturą");
+});
+
+test("apiFetchJson rejects HTML <!doctype> fallback responses with structured ApiError", async () => {
+  const { apiFetchJson, ApiError } = await import("../../utils/apiClient");
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response("<!doctype html><html><body>Login</body></html>", {
+      status: 200,
+      headers: { "Content-Type": "text/html" },
+    })) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      () => apiFetchJson("/api/system/overview"),
+      (err: unknown) =>
+        err instanceof ApiError &&
+        err.message.includes("HTML zamiast JSON")
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 

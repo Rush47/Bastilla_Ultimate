@@ -59,8 +59,8 @@ export class MCPServerManager {
     }
 
     if (toolName === "git_status") {
-      const status = execFileSync("git", ["status", "--short"], { cwd: this.projectRoot, encoding: "utf8" }).trim();
-      const branch = execFileSync("git", ["branch", "--show-current"], { cwd: this.projectRoot, encoding: "utf8" }).trim();
+      const status = execFileSync("git", ["status", "--short"], { cwd: this.projectRoot, encoding: "utf8", timeout: 5000 }).trim();
+      const branch = execFileSync("git", ["branch", "--show-current"], { cwd: this.projectRoot, encoding: "utf8", timeout: 5000 }).trim();
       return { ok: true, branch, status };
     }
 

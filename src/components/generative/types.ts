@@ -264,11 +264,19 @@ export const HexDumpSchema = z.object({
 });
 
 export const ImageViewerSchema = z.object({
+  id: z.string().optional(),
   title: z.string().optional(),
   url: z.string().optional(),
   base64: z.string().optional(),
   caption: z.string().optional(),
   dimensions: z.string().optional(),
+  prompt: z.string().optional(),
+  model: z.string().optional(),
+  source: z.string().optional(),
+  mimeType: z.string().optional(),
+  durationMs: z.number().optional(),
+  createdAt: z.string().optional(),
+  error: z.string().optional(),
 });
 
 // --- 9. MAPY & PRZESTRZEŃ 3D (3D SPATIAL & SOLAR) ---

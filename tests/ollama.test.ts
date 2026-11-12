@@ -33,3 +33,42 @@ test("Ollama client performs a real pull request and propagates service failure"
     await assert.rejects(run("python3", [client, "--version"], { env: { ...process.env, OLLAMA_BASE_URL: "http://127.0.0.1:1" } }));
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
 });
+
+test("pickPreferredOllamaModel selects multimodal and Qwen chat models accurately", async () => {
+  const { pickPreferredOllamaModel } = await import("../server/ollama.js");
+  const models = [
+    { name: "llama3.1:8b", sizeBytes: 4e9, sizeGb: "4.0 GB", parameterSize: "8B", family: "llama", modifiedAt: "", multimodal: false, uncensored: false },
+    { name: "qwen2.5:14b", sizeBytes: 9e9, sizeGb: "9.0 GB", parameterSize: "14B", family: "qwen", modifiedAt: "", multimodal: false, uncensored: false },
+    { name: "llava:13b", sizeBytes: 8e9, sizeGb: "8.0 GB", parameterSize: "13B", family: "llava", modifiedAt: "", multimodal: true, uncensored: false },
+  ];
+  assert.equal(pickPreferredOllamaModel(models, { multimodal: false }), "qwen2.5:14b");
+  assert.equal(pickPreferredOllamaModel(models, { multimodal: true }), "llava:13b");
+  assert.equal(pickPreferredOllamaModel([]), null);
+});
+
+test("probeOllamaStatus reports READY with real models and pullOllamaModelSafe rejects offline daemon", async () => {
+  const { probeOllamaStatus, pullOllamaModelSafe } = await import("../server/ollama.js");
+  const server = createServer((req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/version") return res.end(JSON.stringify({ version: "0.6.5" }));
+    if (req.url === "/api/tags") return res.end(JSON.stringify({ models: [{ name: "qwen2.5:7b", size: 4700000000, details: { parameter_size: "7B", family: "qwen2" } }] }));
+    if (req.url === "/api/ps") return res.end(JSON.stringify({ models: [{ name: "qwen2.5:7b", size: 4700000000 }] }));
+    res.statusCode = 404;
+    res.end("{}");
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  try {
+    const status = await probeOllamaStatus(`http://127.0.0.1:${address.port}`);
+    assert.equal(status.reachable, true);
+    assert.equal(status.state, "READY");
+    assert.deepEqual(status.modelNames, ["qwen2.5:7b"]);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  const offlinePull = await pullOllamaModelSafe("http://127.0.0.1:1", "qwen2.5:7b");
+  assert.equal(offlinePull.ok, false);
+  assert.equal(offlinePull.status.state, "OFFLINE");
+});
+

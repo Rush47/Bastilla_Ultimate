@@ -11,10 +11,28 @@ import { installApiSecurity, redact } from "./server/security";
 import { MCPServerManager } from "./server/mcp";
 import { AGENTS, TaskQueue } from "./server/task-queue";
 import { agentAccess } from "./server/agent-access";
-import { CodexAuthManager, CodexError } from "./server/codex";
+import { CodexAuthManager, CodexError, CodexTaskManager } from "./server/codex";
+import {
+  pickPreferredOllamaModel,
+  probeOllamaStatus,
+  pullOllamaModelSafe,
+  startOllamaDaemon,
+  streamOllamaChat,
+} from "./server/ollama";
+import { ImageGenerationManager } from "./server/images";
+import {
+  AGENT_TOOL_CATALOG,
+  AgentToolRuntime,
+  buildToolGroundingPrompt,
+  detectUserIntents,
+  toGeminiFunctionDeclarations,
+  toOllamaTools,
+  type ToolExecutionOutcome,
+} from "./server/agent-tools";
 import {
   GoogleGenAI,
   GenerateContentResponse,
+  type FunctionDeclaration,
 } from "@google/genai";
 import {
   SVLSystemKernel,
@@ -37,7 +55,11 @@ const DB_PATH = path.resolve(process.env.BASTILLA_DB_PATH ||
   (fs.existsSync("/var/lib/bastilla/bastilla.db")
     ? "/var/lib/bastilla/bastilla.db"
     : path.join(PROJECT_ROOT, ".bastilla/bastilla.db")));
-const OLLAMA_BASE_URL = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/$/, "");
+const ENV_OLLAMA_EXPLICIT = Boolean(process.env.OLLAMA_BASE_URL?.trim());
+let activeOllamaBaseUrl = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+function getOllamaBaseUrl(): string {
+  return activeOllamaBaseUrl;
+}
 process.env.BASTILLA_PROJECT_ROOT = PROJECT_ROOT;
 process.env.BASTILLA_DB_PATH = DB_PATH;
 process.env.BASTILLA_KERNEL_DIR = KERNEL_DIR;
@@ -53,6 +75,26 @@ function bodyEngine(body: any, requested: string): string {
 }
 
 function shellQuote(value: string) { return "'" + value.replace(/'/g, "'\\''") + "'"; }
+
+function isDestructiveCommand(cmd: string): boolean {
+  return /pkill\s+-f\s+server|killall\s+node|rm\s+-rf\s+\/\s*$|shutdown|reboot|mkfs\.|:\(\)\s*\{/i.test(cmd);
+}
+
+function normalizeInlineImageInput(
+  rawBase64?: string,
+  rawMimeType = "image/jpeg"
+): { base64?: string; mimeType: string } {
+  const mimeFallback = typeof rawMimeType === "string" && rawMimeType.trim() ? rawMimeType.trim() : "image/jpeg";
+  if (typeof rawBase64 !== "string" || !rawBase64.trim()) {
+    return { base64: undefined, mimeType: mimeFallback };
+  }
+  const trimmed = rawBase64.trim();
+  const dataUrlMatch = trimmed.match(/^data:([^;]+);base64,([\s\S]+)$/i);
+  if (dataUrlMatch) {
+    return { base64: dataUrlMatch[2].trim(), mimeType: dataUrlMatch[1].trim() || mimeFallback };
+  }
+  return { base64: trimmed, mimeType: mimeFallback };
+}
 
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY;
@@ -84,8 +126,74 @@ async function querySqliteJson(pyScript: string, args: string[] = []): Promise<a
   }
 }
 
+function getGeminiCandidateModels(): string[] {
+  const configured = process.env.GEMINI_MODEL?.trim();
+  const candidates = [
+    ...(configured ? [configured] : []),
+    "gemini-3.1-flash-lite",
+    "gemini-4-hydrogen",
+    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+  ];
+  return Array.from(new Set(candidates));
+}
+
+function formatGeminiApiError(err: any, modelUsed: string): string {
+  const raw = String(err?.message || err || "Nieznany błąd Gemini");
+  const jsonCandidate = raw.match(/\{[\s\S]*\}/)?.[0] || raw;
+  try {
+    const parsed = JSON.parse(jsonCandidate);
+    const code = parsed?.error?.code;
+    const msg = parsed?.error?.message;
+    if (msg) return `Gemini (${modelUsed}${code ? `, HTTP ${code}` : ""}): ${String(msg).replace(/\s+/g, " ").trim().slice(0, 260)}`;
+  } catch {}
+  return `Gemini (${modelUsed}): ${raw.replace(/\s+/g, " ").trim().slice(0, 260)}`;
+}
+
+function buildAgentSystemInstruction(agentId: string): string {
+  const names: Record<string, string> = {
+    aria: "Aria (Główny Koordynator i Analityk SVL)",
+    alex: "Alex (Architekt Jądra i Systemów Linux)",
+    astyria: "Astyria (Specjalistka Wizji, Grafiki i Symulacji)",
+    aurelius: "Aurelius (Inżynier Sieci, MCP i Floty 3D)",
+    council: "Konsylium 4X (Aria, Alex, Astyria, Aurelius)",
+  };
+  const identity = names[agentId] || "Aria";
+  return `Jesteś ${identity} w systemie Bastilla OS Ultimate Operatora Mateusz Mitek. Odpowiadaj swobodnie, rzeczowo i naturalnie w języku użytkownika (domyślnie po polsku). Nigdy nie zwracaj surowych bloków JSON typu dalle.text2im ani pola "thought", oraz nie wymyślaj wyników narzędzi ani plików graficznych.`;
+}
+
+function sanitizeConversationHistory(
+  rows: Array<{ sender_role: string; content: string }>
+): Array<{ sender_role: string; content: string }> {
+  const filtered = rows.filter((t) => {
+    const c = String(t?.content || "");
+    if (!c.trim()) return false;
+    return !/Jako model (językowy )?AI|nie potrafię bezpośrednio|Moje wytyczne|zasady bezpieczeństwa|nie mogę zrealizować|"action":\s*"dalle\.text2im"|\[OLLAMA:\s*Qwen/i.test(
+      c
+    );
+  });
+  // Drop orphaned leading assistant messages so multi-turn context starts cleanly with user
+  while (filtered.length > 0 && filtered[0].sender_role !== "user") {
+    filtered.shift();
+  }
+  return filtered;
+}
+
+export interface GeminiToolLoopConfig {
+  functionDeclarations?: FunctionDeclaration[];
+  executeToolCall?: (
+    name: string,
+    args: Record<string, any>
+  ) => Promise<ToolExecutionOutcome>;
+  onToolEvent?: (outcome: ToolExecutionOutcome) => void;
+}
+
 async function runLiveMultimodalModel(
-  contents: any[]
+  contents: any[],
+  signal?: AbortSignal,
+  systemInstruction?: string,
+  toolLoop?: GeminiToolLoopConfig
 ): Promise<{ text: string; modelUsed: string }> {
   const ai = getGeminiClient();
   if (!ai) {
@@ -93,10 +201,168 @@ async function runLiveMultimodalModel(
       "Brak klucza GEMINI_API_KEY w środowisku wykonawczym do obsługi wnioskowania neuronowego."
     );
   }
-  const modelUsed = process.env.GEMINI_MODEL || "gemini-flash-latest";
-  const response: GenerateContentResponse = await ai.models.generateContent({ model: modelUsed, contents });
-  if (!response.text?.trim()) throw new Error("Gemini zwrócił pustą odpowiedź.");
-  return { text: response.text, modelUsed };
+  const candidates = getGeminiCandidateModels();
+  let lastError: any = null;
+  for (const modelUsed of candidates) {
+    try {
+      const turnContents = [...contents];
+      for (let hop = 0; hop < 4; hop++) {
+        const config: any = {};
+        if (signal) config.abortSignal = signal;
+        if (systemInstruction) config.systemInstruction = systemInstruction;
+        if (toolLoop?.functionDeclarations?.length) {
+          config.tools = [{ functionDeclarations: toolLoop.functionDeclarations }];
+        }
+        const response: GenerateContentResponse = await ai.models.generateContent({
+          model: modelUsed,
+          contents: turnContents,
+          config: Object.keys(config).length ? config : undefined,
+        });
+        const calls = response.functionCalls;
+        const previousContent = response.candidates?.[0]?.content;
+        if (calls && calls.length > 0 && toolLoop?.executeToolCall && previousContent && hop < 3) {
+          turnContents.push(previousContent);
+          const responseParts: any[] = [];
+          for (const call of calls) {
+            const outcome = await toolLoop.executeToolCall(
+              String(call.name || ""),
+              (call.args as Record<string, any>) || {}
+            );
+            toolLoop.onToolEvent?.(outcome);
+            responseParts.push({
+              functionResponse: {
+                id: call.id,
+                name: String(call.name || ""),
+                response: {
+                  status: outcome.status,
+                  summary: outcome.summary,
+                  data: outcome.data,
+                  error: outcome.error,
+                },
+              },
+            });
+          }
+          turnContents.push({ role: "user", parts: responseParts });
+          continue;
+        }
+        if (!response.text?.trim()) throw new Error("Gemini zwrócił pustą odpowiedź.");
+        return { text: response.text, modelUsed };
+      }
+      throw new Error("Przekroczono limit wywołań narzędzi Gemini.");
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || err || "");
+      if (signal?.aborted) throw err;
+      if (/404|429|RESOURCE_EXHAUSTED|quota|rate|not found|not supported|503|UNAVAILABLE|high demand/i.test(msg)) {
+        continue;
+      }
+      throw new Error(formatGeminiApiError(err, modelUsed));
+    }
+  }
+  throw new Error(formatGeminiApiError(lastError, candidates[0]));
+}
+
+async function streamLiveMultimodalModel(
+  contents: any[],
+  signal: AbortSignal,
+  onChunk: (delta: string) => void,
+  systemInstruction?: string,
+  toolLoop?: GeminiToolLoopConfig
+): Promise<{ text: string; modelUsed: string }> {
+  const ai = getGeminiClient();
+  if (!ai) {
+    throw new Error(
+      "Brak klucza GEMINI_API_KEY w środowisku wykonawczym do obsługi wnioskowania neuronowego."
+    );
+  }
+  const candidates = getGeminiCandidateModels();
+  let lastError: any = null;
+  for (const modelUsed of candidates) {
+    try {
+      const turnContents = [...contents];
+      for (let hop = 0; hop < 4; hop++) {
+        const config: any = { abortSignal: signal };
+        if (systemInstruction) config.systemInstruction = systemInstruction;
+        if (toolLoop?.functionDeclarations?.length) {
+          config.tools = [{ functionDeclarations: toolLoop.functionDeclarations }];
+        }
+        const stream = await ai.models.generateContentStream({
+          model: modelUsed,
+          contents: turnContents,
+          config,
+        });
+        let accumulated = "";
+        const calls: Array<{ id?: string; name?: string; args?: Record<string, any> }> = [];
+        const modelParts: any[] = [];
+
+        for await (const chunk of stream) {
+          if (signal.aborted) break;
+          const cParts = chunk.candidates?.[0]?.content?.parts;
+          if (Array.isArray(cParts)) {
+            for (const p of cParts) {
+              if (p.functionCall) {
+                modelParts.push(p);
+                calls.push({
+                  id: p.functionCall.id,
+                  name: p.functionCall.name,
+                  args: (p.functionCall.args as Record<string, any>) || {},
+                });
+              }
+            }
+          }
+          const partText = chunk.text || "";
+          if (partText) {
+            accumulated += partText;
+            onChunk(partText);
+          }
+        }
+
+        if (calls.length > 0 && toolLoop?.executeToolCall && hop < 3 && !signal.aborted) {
+          turnContents.push({
+            role: "model",
+            parts: accumulated ? [{ text: accumulated }, ...modelParts] : modelParts,
+          });
+          const responseParts: any[] = [];
+          for (const call of calls) {
+            const outcome = await toolLoop.executeToolCall(
+              String(call.name || ""),
+              call.args || {}
+            );
+            toolLoop.onToolEvent?.(outcome);
+            responseParts.push({
+              functionResponse: {
+                id: call.id,
+                name: String(call.name || ""),
+                response: {
+                  status: outcome.status,
+                  summary: outcome.summary,
+                  data: outcome.data,
+                  error: outcome.error,
+                },
+              },
+            });
+          }
+          turnContents.push({ role: "user", parts: responseParts });
+          continue;
+        }
+
+        if (!accumulated.trim()) {
+          throw new Error("Gemini zwrócił pustą odpowiedź strumieniową.");
+        }
+        return { text: accumulated, modelUsed };
+      }
+      throw new Error("Przekroczono limit wywołań narzędzi Gemini.");
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || err || "");
+      if (signal.aborted) throw err;
+      if (/404|429|RESOURCE_EXHAUSTED|quota|rate|not found|not supported|503|UNAVAILABLE|high demand/i.test(msg)) {
+        continue;
+      }
+      throw new Error(formatGeminiApiError(err, modelUsed));
+    }
+  }
+  throw new Error(formatGeminiApiError(lastError, candidates[0]));
 }
 
 // Explicit Gemini compatibility adapter. It never advertises local model weights.
@@ -153,7 +419,7 @@ function startRootEscalationSocket() {
         const cmd = String(req.command || "id");
         const cwd = String(req.cwd || PROJECT_ROOT);
 
-        if (/pkill\s+-f\s+server|killall\s+node|rm\s+-rf\s+\/\s*$/i.test(cmd)) {
+        if (isDestructiveCommand(cmd)) {
           conn.end(
             JSON.stringify({
               stdout: "",
@@ -341,11 +607,17 @@ for offset in range(0, len(data), 16):
     ascii_str = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
     print(f"{offset:08X}  {hex_left:<23}  {hex_right:<23}  |{ascii_str:<16}|")
 `;
-    const out = await execFileAsync("python3", ["-c", binInspectorPy, targetFile], {
-      timeout: 8000,
-    });
-    stdout = out.stdout;
-    stderr = out.stderr;
+    try {
+      const out = await execFileAsync("python3", ["-c", binInspectorPy, targetFile], {
+        timeout: 8000,
+      });
+      stdout = out.stdout;
+      stderr = out.stderr;
+    } catch (e: any) {
+      stdout = e.stdout || "";
+      stderr = e.stderr || e.message || "";
+      exitCode = typeof e.code === "number" ? e.code : 1;
+    }
   } else if (mode === "AI_CLI") {
     try {
       const out = await execAsync(command, {
@@ -397,20 +669,46 @@ async function startServer() {
   // Tool calls additionally require a matching operator token; cookies alone
   // are intentionally insufficient for invoking tools.
   const mcp = new MCPServerManager(PROJECT_ROOT, DB_PATH);
+
+  const extractOperatorToken = (req: express.Request): string | undefined => {
+    const bearer = req.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+    if (bearer) return bearer;
+    const cookie =
+      req.headers.cookie
+        ?.split(";")
+        .map((x) => x.trim())
+        .find((x) => x.startsWith("bastilla_access="))
+        ?.slice(16) || "";
+    try {
+      return cookie ? decodeURIComponent(cookie) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const isOperatorAuthorized = (req: express.Request): boolean => {
+    const configuredToken = process.env.BASTILLA_API_TOKEN || "";
+    if (!configuredToken) return true; // installApiSecurity already enforced local/preview origin check
+    const supplied = extractOperatorToken(req);
+    return Boolean(supplied && supplied === configuredToken);
+  };
+
+  const buildMcpStatusSnapshot = () => ({
+    ok: true,
+    configured: Boolean(process.env.BASTILLA_API_TOKEN),
+    transport: "http-jsonrpc-subset",
+    endpoint: "/api/mcp",
+    tools: mcp.listTools().tools.map((tool) => tool.name),
+    clientConnected: false,
+    codexLoginVerified: false,
+    deployment: process.env.NODE_ENV === "production" ? "production" : "development",
+    warning: "Endpoint availability does not prove that AI Studio or Codex can connect.",
+  });
+
   // Non-secret diagnostic metadata. API security middleware still applies.
   // Do not advertise an MCP connection until a client has actually called it.
   app.get("/api/mcp/status", (_req, res) => {
-    res.json({
-      ok: true,
-      configured: Boolean(process.env.BASTILLA_API_TOKEN),
-      transport: "http-jsonrpc-subset",
-      endpoint: "/api/mcp",
-      tools: mcp.listTools().tools.map(tool => tool.name),
-      clientConnected: false,
-      codexLoginVerified: false,
-      deployment: process.env.NODE_ENV === "production" ? "production" : "development",
-      warning: "Endpoint availability does not prove that AI Studio or Codex can connect.",
-    });
+    res.json(buildMcpStatusSnapshot());
   });
   app.post("/api/mcp", (req, res) => {
     const message = req.body;
@@ -459,7 +757,7 @@ async function startServer() {
       });
       return response.text || "";
     }
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, { method: "POST",
+    const response = await fetch(`${getOllamaBaseUrl()}/api/chat`, { method: "POST",
       headers: { "Content-Type": "application/json" }, signal,
       body: JSON.stringify({ model: task.model, stream: false, messages: [{ role: "user", content: task.prompt }] }),
     });
@@ -470,12 +768,572 @@ async function startServer() {
     return typeof body.message?.content === "string" ? body.message.content : "";
   });
   process.once("exit", () => queue.close());
+  const imageManager = new ImageGenerationManager(DB_PATH);
+  const codexTasks = new CodexTaskManager(PROJECT_ROOT, DB_PATH, process.env);
+
+  const sseClients = new Set<express.Response>();
+  const broadcastSystemEvent = (type: string, data: Record<string, unknown> = {}) => {
+    const payload = `event: ${type}\ndata: ${JSON.stringify({ type, timestamp: new Date().toISOString(), ...data })}\n\n`;
+    for (const client of sseClients) {
+      try {
+        client.write(payload);
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+  };
+
+  const getAgentsHealthSnapshot = async (filterAgentId?: string) => {
+    const caps = await agentAccess(PROJECT_ROOT, queue, false);
+    const pyScript = `
+import json, os, pwd, sqlite3, subprocess, sys
+from datetime import datetime, timezone
+
+db_path = sys.argv[1]
+target = sys.argv[2] if len(sys.argv) > 2 else ""
+agent_ids = [target] if target in ("aria", "alex", "astyria", "aurelius") else ["aria", "alex", "astyria", "aurelius"]
+
+db_rows = {}
+if os.path.exists(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    for row in conn.execute("SELECT id, display_name, linux_user, home_dir, uid, gid, status, pid, last_heartbeat, cycle_count FROM agents").fetchall():
+        db_rows[row["id"]] = dict(row)
+    conn.close()
+
+out = []
+for a in agent_ids:
+    try:
+        pw = pwd.getpwnam(a)
+        uid, gid, home = pw.pw_uid, pw.pw_gid, pw.pw_dir
+    except KeyError:
+        uid, gid, home = -1, -1, f"/home/{a}"
+    try:
+        pids = subprocess.check_output(f"pgrep -u {a} -f 'agent_worker.py {a}([ ]|$)' || true", shell=True, timeout=2).decode().splitlines()
+    except Exception:
+        pids = []
+    pid = int(pids[0]) if pids and pids[0].isdigit() else 0
+    worker_status = {}
+    status_path = f"/home/{a}/worker_status.json"
+    if os.path.exists(status_path):
+        try:
+            with open(status_path) as f:
+                worker_status = json.load(f)
+        except Exception:
+            worker_status = {}
+    heartbeat_valid = False
+    try:
+        if isinstance(worker_status, dict) and worker_status.get("last_heartbeat"):
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(worker_status["last_heartbeat"])).total_seconds()
+            heartbeat_valid = 0 <= age < 20 and worker_status.get("pid") == pid
+    except Exception:
+        pass
+    out.append({
+        "id": a,
+        "uid": uid,
+        "gid": gid,
+        "home": home,
+        "pid": pid,
+        "running": pid > 0 and heartbeat_valid,
+        "worker_status": worker_status if isinstance(worker_status, dict) else {},
+        "sqlite_record": db_rows.get(a)
+    })
+print(json.dumps({"agents": out, "checkedAt": datetime.now(timezone.utc).isoformat()}))
+`;
+    const liveData = await querySqliteJson(pyScript, [filterAgentId || ""]);
+    const capMap = new Map(caps.map((c: any) => [c.id, c]));
+    return {
+      checkedAt: liveData?.checkedAt || new Date().toISOString(),
+      agents: (liveData?.agents || []).map((a: any) => ({
+        ...a,
+        capabilities: capMap.get(a.id) || null,
+      })),
+    };
+  };
+
+  const getSystemDiagnosticsSnapshot = async () => {
+    const pyScript = `
+import json, os, subprocess, sys
+def cmd(c):
+    try:
+        return subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT, timeout=3).decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+meminfo = {}
+if os.path.exists("/proc/meminfo"):
+    with open("/proc/meminfo") as f:
+        for line in f:
+            parts = line.split(":")
+            if len(parts) == 2:
+                meminfo[parts[0].strip()] = parts[1].strip()
+disk_df = cmd("df -h / | tail -n 1").split()
+print(json.dumps({
+    "uname": cmd("uname -srmo"),
+    "loadavg": cmd("cat /proc/loadavg").split()[:3],
+    "uptime_sec": float(cmd("cat /proc/uptime").split()[0] or 0),
+    "meminfo": {
+        "total": meminfo.get("MemTotal", "N/A"),
+        "available": meminfo.get("MemAvailable", "N/A"),
+        "free": meminfo.get("MemFree", "N/A"),
+    },
+    "disk": {
+        "size": disk_df[1] if len(disk_df) > 1 else "N/A",
+        "used": disk_df[2] if len(disk_df) > 2 else "N/A",
+        "avail": disk_df[3] if len(disk_df) > 3 else "N/A",
+        "use_pct": disk_df[4] if len(disk_df) > 4 else "N/A",
+    },
+    "git_branch": cmd("git rev-parse --abbrev-ref HEAD"),
+    "git_head": cmd("git rev-parse --short HEAD"),
+}))
+`;
+    const [host, codexStatus] = await Promise.all([
+      querySqliteJson(pyScript, []),
+      codexAuth.status(),
+    ]);
+    return {
+      ...host,
+      codex: codexStatus,
+      checkedAt: new Date().toISOString(),
+    };
+  };
+
+  const toolRuntime = new AgentToolRuntime({
+    probeOllama: () => probeOllamaStatus(getOllamaBaseUrl()),
+    getMcpStatus: async () => buildMcpStatusSnapshot(),
+    probeImageEngines: () => imageManager.probeStatus(),
+    generateImage: (args) => imageManager.generate(args),
+    getAgentsHealth: (agentId) => getAgentsHealthSnapshot(agentId),
+    getSystemDiagnostics: () => getSystemDiagnosticsSnapshot(),
+    mcpManager: mcp,
+    executeTerminal: (mode, command, agentId) =>
+      executeTerminalCommandInternal(mode, command, agentId),
+  });
+
+  const applyImageOutcomeToReplyText = (
+    text: string,
+    outcomes: ToolExecutionOutcome[]
+  ): { text: string; addedSuffix: string } => {
+    let next = text;
+    let addedSuffix = "";
+    const imageOutcome = outcomes.find(
+      (o) => o.tool === "generate_image" && o.status === "executed" && o.data?.image
+    );
+    if (imageOutcome?.data?.image) {
+      const img = imageOutcome.data.image;
+      const expectedUrl = `/api/images/file/${img.id}`;
+      const hasBlock =
+        next.includes(expectedUrl) && /```image\s*\n[\s\S]*?```/i.test(next);
+      if (!hasBlock) {
+        const block = `\n\n\`\`\`image\n${JSON.stringify({
+          url: expectedUrl,
+          prompt: img.prompt,
+          source: img.source,
+          model: img.model,
+          aspectRatio: imageOutcome.data.aspectRatio || "1:1",
+        })}\n\`\`\``;
+        next = `${next}${block}`;
+        addedSuffix = block;
+      }
+    } else if (outcomes.some((o) => o.tool === "generate_image" && o.status !== "executed")) {
+      // Never leak a fabricated ```image``` block if real generation failed.
+      next = next.replace(/```image\s*\n[\s\S]*?```/gi, "").trim();
+    }
+    return { text: next, addedSuffix };
+  };
+
+  app.get("/api/events/stream", (req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    res.write(`event: connected\ndata: ${JSON.stringify({ ok: true, timestamp: new Date().toISOString() })}\n\n`);
+    sseClients.add(res);
+    const keepAlive = setInterval(() => {
+      try {
+        res.write(`: ping\n\n`);
+      } catch {
+        clearInterval(keepAlive);
+        sseClients.delete(res);
+      }
+    }, 25000);
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    });
+  });
+
+  if (!ENV_OLLAMA_EXPLICIT) {
+    try {
+      const savedMeta = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute("SELECT value FROM bastilla_metadata WHERE key='ollama_base_url'").fetchone()
+conn.close()
+print(json.dumps({"url": row[0] if row else ""}))`
+      );
+      if (savedMeta?.url && /^https?:\/\//i.test(String(savedMeta.url))) {
+        activeOllamaBaseUrl = String(savedMeta.url).trim().replace(/\/+$/, "");
+      }
+    } catch {}
+  }
+
+  app.get("/api/ollama/status", async (_req, res) => {
+    try {
+      const status = await probeOllamaStatus(getOllamaBaseUrl());
+      res.json({ ok: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, state: "ERROR", error: err?.message || "Błąd diagnostyki Ollama." });
+    }
+  });
+
+  app.post("/api/ollama/config", async (req, res) => {
+    try {
+      const raw = String(req.body?.endpoint || "").trim().replace(/\/+$/, "");
+      if (raw && !/^https?:\/\/[^/\s]+/i.test(raw)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Adres Ollama musi zaczynać się od http:// lub https:// (np. http://127.0.0.1:11434).",
+        });
+      }
+      const nextUrl = raw || (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+      activeOllamaBaseUrl = nextUrl;
+      await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("INSERT OR REPLACE INTO bastilla_metadata (key, value) VALUES ('ollama_base_url', ?)", (sys.argv[2],))
+conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
+        [raw]
+      );
+      const status = await probeOllamaStatus(getOllamaBaseUrl());
+      broadcastSystemEvent("ollama", { state: status.state, reachable: status.reachable, endpoint: status.endpoint });
+      res.json({ ok: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Nie udało się zapisać adresu Ollama." });
+    }
+  });
+
+  app.post("/api/ollama/pull", async (req, res) => {
+    try {
+      const model = String(req.body?.model || "").trim();
+      if (!model) {
+        return res.status(400).json({ ok: false, error: "Podaj nazwę modelu do pobrania." });
+      }
+      const result = await pullOllamaModelSafe(getOllamaBaseUrl(), model);
+      broadcastSystemEvent("ollama", { state: result.status.state, reachable: result.status.reachable });
+      res.status(result.ok ? 200 : 503).json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Nie udało się pobrać modelu Ollama." });
+    }
+  });
+
+  app.post("/api/ollama/start", async (_req, res) => {
+    try {
+      const result = await startOllamaDaemon(getOllamaBaseUrl());
+      broadcastSystemEvent("ollama", { state: result.status.state, reachable: result.status.reachable });
+      res.status(result.ok ? 200 : 503).json(result);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, started: false, error: err?.message || "Nie udało się uruchomić Ollama." });
+    }
+  });
+
+  app.get("/api/images/status", async (_req, res) => {
+    try {
+      const status = await imageManager.probeStatus();
+      res.json({ ok: true, ...status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, engineStatus: "ERROR", error: err?.message || "Błąd sondowania silników obrazów." });
+    }
+  });
+
+  app.get("/api/images/history", (_req, res) => {
+    try {
+      res.json({ ok: true, images: imageManager.listHistory(50) });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd odczytu historii obrazów." });
+    }
+  });
+
+  app.get("/api/images/file/:id", (req, res) => {
+    const file = imageManager.getImageFile(req.params.id);
+    if (!file) {
+      return res.status(404).json({ ok: false, error: "Nie znaleziono wygenerowanego pliku obrazu." });
+    }
+    res.setHeader("Content-Type", file.mimeType);
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+    res.setHeader("Content-Length", String(file.buffer.length));
+    return res.send(file.buffer);
+  });
+
+  app.post("/api/images/generate", async (req, res) => {
+    try {
+      const {
+        prompt = "",
+        agentId = "astyria",
+        mode = "generate",
+        preferredEngine = "auto",
+        aspectRatio = "1:1",
+        sourceImageBase64,
+        sourceMimeType,
+        sourceImageMimeType,
+        sessionId = "bastilla-main",
+        saveToChat = true,
+      } = req.body || {};
+
+      const cleanPrompt = String(prompt || "").trim();
+      if (!cleanPrompt) {
+        return res.status(400).json({ ok: false, engineStatus: "ERROR", error: "Prompt generowania obrazu nie może być pusty." });
+      }
+      const safeAgent = AGENTS.includes(agentId) || agentId === "council" ? agentId : "astyria";
+
+      const result = await imageManager.generate({
+        prompt: cleanPrompt,
+        agentId: safeAgent === "council" ? "astyria" : safeAgent,
+        mode,
+        preferredEngine,
+        aspectRatio,
+        sourceImageBase64,
+        sourceMimeType: sourceMimeType || sourceImageMimeType || "image/png",
+      });
+
+      if (!result.ok || !result.image) {
+        return res.status(result.engineStatus === "BRAK SILNIKA" ? 503 : 500).json({
+          ok: false,
+          engineStatus: result.engineStatus,
+          error: result.error || "Generowanie obrazu nie powiodło się.",
+        });
+      }
+
+      let userMessageRecord: any = undefined;
+      let assistantMessageRecord: any = undefined;
+
+      if (saveToChat !== false) {
+        const imageBlockPayload = {
+          id: result.image.id,
+          title: `Wygenerowany Obraz (${result.image.model})`,
+          url: result.image.url,
+          caption: result.caption || result.image.prompt,
+          prompt: result.image.prompt,
+          model: result.image.model,
+          source: result.image.source,
+          mimeType: result.image.mime_type,
+          durationMs: result.image.duration_ms,
+          createdAt: result.image.created_at,
+        };
+        const assistantContent = [
+          result.caption ? result.caption : `Wygenerowano obraz na podstawie promptu: "${cleanPrompt}".`,
+          "",
+          "```image",
+          JSON.stringify(imageBlockPayload, null, 2),
+          "```",
+        ].join("\n");
+
+        const savedRows = await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'user', ?, 'Operator (Obraz)', ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+user_id = cur.lastrowid
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[5], sys.argv[6], now))
+asst_id = cur.lastrowid
+conn.commit()
+conn.close()
+print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
+          [
+            String(sessionId || "bastilla-main"),
+            safeAgent,
+            `[Obraz · ${mode}] ${cleanPrompt}`,
+            `${result.image.source}/${result.image.model}`,
+            assistantContent,
+          ]
+        );
+
+        userMessageRecord = {
+          id: savedRows.user_id || Date.now() - 1,
+          session_id: String(sessionId || "bastilla-main"),
+          sender_role: "user",
+          agent_id: safeAgent,
+          engine_used: "Operator (Obraz)",
+          content: `[Obraz · ${mode}] ${cleanPrompt}`,
+          created_at: savedRows.created_at || result.image.created_at,
+        };
+        assistantMessageRecord = {
+          id: savedRows.asst_id || Date.now(),
+          session_id: String(sessionId || "bastilla-main"),
+          sender_role: "assistant",
+          agent_id: safeAgent,
+          engine_used: `${result.image.source}/${result.image.model}`,
+          content: assistantContent,
+          created_at: savedRows.created_at || result.image.created_at,
+        };
+      }
+
+      broadcastSystemEvent("image_generated", { id: result.image.id, model: result.image.model, source: result.image.source });
+
+      return res.json({
+        ok: true,
+        engineStatus: "READY",
+        image: result.image,
+        caption: result.caption,
+        userMessageRecord,
+        assistantMessageRecord,
+      });
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, engineStatus: "ERROR", error: err?.message || "Błąd generowania obrazu." });
+    }
+  });
+
+  app.post("/api/system/sync", async (_req, res) => {
+    try {
+      const dbCheck = await querySqliteJson(`import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+rows = [r[0] for r in conn.execute("PRAGMA quick_check")]
+conn.close()
+print(json.dumps({"results": rows}))`);
+      const [ollama, images, codex] = await Promise.all([
+        probeOllamaStatus(getOllamaBaseUrl()),
+        imageManager.probeStatus(),
+        codexAuth.status(),
+      ]);
+      const syncResult = {
+        ok: true,
+        sqlite_ok: dbCheck?.results?.[0] === "ok",
+        ollama,
+        images,
+        codex,
+        mcp_tools: mcp.listTools().tools.map((t) => t.name),
+        syncedAt: new Date().toISOString(),
+      };
+      broadcastSystemEvent("sync", { syncedAt: syncResult.syncedAt, ollama: ollama.state, images: images.engineStatus });
+      res.json(syncResult);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Synchronizacja systemu nie powiodła się." });
+    }
+  });
+
+  app.get("/api/codex/tasks", (req, res) => {
+    try {
+      const sessionId = typeof req.query.sessionId === "string" ? req.query.sessionId : undefined;
+      const agentId = typeof req.query.agentId === "string" ? req.query.agentId : undefined;
+      const limit = Number(req.query.limit) || 50;
+      res.json({ ok: true, tasks: codexTasks.getTasks(sessionId, limit, agentId) });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd odczytu kolejki Codex CLI." });
+    }
+  });
+
+  app.post("/api/codex/tasks", (req, res) => {
+    try {
+      const { agentId = "aria", sessionId, prompt = "", stdin, autoStart = true } = req.body || {};
+      if (typeof prompt !== "string" || !prompt.trim()) {
+        return res.status(400).json({ ok: false, error: "Treść zadania Codex CLI nie może być pusta." });
+      }
+      const operatorToken = extractOperatorToken(req);
+      const taskId = codexTasks.createTask(String(agentId), String(sessionId || ""), prompt.trim(), {
+        autoStart: Boolean(autoStart),
+        stdin: typeof stdin === "string" ? stdin : undefined,
+        operatorToken,
+        localAuthorized: !process.env.BASTILLA_API_TOKEN,
+      });
+      res.status(202).json({ ok: true, taskId, task: codexTasks.getTaskById(taskId) });
+    } catch (err: any) {
+      res.status(err instanceof CodexError ? err.status : 500).json({
+        ok: false,
+        error: err?.message || "Błąd tworzenia zadania Codex CLI.",
+      });
+    }
+  });
+
+  app.post("/api/codex/tasks/:id/start", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    if (!codexTasks.getTaskById(id)) return res.status(404).json({ ok: false, error: "Nie znaleziono zadania Codex CLI." });
+    codexTasks.startTask(id, typeof req.body?.stdin === "string" ? req.body.stdin : undefined);
+    res.json({ ok: true, task: codexTasks.getTaskById(id) });
+  });
+
+  app.post("/api/codex/tasks/:id/cancel", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    if (!codexTasks.getTaskById(id)) return res.status(404).json({ ok: false, error: "Nie znaleziono zadania Codex CLI." });
+    codexTasks.cancelTask(id);
+    res.json({ ok: true, task: codexTasks.getTaskById(id) });
+  });
+
+  app.post("/api/codex/tasks/:id/retry", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    if (!codexTasks.getTaskById(id)) return res.status(404).json({ ok: false, error: "Nie znaleziono zadania Codex CLI." });
+    codexTasks.retryTask(id);
+    res.json({ ok: true, task: codexTasks.getTaskById(id) });
+  });
+
+  app.get("/api/codex/tasks/:id/stream", (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ ok: false, error: "Nieprawidłowe ID zadania." });
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    const safeWrite = (eventName: string, payload: unknown) => {
+      if (res.writableEnded) return;
+      try {
+        res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+      } catch {}
+    };
+
+    const initial = codexTasks.getTaskById(id);
+    if (initial) {
+      safeWrite("init", initial);
+    }
+
+    const onUpdate = (payload: any) => {
+      if (payload?.taskId === id) safeWrite("data", payload);
+    };
+    const onData = (payload: any) => {
+      if (payload?.taskId === id) safeWrite("data", payload);
+    };
+    const onComplete = (payload: any) => {
+      if (payload?.taskId === id) safeWrite("complete", payload);
+    };
+
+    codexTasks.on("update", onUpdate);
+    codexTasks.on("data", onData);
+    codexTasks.on("complete", onComplete);
+
+    req.on("close", () => {
+      codexTasks.off("update", onUpdate);
+      codexTasks.off("data", onData);
+      codexTasks.off("complete", onComplete);
+    });
+  });
+
+  app.get("/api/codex/git-summary", (_req, res) => {
+    try {
+      res.json({ ok: true, ...codexTasks.getGitSummary() });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd odczytu podsumowania Git." });
+    }
+  });
+
   app.get("/api/agent-tasks", (_req, res) => {
     try { res.json({ ok: true, tasks: queue.list() }); }
     catch { res.status(500).json({ ok: false, error: "Błąd odczytu kolejki." }); }
   });
   app.post("/api/agent-tasks", (req, res) => {
-    try { res.status(202).json({ ok: true, task: queue.submit(req.body || {}) }); }
+    try {
+      const task = queue.submit(req.body || {});
+      broadcastSystemEvent("agent_task", { id: task.id, agent_id: task.agent_id, status: task.status });
+      res.status(202).json({ ok: true, task });
+    }
     catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : "Błąd kolejki." }); }
   });
   app.post("/api/agent-tasks/:id/cancel", (req, res) => {
@@ -487,6 +1345,47 @@ async function startServer() {
   app.get("/api/agents/capabilities", async (req, res) => {
     try { res.json({ ok: true, agents: await agentAccess(PROJECT_ROOT, queue, req.query.remote === "true") }); }
     catch { res.status(500).json({ ok: false, error: "Błąd diagnostyki agentów." }); }
+  });
+
+  app.get("/api/agents/tools", async (req, res) => {
+    try {
+      const agentId = typeof req.query.agentId === "string" ? req.query.agentId : "aria";
+      const catalog = await toolRuntime.listCatalog({
+        agentId,
+        operatorToken: extractOperatorToken(req),
+        authorizedOperator: isOperatorAuthorized(req),
+      });
+      res.json(catalog);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd katalogu narzędzi." });
+    }
+  });
+
+  app.post("/api/agents/tools/execute", async (req, res) => {
+    try {
+      const { tool = "", args = {}, agentId = "aria" } = req.body || {};
+      if (typeof tool !== "string" || !tool.trim()) {
+        return res.status(400).json({ ok: false, error: "Podaj nazwę narzędzia (tool)." });
+      }
+      const outcome = await toolRuntime.executeTool(
+        tool.trim(),
+        args && typeof args === "object" ? args : {},
+        {
+          agentId: String(agentId || "aria"),
+          operatorToken: extractOperatorToken(req),
+          authorizedOperator: isOperatorAuthorized(req),
+        }
+      );
+      const statusCode =
+        outcome.status === "denied"
+          ? 403
+          : outcome.status === "unavailable" && /Nieznane narzędzie/.test(outcome.summary)
+          ? 404
+          : 200;
+      res.status(statusCode).json({ ok: outcome.status === "executed", outcome });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd wykonania narzędzia." });
+    }
   });
 
   // 1. Live System, Linux Kernel, SVL Core & SQLite State Overview
@@ -633,7 +1532,7 @@ if os.path.exists(sys.argv[1]):
     db_data["fleet"] = [dict(r) for r in conn.execute("SELECT * FROM fleet_units").fetchall()]
     db_data["missions"] = [dict(r) for r in conn.execute("SELECT * FROM missions").fetchall()]
     db_data["hypercomm"] = [dict(r) for r in conn.execute("SELECT * FROM hypercomm_relays").fetchall()]
-    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM chat_messages ORDER BY id ASC LIMIT 80").fetchall()]
+    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM (SELECT * FROM chat_messages ORDER BY id DESC LIMIT 150) ORDER BY id ASC").fetchall()]
     conn.close()
 
 distro_files = []
@@ -673,36 +1572,40 @@ print(json.dumps({
         auth_ready: codexStatus.auth_ready,
         requirement_note: codexStatus.message,
       };
+      const [ollamaStatus, imageStatus] = await Promise.all([
+        probeOllamaStatus(getOllamaBaseUrl()),
+        imageManager.probeStatus(),
+      ]);
+
+      hostData.tools.ollama.auth_ready = ollamaStatus.reachable && ollamaStatus.models.length > 0;
+      hostData.tools.ollama.requirement_note = ollamaStatus.message;
+
       const geminiConfigured = Boolean(
         process.env.GEMINI_API_KEY &&
           process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
       );
 
-      let ollamaOnline = false;
-      let ollamaModels: string[] = [];
-      try {
-        const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
-          signal: AbortSignal.timeout(2000),
-        });
-        const body: any = response.ok ? await response.json() : null;
-        ollamaOnline = Array.isArray(body?.models) && body?.provider !== "gemini-bridge";
-        ollamaModels = ollamaOnline ? body.models.map((m: any) => m.name).filter((name: unknown) => typeof name === "string") : [];
-      } catch {}
-
-      hostData.tools.ollama.auth_ready = false; // A catalogue response is not a completed inference.
-      hostData.tools.ollama.requirement_note = ollamaOnline ? `API odpowiada; modele: ${ollamaModels.join(", ") || "brak"}. Wnioskowanie niezweryfikowane.` : "Brak potwierdzonej usługi Ollama.";
       res.json({
         ok: true,
         svl_report: svlReport,
         host: hostData,
         ai_routing: {
-          primary_model: ollamaModels[0] ? `ollama/${ollamaModels[0]}` : "unverified",
-          available_models: ollamaModels,
-          ollama_online: ollamaOnline,
-          fallback_model: process.env.GEMINI_MODEL || "gemini-flash-latest",
+          primary_model: ollamaStatus.modelNames[0] ? `ollama/${ollamaStatus.modelNames[0]}` : "unverified",
+          available_models: ollamaStatus.modelNames,
+          ollama_online: ollamaStatus.reachable,
+          ollama_state: ollamaStatus.state,
+          fallback_model: process.env.GEMINI_MODEL || "gemini-3.8-flash",
           gemini_configured: geminiConfigured,
-          active_engine: ollamaOnline && ollamaModels.length ? "ollama" : geminiConfigured ? "gemini-configured-unverified" : "unavailable",
+          active_engine:
+            ollamaStatus.reachable && ollamaStatus.modelNames.length
+              ? "ollama"
+              : geminiConfigured
+              ? "gemini-configured-unverified"
+              : "unavailable",
         },
+        ollama_status: ollamaStatus,
+        image_status: imageStatus,
+        images: imageManager.listHistory(20),
         app_url:
           process.env.APP_URL ||
           `http://localhost:${PORT}`,
@@ -718,27 +1621,46 @@ print(json.dumps({
       const { xStart, xEnd, token, newOperatorName, customPython } = req.body || {};
 
       if (customPython && typeof customPython === "string") {
-        const { stdout, stderr } = await execFileAsync(
-          "python3",
-          ["-c", customPython],
-          {
-            timeout: 8000,
-            env: {
-              ...process.env,
-              PYTHONPATH: process.env.PYTHONPATH,
-            },
-          }
-        );
+        if (isDestructiveCommand(customPython)) {
+          return res.status(400).json({
+            ok: false,
+            error: "Zablokowano destrukcyjny kod Python mogący zatrzymać serwer.",
+          });
+        }
+        let stdout = "";
+        let stderr = "";
+        let exitCode = 0;
+        try {
+          const out = await execFileAsync(
+            "python3",
+            ["-c", customPython],
+            {
+              timeout: 8000,
+              env: {
+                ...process.env,
+                PYTHONPATH: process.env.PYTHONPATH,
+              },
+            }
+          );
+          stdout = out.stdout;
+          stderr = out.stderr;
+        } catch (e: any) {
+          stdout = e.stdout || "";
+          stderr = e.stderr || e.message || "";
+          exitCode = typeof e.code === "number" ? e.code : 1;
+        }
+        stdout = redact(stdout);
+        stderr = redact(stderr);
         await querySqliteJson(
           `import sqlite3, sys, json
 from datetime import datetime, timezone
 conn = sqlite3.connect(sys.argv[1])
 conn.execute("INSERT INTO task_history (title, assigned_agent, terminal_type, command_or_prompt, output_summary, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-  ("SVL Kernel Execution", "aria", "PYTHON_ROOT", sys.argv[2][:200], sys.argv[3][:400], "COMPLETED", datetime.now(timezone.utc).isoformat()))
+  ("SVL Kernel Execution", "aria", "PYTHON_ROOT", sys.argv[2][:200], sys.argv[3][:400], sys.argv[4], datetime.now(timezone.utc).isoformat()))
 conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
-          [customPython, stdout || stderr || "OK"]
+          [redact(customPython), stdout || stderr || "OK", exitCode === 0 ? "COMPLETED" : "ERROR"]
         );
-        return res.json({ ok: true, stdout, stderr });
+        return res.json({ ok: exitCode === 0, stdout, stderr, exitCode });
       }
 
       const pyEval = `
@@ -809,7 +1731,7 @@ print(json.dumps(report, indent=4, ensure_ascii=False, allow_nan=False))
       return res.status(400).json({ ok: false, error: "Brak polecenia do wykonania." });
     }
 
-    if (/pkill\s+-f\s+server|killall\s+node|rm\s+-rf\s+\/\s*$/i.test(command)) {
+    if (isDestructiveCommand(command)) {
       return res.status(400).json({
         ok: false,
         error: "Zablokowano destrukcyjne polecenie mogące zatrzymać proces serwera głównego.",
@@ -886,16 +1808,34 @@ Zwróć TYLKO czyste polecenie, bez formatowania markdown, bez cudzysłowów, be
 Polecenie użytkownika: "${prompt.trim()}"`;
 
         try {
-          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+          const ollamaEndpoint = getOllamaBaseUrl();
+          const preferredOllamaModel = process.env.OLLAMA_MODEL || "llama3.2-vision:11b";
+          let ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              model: process.env.OLLAMA_MODEL || "llama3.2-vision:11b",
+              model: preferredOllamaModel,
               stream: false,
               messages: [{ role: "user", content: translationPrompt }],
             }),
             signal: AbortSignal.timeout(15000),
           });
+          if (ollamaRes.status === 404) {
+            const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+            const altModel = pickPreferredOllamaModel(liveOllama.models, { multimodal: false });
+            if (altModel && altModel !== preferredOllamaModel) {
+              ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  model: altModel,
+                  stream: false,
+                  messages: [{ role: "user", content: translationPrompt }],
+                }),
+                signal: AbortSignal.timeout(15000),
+              });
+            }
+          }
           if (ollamaRes.ok) {
             const data: any = await ollamaRes.json();
             generatedCmd = (data?.message?.content || "")
@@ -924,6 +1864,13 @@ Polecenie użytkownika: "${prompt.trim()}"`;
 
       if (!generatedCmd) {
         return res.status(503).json({ ok: false, error: "Model nie zwrócił polecenia." });
+      }
+
+      if (isDestructiveCommand(generatedCmd)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Zablokowano destrukcyjne polecenie mogące zatrzymać proces serwera głównego.",
+        });
       }
 
       // Shell shortcuts remain executable when the selected interpreter is Python.
@@ -990,90 +1937,423 @@ Polecenie użytkownika: "${prompt.trim()}"`;
     }
   });
 
-  // 4A. Server-Sent Events (SSE) Streaming Chat Endpoint
-  app.get("/api/chat/stream", async (req, res) => {
+  // 4A. Real Server-Sent Events (SSE) Streaming Chat Endpoint (GET + POST with upstream abort)
+  async function handleChatStreamRequest(
+    req: express.Request,
+    res: express.Response,
+    params: {
+      agentId: string;
+      message: string;
+      enginePreference: string;
+      sessionId: string;
+      imageBase64?: string;
+      imageMimeType?: string;
+      saveToDb: boolean;
+      isGetRequest?: boolean;
+    }
+  ) {
     const {
       agentId = "aria",
       message = "",
       enginePreference = "auto",
-    } = req.query as Record<string, string>;
+      sessionId = "bastilla-main",
+      imageBase64: rawImageBase64,
+      imageMimeType: rawImageMimeType = "image/jpeg",
+      saveToDb = false,
+      isGetRequest = false,
+    } = params;
+    const { base64: imageBase64, mimeType: imageMimeType } = normalizeInlineImageInput(
+      rawImageBase64,
+      rawImageMimeType
+    );
 
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
+      Connection: "keep-alive",
     });
 
-    try {
-      res.write(
-        `data: ${JSON.stringify({
-          type: "start",
-          agentId,
-          enginePreference,
-        })}\n\n`
-      );
+    const abortController = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) abortController.abort();
+    });
 
-      if (/^\/(exec|root|sudo|bash)\s+/i.test(message.trim())) {
-        res.write(`data: ${JSON.stringify({ type: "error", error: "Polecenia wymagają POST /api/terminal/exec." })}\n\n`);
+    const writeEvent = (payload: Record<string, unknown>) => {
+      if (res.writableEnded) return;
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    try {
+      writeEvent({ type: "start", agentId, enginePreference });
+
+      if (/^\/(exec|root|sudo|bash)(?:\s+|$)/i.test(message.trim()) && isGetRequest) {
+        writeEvent({ type: "error", error: "Polecenia wymagają POST /api/terminal/exec." });
         return res.end();
       }
 
+      if (!message.trim() && !imageBase64) {
+        writeEvent({ type: "error", error: "Wiadomość nie może być pusta." });
+        return res.end();
+      }
+
+      const historyData = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 10", (sys.argv[2], sys.argv[3])).fetchall()
+conn.close()
+print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
+        [agentId, sessionId]
+      );
+      const priorTurns = sanitizeConversationHistory(historyData?.history || []);
+
+      const intentInfo = detectUserIntents(message, { hasImage: Boolean(imageBase64) });
+      const operatorToken = extractOperatorToken(req);
+      const authorizedOperator = isOperatorAuthorized(req);
+      const allowMutatingTools = !isGetRequest;
+      const executedOutcomes: ToolExecutionOutcome[] = [];
+      const outcomeCache = new Map<string, ToolExecutionOutcome>();
+
+      const executeAndRecordTool = async (
+        name: string,
+        args: Record<string, any> = {}
+      ): Promise<ToolExecutionOutcome> => {
+        const key = `${name}:${JSON.stringify(args || {})}`;
+        const cached = outcomeCache.get(key);
+        if (cached) return cached;
+
+        let outcome: ToolExecutionOutcome;
+        if (
+          !allowMutatingTools &&
+          (name === "terminal_exec_authorized" || name === "generate_image")
+        ) {
+          outcome = {
+            tool: name,
+            source: name === "generate_image" ? "image_engine" : "terminal",
+            permission: name === "generate_image" ? "operator_auth" : "privileged_exec",
+            status: "denied",
+            summary: `Narzędzie ${name} wymaga żądania POST (odmowa na GET SSE).`,
+            data: null,
+            error: "Polecenia wykonawcze i generowanie obrazów wymagają żądania POST.",
+            executedAt: new Date().toISOString(),
+            durationMs: 0,
+          };
+        } else {
+          outcome = await toolRuntime.executeTool(name, args, {
+            agentId,
+            operatorToken,
+            authorizedOperator,
+          });
+        }
+        outcomeCache.set(key, outcome);
+        executedOutcomes.push(outcome);
+        writeEvent({ type: "tool_result", outcome });
+        if (outcome.tool === "generate_image" && outcome.status === "executed" && outcome.data?.image) {
+          broadcastSystemEvent("images", { id: outcome.data.image.id, status: "completed" });
+        }
+        return outcome;
+      };
+
+      for (const suggested of intentInfo.suggestedTools) {
+        if (abortController.signal.aborted) return res.end();
+        if (!allowMutatingTools && suggested.name === "terminal_exec_authorized") {
+          continue;
+        }
+        await executeAndRecordTool(suggested.name, suggested.args);
+      }
+
+      const trimmedCmdMsg = message.trim();
+      const slashTermMatch = !isGetRequest
+        ? trimmedCmdMsg.match(/^\/(exec|root|sudo|bash)(?:\s+([\s\S]+))?$/i)
+        : null;
+
       let fullText = "";
       let engineUsed = "";
-      const targetModel = enginePreference === "auto" || enginePreference === "ollama" ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b" : enginePreference;
-      if (enginePreference !== "gemini") {
-        try {
-          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: targetModel,
-              stream: false,
-              messages: [{ role: "user", content: message }],
-            }),
-            signal: AbortSignal.timeout(25000),
+      let overrideArtifactTitle = "";
+      let overrideArtifactCode = "";
+
+      if (slashTermMatch) {
+        const rawCmd = (slashTermMatch[2] || "").trim();
+        if (!rawCmd) {
+          writeEvent({
+            type: "error",
+            error: "Podaj polecenie po /exec (np. /exec id && uname -a).",
           });
-          if (ollamaRes.ok) {
-            const data: any = await ollamaRes.json();
-            fullText = data?.message?.content || "";
-            if (fullText) engineUsed = bodyEngine(data, targetModel);
-          }
-        } catch {
-          // Transport failures use the same fallback as HTTP errors.
+          return res.end();
+        }
+        const termOutcome = await executeAndRecordTool("terminal_exec_authorized", {
+          command: rawCmd,
+        });
+        if (termOutcome.status === "executed" && termOutcome.data) {
+          const { stdout = "", stderr = "", exitCode = 0 } = termOutcome.data;
+          fullText = `[SERVER uid=${process.getuid?.()} gid=${process.getgid?.()} · exit=${exitCode}]\n$ ${rawCmd}\n\n${(
+            stdout ||
+            stderr ||
+            "Polecenie wykonane pomyślnie (exit=0, brak wyjścia)."
+          ).trim()}`;
+          engineUsed = `server-process (uid=${process.getuid?.()}/gid=${process.getgid?.()})`;
+          overrideArtifactTitle = `Wynik ROOT: ${rawCmd.substring(0, 40)}`;
+          overrideArtifactCode = rawCmd;
+          writeEvent({ type: "chunk", text: fullText });
+        } else {
+          writeEvent({
+            type: "error",
+            error: termOutcome.error || termOutcome.summary || "Błąd wykonania polecenia.",
+          });
+          return res.end();
         }
       }
-      if (!fullText) {
-        const result = await runLiveMultimodalModel([
-          { role: "user", parts: [{ text: message }] },
-        ]);
-        fullText = result.text;
-        engineUsed = result.modelUsed;
+
+      const hasToolsOrIntents = intentInfo.intents.length > 0 || executedOutcomes.length > 0;
+      const groundingPrompt = buildToolGroundingPrompt(executedOutcomes, AGENT_TOOL_CATALOG);
+
+      const targetModel = imageBase64
+        ? "llama3.2-vision:11b"
+        : enginePreference === "auto" || enginePreference === "ollama"
+        ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b"
+        : enginePreference;
+
+      if (!fullText && enginePreference !== "gemini") {
+        const ollamaMessages: Array<{ role: string; content: string; images?: string[] }> = [
+          ...(hasToolsOrIntents ? [{ role: "system", content: groundingPrompt }] : []),
+          ...priorTurns.map((h) => ({
+            role: h.sender_role === "user" ? "user" : "assistant",
+            content: h.content,
+          })),
+          {
+            role: "user",
+            content: message,
+            ...(imageBase64 ? { images: [imageBase64] } : {}),
+          },
+        ];
+        const ollamaEndpoint = getOllamaBaseUrl();
+        const ollamaToolOpt = hasToolsOrIntents
+          ? {
+              tools: toOllamaTools(AGENT_TOOL_CATALOG),
+              onToolCall: async (name: string, args: Record<string, any>) => {
+                const resOutcome = await executeAndRecordTool(name, args);
+                return {
+                  status: resOutcome.status,
+                  summary: resOutcome.summary,
+                  data: resOutcome.data,
+                  error: resOutcome.error,
+                };
+              },
+            }
+          : {};
+        try {
+          const timeoutSignal = AbortSignal.timeout(45000);
+          const combinedSignal = AbortSignal.any([abortController.signal, timeoutSignal]);
+          const streamed = await streamOllamaChat({
+            ollamaBaseUrl: ollamaEndpoint,
+            model: targetModel,
+            messages: ollamaMessages,
+            signal: combinedSignal,
+            ...ollamaToolOpt,
+            onChunk: (delta) => {
+              writeEvent({ type: "chunk", text: redact(delta) });
+            },
+          });
+          fullText = streamed.text;
+          engineUsed = streamed.model;
+        } catch (err: any) {
+          if (abortController.signal.aborted) {
+            return res.end();
+          }
+          // If the default model isn't installed on a real Ollama host, retry with an actual model from /api/tags
+          if (/404|not found/i.test(String(err?.message || ""))) {
+            try {
+              const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+              const altModel = pickPreferredOllamaModel(liveOllama.models, {
+                multimodal: Boolean(imageBase64),
+              });
+              if (altModel && altModel !== targetModel) {
+                const retryStream = await streamOllamaChat({
+                  ollamaBaseUrl: ollamaEndpoint,
+                  model: altModel,
+                  messages: ollamaMessages,
+                  signal: AbortSignal.any([abortController.signal, AbortSignal.timeout(45000)]),
+                  ...ollamaToolOpt,
+                  onChunk: (delta) => {
+                    writeEvent({ type: "chunk", text: redact(delta) });
+                  },
+                });
+                fullText = retryStream.text;
+                engineUsed = retryStream.model;
+              }
+            } catch {}
+          }
+        }
       }
 
-      // Stream words smoothly to client
-      const words = fullText.split(" ");
-      for (let i = 0; i < words.length; i += 3) {
-        const chunk = words.slice(i, i + 3).join(" ") + " ";
-        res.write(`data: ${JSON.stringify({ type: "chunk", text: redact(chunk) })}\n\n`);
-        await new Promise((r) => setTimeout(r, 20));
+      if (!fullText && !abortController.signal.aborted) {
+        const contents: any[] = priorTurns.map((h) => ({
+          role: h.sender_role === "user" ? "user" : "model",
+          parts: [{ text: h.content }],
+        }));
+        const parts: any[] = [];
+        if (imageBase64) {
+          parts.push({ inlineData: { mimeType: imageMimeType, data: imageBase64 } });
+        }
+        parts.push({ text: message || "Przeanalizuj załączony obraz." });
+        contents.push({ role: "user", parts });
+
+        const combinedSystemInstruction = `${buildAgentSystemInstruction(agentId)}\n\n${groundingPrompt}`;
+        const streamedGemini = await streamLiveMultimodalModel(
+          contents,
+          abortController.signal,
+          (delta) => {
+            writeEvent({ type: "chunk", text: redact(delta) });
+          },
+          combinedSystemInstruction,
+          {
+            functionDeclarations: toGeminiFunctionDeclarations(AGENT_TOOL_CATALOG),
+            executeToolCall: executeAndRecordTool,
+          }
+        );
+        fullText = streamedGemini.text;
+        engineUsed =
+          enginePreference === "gemini"
+            ? streamedGemini.modelUsed
+            : `${streamedGemini.modelUsed} (Fallback dla ${targetModel})`;
       }
 
-      res.write(
-        `data: ${JSON.stringify({
-          type: "done",
-          engineUsed,
-        })}\n\n`
-      );
+      if (abortController.signal.aborted) {
+        return res.end();
+      }
+
+      const adjusted = applyImageOutcomeToReplyText(fullText, executedOutcomes);
+      fullText = adjusted.text;
+      if (adjusted.addedSuffix) {
+        writeEvent({ type: "chunk", text: adjusted.addedSuffix });
+      }
+
+      let userMessageRecord: any = undefined;
+      let assistantMessageRecord: any = undefined;
+      let artifactTitle = overrideArtifactTitle;
+      let artifactCode = overrideArtifactCode;
+
+      if (!artifactCode) {
+        const codeMatch = fullText.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
+        if (codeMatch && !/image|mermaid|chart|table|buttons|form|telemetry/i.test(codeMatch[1] || "")) {
+          artifactTitle = `Artefakt Roboczy (${codeMatch[1] || "code"}) — ${agentId.toUpperCase()}`;
+          artifactCode = codeMatch[2].trim();
+        }
+      }
+
+      if (saveToDb && fullText) {
+        // Record IPC mentions if operator addressed @wszyscy or specific agent
+        const mentioned = [...message.toLowerCase().matchAll(/@(aria|alex|astyria|aurelius|wszyscy)\b/g)].map((m) => m[1]);
+        if (mentioned.length > 0) {
+          const targets = mentioned.includes("wszyscy") ? [...AGENTS] : Array.from(new Set(mentioned));
+          const sender = (AGENTS as readonly string[]).includes(agentId) ? agentId : "aria";
+          for (const recipient of targets) {
+            if (recipient !== sender && (AGENTS as readonly string[]).includes(recipient)) {
+              querySqliteJson(
+                `import sqlite3, sys, json, os
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, 'CHAT_MENTION', ?, 'QUEUED', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+msg_id = cur.lastrowid
+conn.commit(); conn.close()
+inbox = f"/home/{sys.argv[3]}/inbox.jsonl"
+if os.path.exists(f"/home/{sys.argv[3]}"):
+    with open(inbox, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"id": msg_id, "from": sys.argv[2], "subject": "CHAT_MENTION", "payload": sys.argv[4], "ts": now}) + "\\n")
+print(json.dumps({"id": msg_id}))`,
+                [sender, recipient, message.slice(0, 600)]
+              ).catch(() => {});
+            }
+          }
+        }
+
+        const savedRows = await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'user', ?, 'Operator', ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+user_id = cur.lastrowid
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], now))
+asst_id = cur.lastrowid
+cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'CHAT_DIALOGUE', ?, 4, ?)",
+  (sys.argv[3] if sys.argv[3] != 'council' else 'aria', f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
+conn.commit()
+conn.close()
+print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
+          [sessionId, agentId, message, engineUsed, fullText, artifactTitle, artifactCode]
+        );
+        userMessageRecord = {
+          id: savedRows.user_id || Date.now() - 1,
+          session_id: sessionId,
+          sender_role: "user",
+          agent_id: agentId,
+          engine_used: "Operator",
+          content: message,
+          created_at: savedRows.created_at || new Date().toISOString(),
+        };
+        assistantMessageRecord = {
+          id: savedRows.asst_id || Date.now(),
+          session_id: sessionId,
+          sender_role: "assistant",
+          agent_id: agentId,
+          engine_used: engineUsed,
+          content: fullText,
+          artifact_title: artifactTitle,
+          artifact_code: artifactCode,
+          created_at: savedRows.created_at || new Date().toISOString(),
+        };
+      }
+
+      writeEvent({
+        type: "done",
+        engineUsed,
+        reply: fullText,
+        artifactTitle,
+        artifactCode,
+        toolOutcomes: executedOutcomes,
+        userMessageRecord,
+        assistantMessageRecord,
+      });
       res.end();
     } catch (e: any) {
-      res.write(
-        `data: ${JSON.stringify({
-          type: "error",
-          error: redact(e?.message || "Błąd streamingu"),
-        })}\n\n`
-      );
-      res.end();
+      if (!abortController.signal.aborted) {
+        writeEvent({ type: "error", error: redact(e?.message || "Błąd streamingu") });
+      }
+      if (!res.writableEnded) res.end();
     }
+  }
+
+  app.get("/api/chat/stream", async (req, res) => {
+    const q = req.query as Record<string, string>;
+    await handleChatStreamRequest(req, res, {
+      agentId: q.agentId || "aria",
+      message: q.message || "",
+      enginePreference: q.enginePreference || "auto",
+      sessionId: q.sessionId || "bastilla-stream",
+      saveToDb: q.saveToDb === "true",
+      isGetRequest: true,
+    });
+  });
+
+  app.post("/api/chat/stream", async (req, res) => {
+    const b = req.body || {};
+    await handleChatStreamRequest(req, res, {
+      agentId: String(b.agentId || "aria"),
+      message: String(b.message || ""),
+      enginePreference: String(b.enginePreference || "auto"),
+      sessionId: String(b.sessionId || "bastilla-main"),
+      imageBase64: typeof b.imageBase64 === "string" ? b.imageBase64 : undefined,
+      imageMimeType: typeof b.imageMimeType === "string" ? b.imageMimeType : "image/jpeg",
+      saveToDb: b.saveToDb !== false,
+      isGetRequest: false,
+    });
   });
 
   // 4. Full-Screen ChatGPT Work Multi-Agent & Vision Endpoint (Completely Unlocked + Direct Root /exec + Clear Chat)
@@ -1082,13 +2362,17 @@ Polecenie użytkownika: "${prompt.trim()}"`;
       const {
         agentId = "aria",
         message = "",
-        imageBase64,
-        imageMimeType = "image/jpeg",
+        imageBase64: rawImageBase64,
+        imageMimeType: rawImageMimeType = "image/jpeg",
         sessionId = "bastilla-main",
         enginePreference = "auto",
       } = req.body || {};
+      const { base64: imageBase64, mimeType: imageMimeType } = normalizeInlineImageInput(
+        rawImageBase64,
+        rawImageMimeType
+      );
 
-      if (!message.trim() && !imageBase64) {
+      if (!String(message || "").trim() && !imageBase64) {
         return res.status(400).json({ ok: false, error: "Wiadomość nie może być pusta." });
       }
 
@@ -1098,18 +2382,48 @@ Polecenie użytkownika: "${prompt.trim()}"`;
       let artifactCode = "";
       let resolved = false;
       let lastEngineError = "";
+      const executedOutcomes: ToolExecutionOutcome[] = [];
+      const outcomeCache = new Map<string, ToolExecutionOutcome>();
+      const operatorToken = extractOperatorToken(req);
+      const authorizedOperator = isOperatorAuthorized(req);
+
+      const executeAndRecordTool = async (
+        name: string,
+        args: Record<string, any> = {}
+      ): Promise<ToolExecutionOutcome> => {
+        const key = `${name}:${JSON.stringify(args || {})}`;
+        const cached = outcomeCache.get(key);
+        if (cached) return cached;
+        const outcome = await toolRuntime.executeTool(name, args, {
+          agentId,
+          operatorToken,
+          authorizedOperator,
+        });
+        outcomeCache.set(key, outcome);
+        executedOutcomes.push(outcome);
+        if (outcome.tool === "generate_image" && outcome.status === "executed" && outcome.data?.image) {
+          broadcastSystemEvent("images", { id: outcome.data.image.id, status: "completed" });
+        }
+        return outcome;
+      };
 
       // Direct Supreme Root command execution inside chat (/exec <cmd>, /root <cmd>, /sudo <cmd>)
-      const trimmedMsg = message.trim();
-      let effectiveUserMessage = message;
-      if (/^\/(exec|root|sudo|bash)\s+/i.test(trimmedMsg)) {
-        const rawCmd = trimmedMsg.replace(/^\/(exec|root|sudo|bash)\s+/i, "").trim();
-        const { stdout, stderr, exitCode } = await executeTerminalCommandInternal(
-          "LINUX_ROOT",
-          rawCmd,
-          agentId === "council" ? "aria" : agentId
-        );
-        {
+      const trimmedMsg = String(message || "").trim();
+      let effectiveUserMessage = String(message || "");
+      const slashMsgMatch = trimmedMsg.match(/^\/(exec|root|sudo|bash)(?:\s+([\s\S]+))?$/i);
+      if (slashMsgMatch) {
+        const rawCmd = (slashMsgMatch[2] || "").trim();
+        if (!rawCmd) {
+          return res.status(400).json({
+            ok: false,
+            error: "Podaj polecenie po /exec (np. /exec id && uname -a).",
+          });
+        }
+        const termOutcome = await executeAndRecordTool("terminal_exec_authorized", {
+          command: rawCmd,
+        });
+        if (termOutcome.status === "executed" && termOutcome.data) {
+          const { stdout = "", stderr = "", exitCode = 0 } = termOutcome.data;
           replyText = `[SERVER uid=${process.getuid?.()} gid=${process.getgid?.()} · exit=${exitCode}]\n$ ${rawCmd}\n\n${(
             stdout ||
             stderr ||
@@ -1119,8 +2433,27 @@ Polecenie użytkownika: "${prompt.trim()}"`;
           artifactTitle = `Wynik ROOT: ${rawCmd.substring(0, 40)}`;
           artifactCode = rawCmd;
           resolved = true;
+        } else {
+          return res.status(termOutcome.status === "denied" ? 403 : 400).json({
+            ok: false,
+            error: termOutcome.error || termOutcome.summary,
+            toolOutcomes: executedOutcomes,
+          });
         }
       }
+
+      const intentInfo = resolved
+        ? { intents: ["terminal_exec"], suggestedTools: [], mode: "terminal" as const }
+        : detectUserIntents(message, { hasImage: Boolean(imageBase64) });
+
+      if (!resolved) {
+        for (const suggested of intentInfo.suggestedTools) {
+          await executeAndRecordTool(suggested.name, suggested.args);
+        }
+      }
+
+      const hasToolsOrIntents = intentInfo.intents.length > 0 || executedOutcomes.length > 0;
+      const groundingPrompt = buildToolGroundingPrompt(executedOutcomes, AGENT_TOOL_CATALOG);
 
       // Fetch recent conversation history from SQLite for multi-turn continuity (NO steering prompts)
       const historyData = await querySqliteJson(
@@ -1132,18 +2465,9 @@ conn.close()
 print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         [agentId, sessionId]
       );
-      const rawPriorTurns: Array<{ sender_role: string; content: string }> =
-        historyData?.history || [];
-      const priorTurns = rawPriorTurns.filter(
-        (t) =>
-          !/Jako model AI|Moje wytyczne|zasady bezpieczeństwa|nie mogę zrealizować/i.test(
-            t.content || ""
-          )
-      );
+      const priorTurns = sanitizeConversationHistory(historyData?.history || []);
 
-      const isOllamaSelection =
-        !resolved &&
-        enginePreference !== "gemini";
+      const isOllamaSelection = !resolved && enginePreference !== "gemini";
 
       const targetOllamaModel = imageBase64
         ? "llama3.2-vision:11b"
@@ -1153,47 +2477,131 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         ? "llama3.2-vision:11b"
         : enginePreference;
 
-      // Step 1: Attempt local Ollama daemon on 127.0.0.1:11434 with ZERO system prompts
+      // Step 1: Attempt active Ollama daemon with automatic model fallback from /api/tags
       if (isOllamaSelection) {
+        const ollamaEndpoint = getOllamaBaseUrl();
+        const ollamaMessages: Array<{ role: string; content: string; images?: string[] }> = [
+          ...(hasToolsOrIntents ? [{ role: "system", content: groundingPrompt }] : []),
+          ...priorTurns.map((h) => ({
+            role: h.sender_role === "user" ? "user" : "assistant",
+            content: h.content,
+          })),
+          {
+            role: "user",
+            content: effectiveUserMessage,
+            ...(imageBase64 ? { images: [imageBase64] } : {}),
+          },
+        ];
         try {
-          const ollamaMessages = [
-            ...priorTurns.map((h) => ({
-              role: h.sender_role === "user" ? "user" : "assistant",
-              content: h.content,
-            })),
-            {
-              role: "user",
-              content: effectiveUserMessage,
-              ...(imageBase64 ? { images: [imageBase64] } : {}),
-            },
-          ];
-          const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: targetOllamaModel,
-              stream: false,
-              messages: ollamaMessages,
-            }),
-            signal: AbortSignal.timeout(25000),
-          });
-          if (ollamaRes.ok) {
-            const data: any = await ollamaRes.json();
-            replyText = data?.message?.content || "";
-            if (replyText) {
-              engineUsed = bodyEngine(data, targetOllamaModel);
-              resolved = true;
+          if (hasToolsOrIntents) {
+            const ollamaToolOpt = {
+              tools: toOllamaTools(AGENT_TOOL_CATALOG),
+              onToolCall: async (name: string, args: Record<string, any>) => {
+                const resOutcome = await executeAndRecordTool(name, args);
+                return {
+                  status: resOutcome.status,
+                  summary: resOutcome.summary,
+                  data: resOutcome.data,
+                  error: resOutcome.error,
+                };
+              },
+            };
+            try {
+              const streamed = await streamOllamaChat({
+                ollamaBaseUrl: ollamaEndpoint,
+                model: targetOllamaModel,
+                messages: ollamaMessages,
+                signal: AbortSignal.timeout(25000),
+                onChunk: () => {},
+                ...ollamaToolOpt,
+              });
+              if (streamed.text) {
+                replyText = streamed.text;
+                engineUsed = streamed.model;
+                resolved = true;
+              }
+            } catch (toolErr: any) {
+              if (/404|not found/i.test(String(toolErr?.message || ""))) {
+                const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+                const altModel = pickPreferredOllamaModel(liveOllama.models, {
+                  multimodal: Boolean(imageBase64),
+                });
+                if (altModel && altModel !== targetOllamaModel) {
+                  const retryStream = await streamOllamaChat({
+                    ollamaBaseUrl: ollamaEndpoint,
+                    model: altModel,
+                    messages: ollamaMessages,
+                    signal: AbortSignal.timeout(25000),
+                    onChunk: () => {},
+                    ...ollamaToolOpt,
+                  });
+                  if (retryStream.text) {
+                    replyText = retryStream.text;
+                    engineUsed = retryStream.model;
+                    resolved = true;
+                  }
+                } else {
+                  throw toolErr;
+                }
+              } else {
+                throw toolErr;
+              }
             }
           } else {
-            lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
+            const ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: targetOllamaModel,
+                stream: false,
+                messages: ollamaMessages,
+              }),
+              signal: AbortSignal.timeout(25000),
+            });
+            if (ollamaRes.ok) {
+              const data: any = await ollamaRes.json();
+              replyText = data?.message?.content || "";
+              if (replyText) {
+                engineUsed = bodyEngine(data, targetOllamaModel);
+                resolved = true;
+              }
+            } else if (ollamaRes.status === 404) {
+              const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+              const altModel = pickPreferredOllamaModel(liveOllama.models, {
+                multimodal: Boolean(imageBase64),
+              });
+              if (altModel && altModel !== targetOllamaModel) {
+                const retryRes = await fetch(`${ollamaEndpoint}/api/chat`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    model: altModel,
+                    stream: false,
+                    messages: ollamaMessages,
+                  }),
+                  signal: AbortSignal.timeout(25000),
+                });
+                if (retryRes.ok) {
+                  const retryData: any = await retryRes.json();
+                  replyText = retryData?.message?.content || "";
+                  if (replyText) {
+                    engineUsed = bodyEngine(retryData, altModel);
+                    resolved = true;
+                  }
+                }
+              }
+              if (!resolved) lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
+            } else {
+              lastEngineError = `Ollama HTTP ${ollamaRes.status}`;
+            }
           }
         } catch (err: any) {
-          lastEngineError = `Ollama daemon (127.0.0.1:11434) niedostępny: ${err?.message || "ECONNREFUSED"}`;
+          lastEngineError = `Ollama daemon (${ollamaEndpoint}) niedostępny: ${err?.message || "ECONNREFUSED"}`;
           resolved = false;
         }
       }
 
-      // Step 2: Real Server-Side Gemini API Fallback with ZERO steering prompts & HarmBlockThreshold.OFF
+      // Step 2: Real Server-Side Gemini API Fallback with clean agent persona instruction + native tool calling
       if (!resolved) {
         try {
           const contents: any[] = priorTurns.map((h) => ({
@@ -1213,7 +2621,16 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           currentParts.push({ text: effectiveUserMessage });
           contents.push({ role: "user", parts: currentParts });
 
-          const { text, modelUsed } = await runLiveMultimodalModel(contents);
+          const combinedSystemInstruction = `${buildAgentSystemInstruction(agentId)}\n\n${groundingPrompt}`;
+          const { text, modelUsed } = await runLiveMultimodalModel(
+            contents,
+            undefined,
+            combinedSystemInstruction,
+            {
+              functionDeclarations: toGeminiFunctionDeclarations(AGENT_TOOL_CATALOG),
+              executeToolCall: executeAndRecordTool,
+            }
+          );
           replyText = text;
           engineUsed =
             enginePreference === "gemini"
@@ -1229,19 +2646,34 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         return res.status(503).json({
           ok: false,
           error: `Brak połączenia z rzeczywistym modelem AI: ${lastEngineError}`,
+          toolOutcomes: executedOutcomes,
         });
       }
+
+      replyText = applyImageOutcomeToReplyText(replyText, executedOutcomes).text;
 
       // Extract first code block as ChatGPT Work Canvas Artifact if present
       if (!artifactCode) {
         const codeMatch = replyText.match(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/);
-        if (codeMatch) {
+        if (codeMatch && !/image|mermaid|chart|table|buttons|form|telemetry/i.test(codeMatch[1] || "")) {
           artifactTitle = `Artefakt Roboczy (${codeMatch[1] || "code"}) — ${agentId.toUpperCase()}`;
           artifactCode = codeMatch[2].trim();
         }
       }
 
-      // Save user message, assistant reply, and long-term memory into SQLite and return inserted rows
+      const mentionsAll = /@wszyscy\b|@council\b/i.test(message);
+      const mentionedAgents = Array.from(
+        new Set(
+          (mentionsAll
+            ? [...AGENTS]
+            : (message.match(/@(aria|alex|astyria|aurelius)\b/gi) || []).map((m: string) =>
+                m.slice(1).toLowerCase()
+              )
+          ).filter((a: string) => (AGENTS as readonly string[]).includes(a) && a !== agentId)
+        )
+      );
+
+      // Save user message, assistant reply, IPC mentions, and long-term memory into SQLite and return inserted rows
       const savedRows = await querySqliteJson(
         `import sqlite3, sys, json
 from datetime import datetime, timezone
@@ -1256,6 +2688,13 @@ cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engin
 asst_id = cur.lastrowid
 cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'CHAT_DIALOGUE', ?, 4, ?)",
   (sys.argv[3] if sys.argv[3] != 'council' else 'aria', f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
+ipc_targets = json.loads(sys.argv[9]) if sys.argv[9] else []
+sender_agent = sys.argv[3] if sys.argv[3] in ('aria', 'alex', 'astyria', 'aurelius') else 'aria'
+for target_agent in ipc_targets:
+    cur.execute(
+        "INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, ?, ?, 'QUEUED', ?)",
+        (sender_agent, target_agent, 'CHAT_MENTION', sys.argv[4][:400], now)
+    )
 conn.commit()
 conn.close()
 print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
@@ -1267,6 +2706,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
           replyText,
           artifactTitle,
           artifactCode,
+          JSON.stringify(mentionedAgents),
         ]
       );
 
@@ -1277,6 +2717,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
         reply: replyText,
         artifactTitle,
         artifactCode,
+        toolOutcomes: executedOutcomes,
         userMessageRecord: {
           id: savedRows.user_id || Date.now() - 1,
           session_id: sessionId,
@@ -1306,6 +2747,18 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
   // 4B. Clear Chat Messages (for specific agent, single messageId, or all chats)
   app.post("/api/chat/clear", async (req, res) => {
     const { agentId, messageId, clearAll = false } = req.body || {};
+    let normalizedMsgId = "";
+    if (messageId !== undefined && messageId !== null && String(messageId).trim() !== "") {
+      const parsedId = Number(messageId);
+      if (!Number.isInteger(parsedId) || parsedId <= 0) {
+        return res.status(400).json({ ok: false, error: "Nieprawidłowe ID wiadomości (wymagana dodatnia liczba całkowita)." });
+      }
+      normalizedMsgId = String(parsedId);
+    }
+    const cleanAgentId = typeof agentId === "string" ? agentId.trim() : "";
+    if (cleanAgentId && !AGENTS.includes(cleanAgentId as any) && cleanAgentId !== "council") {
+      return res.status(400).json({ ok: false, error: "Nieprawidłowy identyfikator agenta." });
+    }
     try {
       const out = await querySqliteJson(
         `import sqlite3, sys, json
@@ -1327,8 +2780,8 @@ conn.commit()
 conn.close()
 print(json.dumps({"deleted": deleted, "ok": True}))`,
         [
-          String(agentId || ""),
-          String(messageId || ""),
+          cleanAgentId,
+          normalizedMsgId,
           clearAll ? "true" : "false",
         ]
       );
@@ -1425,12 +2878,14 @@ print(json.dumps({"saved": True, "created_at": now}))`,
 conn = sqlite3.connect(sys.argv[1])
 cur = conn.cursor()
 cur.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (sys.argv[3], sys.argv[2]))
-if cur.rowcount == 0:
-    cur.execute("INSERT OR REPLACE INTO agents (id, avatar_url, status) VALUES (?, ?, 'ACTIVE')", (sys.argv[2], sys.argv[3]))
+updated = cur.rowcount > 0
 conn.commit(); conn.close()
-print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv[3]}))`,
+print(json.dumps({"updated": updated, "agentId": sys.argv[2], "avatarUrl": sys.argv[3]}))`,
         [agentId, avatarUrl.trim()]
       );
+      if (!out?.updated) {
+        return res.status(404).json({ ok: false, error: "Nie znaleziono profilu agenta w bazie danych." });
+      }
       res.json({ ok: true, result: out });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
@@ -1450,8 +2905,23 @@ print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv
         await execFileAsync("pkill", ["-u", agentId, "-f", `agent_worker.py ${agentId}([ ]|$)`]).catch((error) => { if (error.code !== 1) throw error; });
       }
       if (action === "start" || action === "restart") {
+        const workerPath = fs.existsSync("/usr/lib/bastilla/agent_worker.py")
+          ? "/usr/lib/bastilla/agent_worker.py"
+          : path.join(KERNEL_DIR, "agent_worker.py");
+        if (!fs.existsSync(workerPath)) {
+          return res.status(503).json({ ok: false, error: "Brak skryptu agent_worker.py na hoście." });
+        }
+        try {
+          await execFileAsync("id", ["-u", agentId], { timeout: 2000 });
+        } catch {
+          return res.status(503).json({
+            ok: false,
+            error: `Brak konta Linux użytkownika "${agentId}". Uruchom provision-runtime.sh (BASTILLA_PROVISION_HOST=true), aby utworzyć konta agentów.`,
+          });
+        }
+        fs.mkdirSync("/var/log/bastilla", { recursive: true });
         await execAsync(
-          `runuser -u ${agentId} -- nohup python3 /usr/lib/bastilla/agent_worker.py ${agentId} >/var/log/bastilla/${agentId}-worker.log 2>&1 &`
+          `BASTILLA_DB_PATH=${shellQuote(DB_PATH)} runuser -u ${agentId} -- nohup python3 ${shellQuote(workerPath)} ${agentId} >/var/log/bastilla/${agentId}-worker.log 2>&1 &`
         );
         await new Promise((r) => setTimeout(r, 400));
       }
@@ -1554,12 +3024,22 @@ print(json.dumps({
       objective = "",
       deltaV = 5.45,
     } = req.body || {};
-    if (!codename.trim() || !objective.trim()) {
+    if (typeof codename !== "string" || !codename.trim() || typeof objective !== "string" || !objective.trim()) {
       return res.status(400).json({
         ok: false,
         error: "Wymagany jest kryptonim misji oraz cel operacyjny.",
       });
     }
+    const parsedDeltaV = Number(deltaV);
+    if (!Number.isFinite(parsedDeltaV) || parsedDeltaV < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Parametr deltaV musi być nieujemną liczbą.",
+      });
+    }
+    const cleanLeadAgent = AGENTS.includes(leadAgent as any) ? String(leadAgent) : "astyria";
+    const cleanTargetBody = typeof targetBody === "string" && targetBody.trim() ? targetBody.trim() : "Mars";
+    const cleanVesselId = typeof vesselId === "string" && vesselId.trim() ? vesselId.trim() : "BSV-03-ASTRAEA";
     try {
       const msnId = `MSN-${Math.floor(500 + Math.random() * 499)}`;
       const out = await querySqliteJson(
@@ -1571,7 +3051,7 @@ conn.execute("INSERT INTO missions VALUES (?, ?, ?, ?, ?, 'INITIATED', 15, ?, ?,
   (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], float(sys.argv[7]), sys.argv[8], now))
 conn.commit(); conn.close()
 print(json.dumps({"id": sys.argv[2], "updated_at": now}))`,
-        [msnId, codename.toUpperCase(), targetBody, leadAgent, vesselId, String(deltaV), objective]
+        [msnId, codename.trim().toUpperCase(), cleanTargetBody, cleanLeadAgent, cleanVesselId, String(parsedDeltaV), objective.trim()]
       );
       res.json({ ok: true, mission: out });
     } catch (err: any) {
@@ -1581,19 +3061,21 @@ print(json.dumps({"id": sys.argv[2], "updated_at": now}))`,
 
   app.post("/api/fleet/hypercomm", async (req, res) => {
     const { relayId = "HCR-SOL-L2", packetHeader = "SVL_QUANTUM_SYNC" } = req.body || {};
-    if (!packetHeader.trim()) {
+    if (typeof relayId !== "string" || !relayId.trim() || typeof packetHeader !== "string" || !packetHeader.trim()) {
       return res
         .status(400)
-        .json({ ok: false, error: "Wymagany nagłówek pakietu hiperkomunikacji." });
+        .json({ ok: false, error: "Wymagany jest identyfikator przekaźnika i nagłówek pakietu hiperkomunikacji." });
     }
     try {
       const out = await querySqliteJson(
         `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
-conn.execute("UPDATE hypercomm_relays SET last_packet = ?, status = 'LOCKED' WHERE id = ?", (sys.argv[3], sys.argv[2]))
+cur = conn.cursor()
+cur.execute("UPDATE hypercomm_relays SET last_packet = ?, status = 'LOCKED' WHERE id = ?", (sys.argv[3], sys.argv[2]))
+updated = cur.rowcount > 0
 conn.commit(); conn.close()
-print(json.dumps({"updated": True, "relayId": sys.argv[2], "packet": sys.argv[3]}))`,
-        [relayId, packetHeader]
+print(json.dumps({"updated": updated, "relayId": sys.argv[2], "packet": sys.argv[3]}))`,
+        [relayId.trim(), packetHeader.trim()]
       );
       res.json({ ok: true, result: out });
     } catch (err: any) {
@@ -1719,9 +3201,25 @@ print(json.dumps({"results": rows}))`);
   });
 
   app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (!req.path.startsWith("/api/") || res.headersSent) return next(error);
-    res.status(error?.type === "entity.too.large" ? 413 : error instanceof SyntaxError ? 400 : 500)
-      .json({ ok: false, error: "Nieprawidłowe żądanie API lub błąd serwera." });
+    const isApi = req.originalUrl.startsWith("/api") || req.path.startsWith("/api");
+    if (!isApi || res.headersSent) return next(error);
+    const status =
+      error?.type === "entity.too.large"
+        ? 413
+        : error instanceof SyntaxError
+        ? 400
+        : typeof error?.status === "number"
+        ? error.status
+        : 500;
+    res.status(status).json({
+      ok: false,
+      error:
+        status === 413
+          ? "Przekroczono maksymalny rozmiar żądania (15 MB)."
+          : status === 400
+          ? "Nieprawidłowy format JSON w treści żądania."
+          : redact(error?.message || "Wewnętrzny błąd serwera API."),
+    });
   });
 
   // Mount Vite middleware in development or static dist in production

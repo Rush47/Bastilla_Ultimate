@@ -11,6 +11,7 @@ import {
   History,
   MessageSquareShare,
 } from "lucide-react";
+import { apiFetchJson } from "../utils/apiClient";
 
 interface AgentsMemoryViewProps {
   overview: SystemOverviewResponse | null;
@@ -44,32 +45,38 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
     action: "restart" | "start" | "stop"
   ) => {
     setBusyAgent(`${agentId}-${action}`);
+    setIpcError("");
     try {
-      const response = await fetch("/api/agents/service", {
+      const result = await apiFetchJson<any>("/api/agents/service", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ agentId, action }),
       });
-      const result = await response.json();
-      if (!response.ok || result.exitCode) setIpcError(result.error || result.rootVerification || "Błąd wykonania.");
+      if (!result.ok || result.exitCode) {
+        setIpcError(result.error || result.rootVerification || "Błąd wykonania.");
+      }
       onRefresh();
-    } catch { setIpcError("Brak połączenia z serwerem."); } finally {
+    } catch (e: any) {
+      setIpcError(e?.message || "Brak połączenia z serwerem.");
+    } finally {
       setBusyAgent(null);
     }
   };
 
   const handleAutonomousRootCycle = async (agentId: AgentId) => {
     setBusyAgent(`${agentId}-autonomy`);
+    setIpcError("");
     try {
-      const response = await fetch("/api/agents/autonomy", {
+      const result = await apiFetchJson<any>("/api/agents/autonomy", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ agentId }),
       });
-      const result = await response.json();
-      if (!response.ok || result.exitCode) setIpcError(result.error || result.rootVerification || "Błąd wykonania.");
+      if (!result.ok || result.exitCode) {
+        setIpcError(result.error || result.rootVerification || "Błąd wykonania.");
+      }
       onRefresh();
-    } catch { setIpcError("Brak połączenia z serwerem."); } finally {
+    } catch (e: any) {
+      setIpcError(e?.message || "Brak połączenia z serwerem.");
+    } finally {
       setBusyAgent(null);
     }
   };
@@ -81,22 +88,24 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
       return;
     }
     setIpcError("");
-    const res = await fetch("/api/agents/ipc", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sender: ipcSender,
-        recipient: ipcRecipient,
-        subject: ipcSubject,
-        payload: ipcPayload,
-      }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      setIpcPayload("");
-      onRefresh();
-    } else {
-      setIpcError(data.error || "Błąd zapisu IPC");
+    try {
+      const data = await apiFetchJson<any>("/api/agents/ipc", {
+        method: "POST",
+        body: JSON.stringify({
+          sender: ipcSender,
+          recipient: ipcRecipient,
+          subject: ipcSubject,
+          payload: ipcPayload,
+        }),
+      });
+      if (data.ok) {
+        setIpcPayload("");
+        onRefresh();
+      } else {
+        setIpcError(data.error || "Błąd zapisu IPC");
+      }
+    } catch (e: any) {
+      setIpcError(e?.message || "Błąd zapisu IPC");
     }
   };
 
@@ -107,22 +116,24 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
       return;
     }
     setMemError("");
-    const res = await fetch("/api/agents/memory", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentId: memAgent,
-        category: memCategory,
-        content: memContent,
-        importance: 5,
-      }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      setMemContent("");
-      onRefresh();
-    } else {
-      setMemError(data.error || "Błąd zapisu pamięci");
+    try {
+      const data = await apiFetchJson<any>("/api/agents/memory", {
+        method: "POST",
+        body: JSON.stringify({
+          agentId: memAgent,
+          category: memCategory,
+          content: memContent,
+          importance: 5,
+        }),
+      });
+      if (data.ok) {
+        setMemContent("");
+        onRefresh();
+      } else {
+        setMemError(data.error || "Błąd zapisu pamięci");
+      }
+    } catch (e: any) {
+      setMemError(e?.message || "Błąd zapisu pamięci");
     }
   };
 

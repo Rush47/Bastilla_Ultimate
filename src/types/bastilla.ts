@@ -72,6 +72,28 @@ export interface TaskHistoryRecord {
   created_at: string;
 }
 
+export interface ToolExecutionOutcomeSummary {
+  tool: string;
+  source: "backend" | "mcp" | "image_engine" | "terminal";
+  permission: "public_diag" | "operator_auth" | "mcp_token_required" | "privileged_exec";
+  status: "executed" | "planned" | "unavailable" | "denied" | "error";
+  summary: string;
+  data: Record<string, any> | null;
+  error?: string;
+  executedAt: string;
+  durationMs: number;
+}
+
+export interface AgentToolCatalogItem {
+  name: string;
+  description: string;
+  source: "backend" | "mcp" | "image_engine" | "terminal";
+  permission: "public_diag" | "operator_auth" | "mcp_token_required" | "privileged_exec";
+  allowedAgents: string[];
+  usableNow: boolean;
+  availabilityNote: string;
+}
+
 export interface ChatMessageRecord {
   id: number;
   session_id: string;
@@ -82,6 +104,7 @@ export interface ChatMessageRecord {
   artifact_title?: string;
   artifact_code?: string;
   created_at: string;
+  toolOutcomes?: ToolExecutionOutcomeSummary[];
 }
 
 export interface FleetUnitRecord {
@@ -121,6 +144,67 @@ export interface HypercommRelayRecord {
   last_packet: string;
 }
 
+export interface OllamaStatusData {
+  state: "ONLINE" | "OFFLINE" | "MODEL LOADING" | "READY" | "BUSY" | "ERROR";
+  reachable: boolean;
+  endpoint: string;
+  version: string;
+  binaryPath: string;
+  binaryType: "native-elf" | "python-http-wrapper" | "missing";
+  daemonPid: number | null;
+  models: Array<{
+    name: string;
+    sizeBytes: number;
+    sizeGb: string;
+    parameterSize: string;
+    family: string;
+    multimodal: boolean;
+    uncensored: boolean;
+  }>;
+  modelNames: string[];
+  runningModels: Array<{ name: string; sizeBytes: number; processor: string }>;
+  activeRequests: number;
+  isGeminiBridge: boolean;
+  message: string;
+  checkedAt: string;
+}
+
+export interface ImageEnginesStatusData {
+  engineStatus: "READY" | "BRAK SILNIKA" | "ERROR";
+  activeSource: "comfyui" | "local" | "gemini" | null;
+  activeModel: string | null;
+  engines: Record<
+    "comfyui" | "local" | "gemini",
+    {
+      id: "comfyui" | "local" | "gemini";
+      label: string;
+      configured: boolean;
+      reachable: boolean;
+      model: string;
+      endpoint?: string;
+      error?: string;
+    }
+  >;
+  message: string;
+  checkedAt: string;
+}
+
+export interface GeneratedImageItem {
+  id: string;
+  prompt: string;
+  mode: "generate" | "edit" | "variation";
+  agent_id: string;
+  model: string;
+  source: string;
+  mime_type: string;
+  byte_size: number;
+  duration_ms: number;
+  status: "completed" | "failed";
+  error: string;
+  created_at: string;
+  url?: string;
+}
+
 export interface SystemOverviewResponse {
   ok: boolean;
   svl_report: SVLKernelReport;
@@ -158,10 +242,14 @@ export interface SystemOverviewResponse {
     primary_model: string;
     available_models: string[];
     ollama_online: boolean;
+    ollama_state?: OllamaStatusData["state"];
     fallback_model: string;
     gemini_configured: boolean;
     active_engine: string;
   };
+  ollama_status?: OllamaStatusData;
+  image_status?: ImageEnginesStatusData;
+  images?: GeneratedImageItem[];
   app_url: string;
 }
 

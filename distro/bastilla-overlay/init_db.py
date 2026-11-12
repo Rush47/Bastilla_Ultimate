@@ -160,6 +160,21 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
   lease_until TEXT, owner TEXT, idempotency_key TEXT UNIQUE
 );
 CREATE INDEX IF NOT EXISTS agent_tasks_pending ON agent_tasks(status,priority DESC,created_at);
+CREATE TABLE IF NOT EXISTS generated_images (
+  id TEXT PRIMARY KEY,
+  prompt TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'generate',
+  agent_id TEXT NOT NULL DEFAULT 'astyria',
+  model TEXT NOT NULL,
+  source TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  byte_size INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
 """)
 conn.commit()
 conn.close()

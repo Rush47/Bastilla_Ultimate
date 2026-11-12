@@ -9,6 +9,7 @@ const manager = new MCPServerManager(root, process.env.BASTILLA_DB_PATH || path.
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 function send(value: unknown) { process.stdout.write(JSON.stringify(value) + "\n"); }
 input.on("line", line => {
+  if (!line.trim()) return;
   let request: any;
   try { request = JSON.parse(line); } catch { send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }); return; }
   if (!request || request.jsonrpc !== "2.0" || typeof request.method !== "string") {

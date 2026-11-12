@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { DatabaseSync } from "node:sqlite";
 import type { CodexDeviceLogin, CodexStatus } from "../src/types/codex";
 
 export class CodexError extends Error {
@@ -244,19 +245,21 @@ export class CodexTaskManager extends EventEmitter {
     return sessionId;
   }
 
+  private withDb<T>(fn: (db: DatabaseSync) => T): T {
+    const db = new DatabaseSync(this.dbPath);
+    db.exec("PRAGMA busy_timeout=5000");
+    try {
+      return fn(db);
+    } finally {
+      db.close();
+    }
+  }
+
   private runSql(sql: string, params: any[] = []): CodexTaskRecord[] {
     try {
-      const pyScript = `
-import sqlite3, sys, json
-conn = sqlite3.connect(sys.argv[1])
-conn.row_factory = sqlite3.Row
-res = conn.execute(sys.argv[2], json.loads(sys.argv[3])).fetchall()
-conn.commit()
-conn.close()
-print(json.dumps([dict(r) for r in res]))
-`;
-      const out = execFileSync("python3", ["-c", pyScript, this.dbPath, sql, JSON.stringify(params)], { encoding: "utf8" });
-      return JSON.parse(out.trim() || "[]");
+      return this.withDb((db) =>
+        db.prepare(sql).all(...params) as unknown as CodexTaskRecord[]
+      );
     } catch (e: any) {
       console.error("CodexTaskManager SQLite error:", e?.message || e);
       return [];
@@ -265,18 +268,10 @@ print(json.dumps([dict(r) for r in res]))
 
   private runSqlRun(sql: string, params: any[] = []) {
     try {
-      const pyScript = `
-import sqlite3, sys, json
-conn = sqlite3.connect(sys.argv[1])
-cur = conn.cursor()
-cur.execute(sys.argv[2], json.loads(sys.argv[3]))
-last_id = cur.lastrowid
-conn.commit()
-conn.close()
-print(json.dumps({"last_id": last_id}))
-`;
-      const out = execFileSync("python3", ["-c", pyScript, this.dbPath, sql, JSON.stringify(params)], { encoding: "utf8" });
-      return JSON.parse(out.trim() || '{"last_id":0}');
+      return this.withDb((db) => {
+        const res = db.prepare(sql).run(...params);
+        return { last_id: Number(res.lastInsertRowid || 0) };
+      });
     } catch (e: any) {
       console.error("CodexTaskManager SQLite run error:", e?.message || e);
       return { last_id: 0 };
@@ -287,9 +282,13 @@ print(json.dumps({"last_id": last_id}))
     agentId: string,
     sessionId: string,
     prompt: string,
-    options?: { autoStart?: boolean; stdin?: string; operatorToken?: string }
+    options?: { autoStart?: boolean; stdin?: string; operatorToken?: string; localAuthorized?: boolean }
   ): number {
-    if (!this.verifyOperatorPermission(options?.operatorToken)) {
+    const tokenConfigured = Boolean(this.env.BASTILLA_API_TOKEN?.trim());
+    const authorized = tokenConfigured
+      ? this.verifyOperatorPermission(options?.operatorToken)
+      : Boolean(options?.localAuthorized);
+    if (!authorized) {
       throw new CodexError(403, "Brak uprawnień operatora do wykonywania zadań Codex CLI.");
     }
     const cleanAgent = ["aria", "alex", "astyria", "aurelius"].includes(agentId.toLowerCase())

@@ -9,6 +9,11 @@ import {
   Monitor,
   RefreshCw,
 } from "lucide-react";
+import {
+  apiFetchJson,
+  getExternalBackendUrl,
+  setExternalBackendUrl as persistExternalBackendUrl,
+} from "../utils/apiClient";
 
 interface DistroDiagnosticsViewProps {
   overview: SystemOverviewResponse | null;
@@ -25,44 +30,111 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   );
   const [syncResult, setSyncResult] = useState<any>(null);
   const [syncing, setSyncing] = useState<boolean>(false);
+  const [startingOllama, setStartingOllama] = useState<boolean>(false);
+  const [ollamaActionMsg, setOllamaActionMsg] = useState<string>("");
   const [mcpStatus, setMcpStatus] = useState<any>(null);
   const [mcpProbeOutput, setMcpProbeOutput] = useState<string>("");
   const [probingMcp, setProbingMcp] = useState<boolean>(false);
-  const [externalBackendUrl, setExternalBackendUrl] = useState<string>(() => {
-    try {
-      return localStorage.getItem("bastilla_external_backend_url") || (import.meta as any).env?.VITE_BACKEND_URL || "";
-    } catch {
-      return "";
-    }
-  });
+  const [externalBackendUrl, setExternalBackendUrl] = useState<string>(() =>
+    getExternalBackendUrl()
+  );
   const [externalBackendSaved, setExternalBackendSaved] = useState<string>("");
+  const [ollamaEndpointInput, setOllamaEndpointInput] = useState<string>(
+    overview?.ollama_status?.endpoint || "http://127.0.0.1:11434"
+  );
+  const [savingOllamaEndpoint, setSavingOllamaEndpoint] = useState<boolean>(false);
+  const [ollamaPullModel, setOllamaPullModel] = useState<string>("qwen2.5:7b");
+  const [pullingOllamaModel, setPullingOllamaModel] = useState<boolean>(false);
 
   const fetchGitStatus = async () => {
     try {
-      const res = await fetch("/api/git/status");
-      const data = await res.json();
+      const data = await apiFetchJson<any>("/api/git/status");
       if (data.ok) setGitInfo(data.git);
-    } catch {
-      // ignore
-    }
+    } catch {}
   };
 
   const fetchMcpStatus = async () => {
     try {
-      const res = await fetch("/api/mcp/status");
-      const data = await res.json();
+      const data = await apiFetchJson<any>("/api/mcp/status");
       if (data.ok) setMcpStatus(data);
-    } catch {
-      // ignore
+    } catch {}
+  };
+
+  const handleStartOllamaDaemon = async () => {
+    setStartingOllama(true);
+    setOllamaActionMsg("");
+    try {
+      const data = await apiFetchJson<{ ok: boolean; message?: string; error?: string }>(
+        "/api/ollama/start",
+        { method: "POST", body: "{}" }
+      );
+      setOllamaActionMsg(data.message || data.error || "Zaktualizowano status Ollama.");
+      onRefresh();
+    } catch (err: any) {
+      setOllamaActionMsg(err?.message || "Błąd komunikacji z /api/ollama/start");
+    } finally {
+      setStartingOllama(false);
+    }
+  };
+
+  const handleSaveOllamaEndpoint = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingOllamaEndpoint(true);
+    setOllamaActionMsg("");
+    try {
+      const data = await apiFetchJson<{
+        ok: boolean;
+        state?: string;
+        endpoint?: string;
+        modelNames?: string[];
+        message?: string;
+        error?: string;
+      }>("/api/ollama/config", {
+        method: "POST",
+        body: JSON.stringify({ endpoint: ollamaEndpointInput.trim() }),
+      });
+      if (data.endpoint) setOllamaEndpointInput(data.endpoint);
+      setOllamaActionMsg(
+        data.message || `Zapisano adres Ollama: ${data.endpoint} (${data.state})`
+      );
+      onRefresh();
+    } catch (err: any) {
+      setOllamaActionMsg(err?.message || "Nie udało się zapisać adresu Ollama.");
+    } finally {
+      setSavingOllamaEndpoint(false);
+    }
+  };
+
+  const handlePullOllamaModel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanModel = ollamaPullModel.trim();
+    if (!cleanModel) return;
+    setPullingOllamaModel(true);
+    setOllamaActionMsg("");
+    try {
+      const data = await apiFetchJson<{
+        ok: boolean;
+        message?: string;
+        error?: string;
+      }>("/api/ollama/pull", {
+        method: "POST",
+        body: JSON.stringify({ model: cleanModel }),
+        timeoutMs: 120000,
+      });
+      setOllamaActionMsg(data.message || data.error || `Zakończono pobieranie ${cleanModel}.`);
+      onRefresh();
+    } catch (err: any) {
+      setOllamaActionMsg(err?.message || `Błąd pobierania modelu ${cleanModel}.`);
+    } finally {
+      setPullingOllamaModel(false);
     }
   };
 
   const runMcpJsonRpcProbe = async () => {
     setProbingMcp(true);
     try {
-      const initRes = await fetch("/api/mcp", {
+      const initData = await apiFetchJson<any>("/api/mcp", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           jsonrpc: "2.0",
           id: 1,
@@ -74,18 +146,15 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
           },
         }),
       });
-      const initData = await initRes.json();
 
-      const listRes = await fetch("/api/mcp", {
+      const listData = await apiFetchJson<any>("/api/mcp", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           jsonrpc: "2.0",
           id: 2,
           method: "tools/list",
         }),
       });
-      const listData = await listRes.json();
 
       await fetchMcpStatus();
       setMcpProbeOutput(
@@ -103,41 +172,52 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   const handleSaveExternalBackend = (e: React.FormEvent) => {
     e.preventDefault();
     const cleaned = externalBackendUrl.trim().replace(/\/$/, "");
-    try {
-      if (cleaned) {
-        localStorage.setItem("bastilla_external_backend_url", cleaned);
-        setExternalBackendSaved(`Zapisano adres zewnętrznego backendu HTTPS: ${cleaned}`);
-      } else {
-        localStorage.removeItem("bastilla_external_backend_url");
-        setExternalBackendSaved("Przywrócono domyślny lokalny backend (/api/*).");
-      }
-    } catch {}
+    persistExternalBackendUrl(cleaned);
+    setExternalBackendUrl(cleaned);
+    if (cleaned) {
+      setExternalBackendSaved(`Zapisano adres zewnętrznego backendu HTTPS: ${cleaned}`);
+    } else {
+      setExternalBackendSaved("Przywrócono domyślny lokalny backend (/api/*).");
+    }
+    onRefresh();
   };
 
   useEffect(() => {
-    fetchGitStatus();
-    fetchMcpStatus();
+    void fetchGitStatus();
+    void fetchMcpStatus();
   }, []);
+
+  useEffect(() => {
+    if (overview?.ollama_status?.endpoint) {
+      setOllamaEndpointInput((prev) =>
+        prev === "http://127.0.0.1:11434" || !prev
+          ? overview.ollama_status!.endpoint
+          : prev
+      );
+    }
+  }, [overview?.ollama_status?.endpoint]);
 
   const handleGitSync = async (e: React.FormEvent) => {
     e.preventDefault();
     setSyncing(true);
     try {
-      const res = await fetch("/api/git/sync", {
+      const data = await apiFetchJson<any>("/api/git/sync", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           commitMessage: commitMsg,
           remoteUrl: "https://github.com/Rush47/Bastilla_Ultimate.git",
         }),
       });
-      const data = await res.json();
-      if (!res.ok) { setSyncResult({ push_status: "WYMAGANY PRZEGLĄD", push_detail: data.error }); }
       if (data.ok) {
         setSyncResult(data.sync);
-        fetchGitStatus();
+        void fetchGitStatus();
         onRefresh();
       }
+    } catch (err: any) {
+      setSyncResult({
+        push_status: "WYMAGANY PRZEGLĄD",
+        push_detail: err?.message || "Błąd synchronizacji Git",
+      });
     } finally {
       setSyncing(false);
     }
@@ -250,19 +330,65 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
                 <div className="text-cyan-300 font-semibold mt-0.5">{(mcpStatus.tools || []).join(", ") || "brak"}</div>
                 <div className="text-[11px] text-slate-400">Codex CLI Login: {mcpStatus.codexLoginVerified ? "Zweryfikowano" : "Niezweryfikowano"}</div>
               </div>
-              <div className="p-3 rounded bg-[#07090e] border border-slate-800">
-                <div className="text-slate-400 text-[10px]">MODELE AI (GEMINI / OLLAMA)</div>
+              <div className="p-3 rounded bg-[#07090e] border border-slate-800 space-y-1">
+                <div className="text-slate-400 text-[10px]">MODELE AI (OLLAMA / GEMINI)</div>
                 <div className="text-white font-semibold mt-0.5">
                   Gemini: {overview?.ai_routing?.gemini_configured ? "Skonfigurowany" : "Brak klucza"}
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  Ollama (127.0.0.1:11434): {overview?.ai_routing?.ollama_online ? "Online" : "Offline"}
+                  Ollama: {overview?.ollama_status?.state || (overview?.ai_routing?.ollama_online ? "ONLINE" : "OFFLINE")}
+                  {overview?.ollama_status?.binaryType ? ` (${overview.ollama_status.binaryType})` : ""}
                 </div>
+                <button
+                  type="button"
+                  onClick={() => void handleStartOllamaDaemon()}
+                  disabled={startingOllama}
+                  className="mt-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 text-[10px] font-semibold"
+                >
+                  {startingOllama ? "Uruchamianie..." : "Uruchom / Sprawdź Ollamę"}
+                </button>
               </div>
             </div>
           ) : (
             <div className="text-slate-400">Pobieranie statusu /api/mcp/status...</div>
           )}
+
+          {ollamaActionMsg && (
+            <div className="text-[11px] text-cyan-300 font-mono-tabular">
+              Ollama: {ollamaActionMsg}
+            </div>
+          )}
+
+          {/* Truthful Image Engine Availability Matrix */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 font-mono-tabular pt-2 border-t border-slate-800">
+            <div className="p-3 rounded bg-[#07090e] border border-slate-800">
+              <div className="text-slate-400 text-[10px]">COMFYUI (127.0.0.1:8188)</div>
+              <div className={overview?.image_status?.engines?.comfyui?.reachable ? "text-emerald-400 font-semibold mt-0.5" : "text-amber-300 font-semibold mt-0.5"}>
+                {overview?.image_status?.engines?.comfyui?.reachable ? "ONLINE" : "BRAK SILNIKA"}
+              </div>
+              <div className="text-[11px] text-slate-400 truncate">
+                {overview?.image_status?.engines?.comfyui?.endpoint || "127.0.0.1:8188"}
+              </div>
+            </div>
+            <div className="p-3 rounded bg-[#07090e] border border-slate-800">
+              <div className="text-slate-400 text-[10px]">LOCAL SD WEBUI (7860)</div>
+              <div className={overview?.image_status?.engines?.local?.reachable ? "text-emerald-400 font-semibold mt-0.5" : "text-amber-300 font-semibold mt-0.5"}>
+                {overview?.image_status?.engines?.local?.reachable ? "ONLINE" : "BRAK SILNIKA"}
+              </div>
+              <div className="text-[11px] text-slate-400 truncate">
+                {overview?.image_status?.engines?.local?.endpoint || "127.0.0.1:7860"}
+              </div>
+            </div>
+            <div className="p-3 rounded bg-[#07090e] border border-slate-800">
+              <div className="text-slate-400 text-[10px]">GEMINI IMAGE API</div>
+              <div className={overview?.image_status?.engines?.gemini?.configured ? "text-emerald-400 font-semibold mt-0.5" : "text-amber-300 font-semibold mt-0.5"}>
+                {overview?.image_status?.engines?.gemini?.configured ? "SKONFIGUROWANY" : "BRAK KLUCZA"}
+              </div>
+              <div className="text-[11px] text-slate-400 truncate">
+                {overview?.image_status?.engines?.gemini?.model || "gemini-3.1-flash-lite-image"}
+              </div>
+            </div>
+          </div>
 
           {mcpStatus?.warning && (
             <div className="text-[11px] text-amber-300 font-mono-tabular">
@@ -275,6 +401,66 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
               {mcpProbeOutput}
             </pre>
           )}
+
+          {/* Live Runtime Ollama URL + Safe Model Pull Controls */}
+          <div className="pt-3 border-t border-slate-800 grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <form onSubmit={handleSaveOllamaEndpoint} className="space-y-2">
+              <label htmlFor="ollama-base-url-input" className="block text-slate-300 font-semibold">
+                Punkt końcowy Ollama (OLLAMA_BASE_URL — lokalny lub zdalny tunel Linux):
+              </label>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  id="ollama-base-url-input"
+                  type="url"
+                  value={ollamaEndpointInput}
+                  onChange={(e) => setOllamaEndpointInput(e.target.value)}
+                  placeholder="http://127.0.0.1:11434"
+                  className="flex-1 px-3 py-2 rounded bg-[#07090e] border border-slate-700 text-white font-mono-tabular text-xs"
+                />
+                <button
+                  type="submit"
+                  disabled={savingOllamaEndpoint}
+                  className="px-4 py-2 rounded bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white font-semibold shrink-0"
+                >
+                  {savingOllamaEndpoint ? "Sprawdzanie..." : "Połącz Ollamę"}
+                </button>
+              </div>
+              {overview?.ollama_status?.message && (
+                <div className="text-[11px] text-slate-400 font-mono-tabular">
+                  {overview.ollama_status.message}
+                </div>
+              )}
+            </form>
+
+            <form onSubmit={handlePullOllamaModel} className="space-y-2">
+              <label htmlFor="ollama-pull-model-input" className="block text-slate-300 font-semibold">
+                Pobierz model Ollama (/api/pull z kontrolą dysku i RAM):
+              </label>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  id="ollama-pull-model-input"
+                  type="text"
+                  value={ollamaPullModel}
+                  onChange={(e) => setOllamaPullModel(e.target.value)}
+                  placeholder="qwen2.5:7b lub llama3.2-vision:11b"
+                  className="flex-1 px-3 py-2 rounded bg-[#07090e] border border-slate-700 text-white font-mono-tabular text-xs"
+                />
+                <button
+                  type="submit"
+                  disabled={pullingOllamaModel}
+                  className="px-4 py-2 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-cyan-300 font-semibold shrink-0"
+                >
+                  {pullingOllamaModel ? "Pobieranie..." : "Pobierz model"}
+                </button>
+              </div>
+              <div className="text-[11px] text-slate-400 font-mono-tabular">
+                Dostępne modele:{" "}
+                {(overview?.ollama_status?.modelNames || []).length > 0
+                  ? overview!.ollama_status!.modelNames.join(", ")
+                  : "brak (fallback na Gemini API)"}
+              </div>
+            </form>
+          </div>
 
           <form onSubmit={handleSaveExternalBackend} className="pt-2 border-t border-slate-800 space-y-2">
             <label htmlFor="external-https-backend" className="block text-slate-300 font-semibold">

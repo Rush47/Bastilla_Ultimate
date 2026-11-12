@@ -11,6 +11,7 @@ import {
   Radio,
   Shield,
 } from "lucide-react";
+import { apiFetchJson } from "../utils/apiClient";
 
 interface SolarSystem3DViewProps {
   overview: SystemOverviewResponse | null;
@@ -442,37 +443,42 @@ export const SolarSystem3DView: React.FC<SolarSystem3DViewProps> = ({
     const targetSpec = PLANETS.find((p) => p.name === msnTarget) || PLANETS[3];
     const deltaV = calculateHohmannTransferDeltaV(1.0, targetSpec.orbitAu);
 
-    const res = await fetch("/api/fleet/mission", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        codename: msnCodename,
-        targetBody: msnTarget,
-        leadAgent: msnAgent,
-        vesselId: "BSV-03-ASTRAEA",
-        objective: msnObjective,
-        deltaV,
-      }),
-    });
-    const data = await res.json();
-    if (data.ok) {
-      setMsnCodename("");
-      setMsnObjective("");
-      setActiveSubPanel("none");
-      onRefresh();
+    try {
+      const data = await apiFetchJson<any>("/api/fleet/mission", {
+        method: "POST",
+        body: JSON.stringify({
+          codename: msnCodename,
+          targetBody: msnTarget,
+          leadAgent: msnAgent,
+          vesselId: "BSV-03-ASTRAEA",
+          objective: msnObjective,
+          deltaV,
+        }),
+      });
+      if (data.ok) {
+        setMsnCodename("");
+        setMsnObjective("");
+        setActiveSubPanel("none");
+        onRefresh();
+      }
+    } catch (err: any) {
+      setMsnError(err?.message || "Błąd zapisu misji orbitalnej.");
     }
   };
 
   const handleSendHypercomm = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!packetHeader.trim()) return;
-    await fetch("/api/fleet/hypercomm", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ relayId, packetHeader }),
-    });
-    setActiveSubPanel("none");
-    onRefresh();
+    try {
+      await apiFetchJson("/api/fleet/hypercomm", {
+        method: "POST",
+        body: JSON.stringify({ relayId, packetHeader }),
+      });
+      setActiveSubPanel("none");
+      onRefresh();
+    } catch (err: any) {
+      setMsnError(err?.message || "Błąd transmisji hiperkomunikacji.");
+    }
   };
 
   return (

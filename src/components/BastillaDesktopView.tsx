@@ -19,6 +19,7 @@ import {
   GitBranch,
   HardDrive,
 } from "lucide-react";
+import { apiFetchJson } from "../utils/apiClient";
 
 export const AGENT_AVATARS: Record<AgentId, string> = {
   aria: ariaAvatar,
@@ -59,16 +60,14 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
   const handleRunSvlMaxUpgrade = async () => {
     setRunningSvl(true);
     try {
-      const res = await fetch("/api/svl/execute", {
+      const data = await apiFetchJson<any>("/api/svl/execute", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           xStart: xStartInput,
           xEnd: xEndInput,
           token: omniToken,
         }),
       });
-      const data = await res.json();
       if (data.ok) {
         setSvlOutput(data.raw_output || JSON.stringify(data.report, null, 2));
         onRefresh();

@@ -43,7 +43,12 @@ import {
   Radio,
   FileText,
   Eye,
+  Download,
+  ZoomIn,
+  X,
+  ImageOff,
 } from "lucide-react";
+import { apiFetchJson, buildApiUrl } from "../../utils/apiClient";
 import {
   MetricCardSchema,
   StatsGridSchema,
@@ -257,37 +262,36 @@ export const InteractiveActionButtonGroup: React.FC<{
     try {
       if (btn.actionType === "exec_root") {
         const cmd = btn.payload;
-        const res = await fetch("/api/terminal/exec", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode: "LINUX_ROOT", command: cmd }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          const out = (data.stdout || data.stderr || "Wykonano pomyślnie (exit=0)").trim();
-          setFeedback({
-            idx,
-            text: out.length > 120 ? out.substring(0, 120) + "..." : out,
-            ok: data.exitCode === 0,
-          });
+        if (onExecuteCommand) {
+          onExecuteCommand(`/exec ${cmd}`);
+          setFeedback({ idx, text: `Wysłano do czatu: ${cmd}`, ok: true });
         } else {
-          setFeedback({ idx, text: data.error || "Błąd wykonania", ok: false });
+          const data = await apiFetchJson<any>("/api/terminal/exec", {
+            method: "POST",
+            body: JSON.stringify({ mode: "LINUX_ROOT", command: cmd }),
+          });
+          if (data.ok) {
+            const out = (data.stdout || data.stderr || "Wykonano pomyślnie (exit=0)").trim();
+            setFeedback({
+              idx,
+              text: out.length > 120 ? out.substring(0, 120) + "..." : out,
+              ok: data.exitCode === 0,
+            });
+          } else {
+            setFeedback({ idx, text: data.error || "Błąd wykonania", ok: false });
+          }
         }
-        onExecuteCommand?.(`/exec ${cmd}`);
       } else if (btn.actionType === "exec_python") {
         const cmd = btn.payload;
-        const res = await fetch("/api/terminal/exec", {
+        const data = await apiFetchJson<any>("/api/terminal/exec", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ mode: "PYTHON_ROOT", command: cmd }),
         });
-        const data = await res.json();
         setFeedback({
           idx,
           text: (data.stdout || data.stderr || "Skrypt python wykonany").trim(),
           ok: data.exitCode === 0,
         });
-        onExecuteCommand?.(`/exec python3 -c "${cmd}"`);
       } else if (btn.actionType === "copy_text") {
         navigator.clipboard?.writeText(btn.payload);
         setFeedback({ idx, text: "Skopiowano do schowka", ok: true });
@@ -386,12 +390,10 @@ export const InteractiveCodeSandboxBox: React.FC<{
     setRunning(true);
     try {
       const mode = isPython ? "PYTHON_ROOT" : "LINUX_ROOT";
-      const res = await fetch("/api/terminal/exec", {
+      const data = await apiFetchJson<any>("/api/terminal/exec", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode, command: code }),
       });
-      const data = await res.json();
       if (data.ok) {
         setResult({
           stdout: data.stdout,
@@ -404,11 +406,6 @@ export const InteractiveCodeSandboxBox: React.FC<{
           exitCode: 1,
         });
       }
-      onExecuteCommand?.(
-        isPython
-          ? `/exec python3 -c '${code.replace(/'/g, "'\\''")}'`
-          : `/exec ${code}`
-      );
     } catch (e: any) {
       setResult({
         stderr: e?.message || "Błąd komunikacji z procesem root",
@@ -883,14 +880,16 @@ export const GenerativeComponentRenderer: React.FC<ComponentRendererProps> = ({
             <button
               type="button"
               onClick={async () => {
+                if (onExecuteCommand) {
+                  onExecuteCommand(`/exec ${cmd}`);
+                  return;
+                }
                 try {
-                  await fetch("/api/terminal/exec", {
+                  await apiFetchJson("/api/terminal/exec", {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ mode: "LINUX_ROOT", command: cmd }),
                   });
                 } catch {}
-                onExecuteCommand?.(`/exec ${cmd}`);
               }}
               className="w-full px-2 py-1 rounded bg-violet-600/90 hover:bg-violet-500 text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all shadow-sm active:scale-95"
               title={`Wykonaj w ROOT: ${cmd}`}
@@ -1256,18 +1255,7 @@ export const GenerativeComponentRenderer: React.FC<ComponentRendererProps> = ({
     case "image_viewer": {
       const parsed = ImageViewerSchema.safeParse(props);
       if (!parsed.success) return null;
-      const { title, url, base64, caption } = parsed.data;
-      const src = base64 ? `data:image/jpeg;base64,${base64}` : url;
-
-      return (
-        <div className="p-3 rounded-lg bg-[#0c1018] border border-slate-800 my-2 space-y-2">
-          {title && <div className="text-xs font-semibold text-white">{title}</div>}
-          {src && (
-            <img src={src} alt={title || "Podgląd"} className="rounded max-h-60 w-auto mx-auto object-contain" />
-          )}
-          {caption && <div className="text-[10px] text-slate-400 text-center">{caption}</div>}
-        </div>
-      );
+      return <ImageViewerCard data={parsed.data} onAction={onAction} />;
     }
 
     // ========================================================================
@@ -1577,35 +1565,18 @@ export function extractGenerativeUI(
     return "";
   });
 
-  // 7.4 Dalle / Qwen Image Action JSON Parser (e.g. "action": "dalle.text2im")
-  const dalleJsonRegex = /```(?:json)?\s*\n([\s\S]*?"action"\s*:\s*"dalle\.text2im"[\s\S]*?)`{2,4}/gi;
-  workingText = workingText.replace(dalleJsonRegex, (_, jsonContent) => {
-    const promptText = extractPromptFromDalleJson(jsonContent);
-    const imageUrl = getUniqueImageForPrompt(promptText);
-
+  // 7.4 Balanced-brace extraction for leaked dalle.text2im / {"thought": ...} JSON payloads
+  workingText = stripLeakedDalleAndThoughtJson(workingText, (promptText, thoughtText) => {
     return addComp({
-      id: `img-gen-${Math.random().toString(36).substring(2, 9)}`,
+      id: `img-legacy-${Math.random().toString(36).substring(2, 9)}`,
       type: "image_viewer",
       props: {
-        title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
-        url: imageUrl,
-        caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
-      },
-    });
-  });
-
-  // Also catch raw or escaped JSON objects with "action": "dalle.text2im" without markdown fences
-  const rawDalleRegex = /\{\s*"action"\s*:\s*"dalle\.text2im"[\s\S]*?\}/gi;
-  workingText = workingText.replace(rawDalleRegex, (fullMatch) => {
-    const promptText = extractPromptFromDalleJson(fullMatch);
-    const imageUrl = getUniqueImageForPrompt(promptText);
-    return addComp({
-      id: `img-gen-raw-${Math.random().toString(36).substring(2, 9)}`,
-      type: "image_viewer",
-      props: {
-        title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
-        url: imageUrl,
-        caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
+        title: "Żądanie generowania obrazu (legacy payload)",
+        prompt: promptText,
+        caption: thoughtText
+          ? `${thoughtText} · Kliknij poniżej, aby wygenerować prawdziwy obraz przez aktywny silnik.`
+          : "Wykryto zapis tekstowy narzędzia obrazu bez pliku graficznego.",
+        error: "Brak wygenerowanego pliku binarnego w historii — wymagane uruchomienie rzeczywistego silnika obrazów.",
       },
     });
   });
@@ -1619,13 +1590,18 @@ export function extractGenerativeUI(
       try {
         imgObj = JSON.parse(trimmed);
       } catch {
-        // If not JSON, treat the whole content as URL or caption
-        const urlMatch = trimmed.match(/https?:\/\/[^\s]+/i);
-        imgObj = {
-          title: "Obraz z Internetu / Zasób AI",
-          url: urlMatch ? urlMatch[0] : "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=800&auto=format&fit=crop",
-          caption: trimmed,
-        };
+        const urlMatch = trimmed.match(/(?:https?:\/\/|\/api\/images\/file\/)[^\s]+/i);
+        imgObj = urlMatch
+          ? {
+              title: "Wygenerowany zasób graficzny",
+              url: urlMatch[0],
+              caption: trimmed.replace(urlMatch[0], "").trim() || undefined,
+            }
+          : {
+              title: "Brak adresu obrazu",
+              prompt: trimmed,
+              error: "Nie dostarczono prawidłowego adresu URL ani danych binarnych obrazu.",
+            };
       }
       const validated = ImageViewerSchema.safeParse(imgObj);
       if (validated.success) {
@@ -2037,62 +2013,291 @@ export function extractGenerativeUI(
   return { cleanText, components: orderedComponents, segments };
 }
 
-function getUniqueImageForPrompt(prompt: string): string {
-  const photos = [
-    "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop", // futuristic city / nature
-    "https://images.unsplash.com/photo-1506744038136-46273834b3fb?q=80&w=1000&auto=format&fit=crop", // serene landscape / waterfall
-    "https://images.unsplash.com/photo-1519501025264-65ba15a82390?q=80&w=1000&auto=format&fit=crop", // cyberpunk neon city
-    "https://images.unsplash.com/photo-1451187580459-43490279c0fa?q=80&w=1000&auto=format&fit=crop", // deep space galaxy nebula
-    "https://images.unsplash.com/photo-1534447677768-be436bb09401?q=80&w=1000&auto=format&fit=crop", // surreal cosmic abstract
-    "https://images.unsplash.com/photo-1550684848-fac1c5b4e853?q=80&w=1000&auto=format&fit=crop", // glowing neon digital portal
-    "https://images.unsplash.com/photo-1634017839464-5c339ebe3cb4?q=80&w=1000&auto=format&fit=crop", // quantum crystal abstract
-    "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?q=80&w=1000&auto=format&fit=crop", // majestic mountain range sunset
-    "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1000&auto=format&fit=crop", // bio-architecture organic building
-    "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?q=80&w=1000&auto=format&fit=crop", // tropical beach paradise
-    "https://images.unsplash.com/photo-1518770660439-4636190af475?q=80&w=1000&auto=format&fit=crop", // microchip / quantum circuit
-    "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?q=80&w=1000&auto=format&fit=crop", // abstract gradient colorful art
-  ];
-  let hash = 0;
-  for (let i = 0; i < prompt.length; i++) {
-    hash = (hash << 5) - hash + prompt.charCodeAt(i);
-    hash |= 0;
+const ImageViewerCard: React.FC<{
+  data: {
+    id?: string;
+    title?: string;
+    url?: string;
+    base64?: string;
+    caption?: string;
+    prompt?: string;
+    model?: string;
+    source?: string;
+    mimeType?: string;
+    durationMs?: number;
+    createdAt?: string;
+    error?: string;
+  };
+  onAction?: (actionType: string, payload: any) => void;
+}> = ({ data, onAction }) => {
+  const [imgFailed, setImgFailed] = useState(false);
+  const [zoomOpen, setZoomOpen] = useState(false);
+
+  const resolvedUrl = data.base64
+    ? `data:${data.mimeType || "image/png"};base64,${data.base64}`
+    : data.url
+    ? data.url.startsWith("/api/")
+      ? buildApiUrl(data.url)
+      : data.url
+    : "";
+
+  const downloadName = `bastilla_${data.id || "image"}.${
+    (data.mimeType || "").includes("jpeg")
+      ? "jpg"
+      : (data.mimeType || "").includes("webp")
+      ? "webp"
+      : "png"
+  }`;
+
+  return (
+    <>
+      <div className="p-3 rounded-lg bg-[#0c1018] border border-slate-800 my-2 space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-xs font-semibold text-white truncate">
+            {data.title || "Wygenerowany Obraz"}
+          </div>
+          {(data.model || data.source || data.mimeType || data.durationMs) && (
+            <div className="text-[10px] font-mono-tabular text-slate-400 flex flex-wrap items-center gap-1.5">
+              {data.source && <span className="text-cyan-300">{data.source}</span>}
+              {data.model && <span>· {data.model}</span>}
+              {data.mimeType && <span>· {data.mimeType}</span>}
+              {typeof data.durationMs === "number" && (
+                <span>· {(data.durationMs / 1000).toFixed(1)}s</span>
+              )}
+              {data.id && <span>· #{data.id}</span>}
+            </div>
+          )}
+        </div>
+
+        {resolvedUrl && !imgFailed ? (
+          <div className="relative group rounded-lg overflow-hidden bg-[#07090e] border border-slate-800/80">
+            <img
+              src={resolvedUrl}
+              alt={data.prompt || data.title || "Wygenerowany obraz"}
+              referrerPolicy="no-referrer"
+              onError={() => setImgFailed(true)}
+              onClick={() => setZoomOpen(true)}
+              className="rounded max-h-80 w-auto mx-auto object-contain cursor-zoom-in"
+            />
+            <div className="flex flex-wrap items-center justify-end gap-2 px-2 py-1.5 border-t border-slate-800/80 bg-[#090d14]">
+              <button
+                type="button"
+                onClick={() => setZoomOpen(true)}
+                className="min-h-8 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-medium flex items-center gap-1"
+              >
+                <ZoomIn className="w-3 h-3" />
+                Powiększ
+              </button>
+              <a
+                href={resolvedUrl}
+                download={downloadName}
+                className="min-h-8 px-2.5 py-1 rounded bg-violet-600/80 hover:bg-violet-500 text-white text-[11px] font-medium flex items-center gap-1"
+              >
+                <Download className="w-3 h-3" />
+                Pobierz
+              </a>
+              {data.prompt && onAction && (
+                <button
+                  type="button"
+                  onClick={() => onAction("generate_image", data.prompt)}
+                  className="min-h-8 px-2.5 py-1 rounded bg-cyan-700/70 hover:bg-cyan-600 text-white text-[11px] font-medium flex items-center gap-1"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  Wariant
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-800/60 text-xs text-amber-200 space-y-2">
+            <div className="flex items-center gap-2 font-semibold">
+              <ImageOff className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>
+                {imgFailed
+                  ? "Nie udało się wczytać pliku graficznego z serwera."
+                  : data.error || "BRAK SILNIKA / Brak wyrenderowanego pliku obrazu."}
+              </span>
+            </div>
+            {data.prompt && (
+              <div className="text-[11px] text-slate-300 font-mono-tabular">
+                Prompt: {data.prompt}
+              </div>
+            )}
+            {data.prompt && onAction && (
+              <button
+                type="button"
+                onClick={() => onAction("generate_image", data.prompt)}
+                className="min-h-10 px-3 py-1.5 rounded bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold inline-flex items-center gap-1.5"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                Wygeneruj przez prawdziwy silnik obrazów
+              </button>
+            )}
+          </div>
+        )}
+
+        {data.caption && (
+          <div className="text-[11px] text-slate-400 break-words">{data.caption}</div>
+        )}
+      </div>
+
+      {zoomOpen && resolvedUrl && !imgFailed && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Podgląd pełnoekranowy obrazu"
+          onClick={() => setZoomOpen(false)}
+          className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative max-w-5xl max-h-[90vh] flex flex-col items-center gap-3"
+          >
+            <button
+              type="button"
+              onClick={() => setZoomOpen(false)}
+              aria-label="Zamknij podgląd"
+              className="self-end min-h-11 min-w-11 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-white flex items-center gap-1.5 text-xs"
+            >
+              <X className="w-4 h-4" />
+              Zamknij
+            </button>
+            <img
+              src={resolvedUrl}
+              alt={data.prompt || data.title || "Podgląd obrazu"}
+              referrerPolicy="no-referrer"
+              className="max-h-[78vh] w-auto rounded-lg border border-slate-700 object-contain"
+            />
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
+
+function findBalancedJsonSpan(text: string, startIdx: number): number {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) return i + 1;
+      }
+    }
   }
-  const index = Math.abs(hash) % photos.length;
-  return photos[index];
+  return -1;
+}
+
+function stripLeakedDalleAndThoughtJson(
+  input: string,
+  onDalleFound: (promptText: string, thoughtText?: string) => string
+): string {
+  // 1. Replace fenced json blocks containing dalle.text2im or raw thought/action JSON
+  let text = input.replace(
+    /```(?:json)?\s*\n([\s\S]*?)`{2,4}/gi,
+    (fullMatch, inner) => {
+      if (/"action"\s*:\s*"dalle\.text2im"/i.test(inner)) {
+        const prompt = extractPromptFromDalleJson(inner);
+        return onDalleFound(prompt);
+      }
+      return fullMatch;
+    }
+  );
+
+  // 2. Walk the string for balanced `{ ... }` objects containing `"action": "dalle.text2im"` or leaked `"thought":`
+  let cursor = 0;
+  let result = "";
+  while (cursor < text.length) {
+    const braceIdx = text.indexOf("{", cursor);
+    if (braceIdx === -1) {
+      result += text.slice(cursor);
+      break;
+    }
+    const endIdx = findBalancedJsonSpan(text, braceIdx);
+    if (endIdx === -1) {
+      result += text.slice(cursor);
+      break;
+    }
+    const candidate = text.slice(braceIdx, endIdx);
+    const hasDalle = /"action"\s*:\s*"dalle\.text2im"/i.test(candidate);
+    const hasThought = /"thought"\s*:/i.test(candidate) && (hasDalle || /"action_input"\s*:/i.test(candidate));
+    if (hasDalle || hasThought) {
+      result += text.slice(cursor, braceIdx);
+      const prompt = extractPromptFromDalleJson(candidate);
+      let thoughtText: string | undefined;
+      try {
+        const parsed = JSON.parse(candidate);
+        if (typeof parsed?.thought === "string" && parsed.thought.trim()) {
+          thoughtText = parsed.thought.trim();
+        }
+      } catch {
+        const tm = candidate.match(/"thought"\s*:\s*"((?:\\.|[^"\\])*)"/);
+        if (tm?.[1]) {
+          thoughtText = tm[1].replace(/\\"/g, '"').replace(/\\n/g, " ").trim();
+        }
+      }
+      result += onDalleFound(prompt, thoughtText);
+      cursor = endIdx;
+      continue;
+    }
+    result += text.slice(cursor, braceIdx + 1);
+    cursor = braceIdx + 1;
+  }
+
+  // 3. Clean up any broken legacy tail fragments like `",\n"thought": "..."\n}` left in DB history
+  result = result.replace(/(?:^|\n)\s*["',]*\s*\n?\s*"thought"\s*:\s*"[\s\S]*?"\s*\n?\s*\}/gi, "");
+  return result;
 }
 
 function extractPromptFromDalleJson(content: string): string {
-  const m1 = content.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
-  if (m1 && m1[1]) return m1[1].replace(/\\"/g, '"');
-
-  const m2 = content.match(/["']action_input["']\s*:\s*["']([^"']+)["']/i);
-  if (m2 && m2[1]) {
-    const inner = m2[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    const m3 = inner.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
-    if (m3 && m3[1]) return m3[1].replace(/\\"/g, '"');
-    return inner;
-  }
-
   try {
-    const cleaned = content.trim().replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    const parsed = JSON.parse(cleaned);
-    if (parsed.action_input) {
+    const parsed = JSON.parse(content.trim());
+    if (parsed?.action_input) {
       if (typeof parsed.action_input === "object" && parsed.action_input.prompt) {
         return String(parsed.action_input.prompt);
       }
       if (typeof parsed.action_input === "string") {
         try {
-          const innerObj = JSON.parse(parsed.action_input.replace(/\\"/g, '"'));
-          if (innerObj.prompt) return String(innerObj.prompt);
+          const innerObj = JSON.parse(parsed.action_input);
+          if (innerObj?.prompt) return String(innerObj.prompt);
         } catch {
           const m = parsed.action_input.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
           if (m && m[1]) return m[1];
         }
+        return parsed.action_input;
       }
     }
+    if (parsed?.prompt) return String(parsed.prompt);
   } catch {}
 
-  return "Futurystyczny pejzaż z elementami natury";
+  const m2 = content.match(/["']action_input["']\s*:\s*["']((?:\\.|[^"'\\])+)["']/i);
+  if (m2 && m2[1]) {
+    const inner = m2[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    const m3 = inner.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
+    if (m3 && m3[1]) return m3[1];
+    return inner;
+  }
+
+  const m1 = content.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
+  if (m1 && m1[1]) return m1[1].replace(/\\"/g, '"');
+
+  return "Wygeneruj obraz na podstawie opisu";
 }
 
 
