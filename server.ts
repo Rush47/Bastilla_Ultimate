@@ -421,7 +421,7 @@ async function startServer() {
       const name = message.params?.name;
       if (typeof name !== "string" || !mcp.listTools().tools.some(t => t.name === name))
         return fail(-32602, "Unknown tool");
-      const bearer = req.get("authorization")?.replace(/^Bearer\\s+/i, "") || "";
+      const bearer = req.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
       try {
         const result = mcp.executeTool(name, message.params?.arguments || {}, bearer);
         return reply({ content: [{ type: "text", text: JSON.stringify(result) }] });
