@@ -31,8 +31,7 @@ Do rzeczywistych odpowiedzi AI potrzebna jest działająca usługa Ollama pod
 `OLLAMA_BASE_URL` z modelem wybranym w panelu albo `GEMINI_API_KEY` w `.env`.
 Bez tych integracji panel nadal działa, a czat zgłasza brak połączenia.
 Opcjonalny `BASTILLA_OLLAMA_BRIDGE=true` uruchamia dotychczasowy most zgodności
-AI Studio na porcie 11434; jego katalog modeli jest statyczny i nie potwierdza
-instalacji lokalnych wag Ollama.
+AI Studio na porcie 11435; jego pusty katalog nie deklaruje instalacji lokalnych wag Ollama.
 
 ## Weryfikacja i produkcja
 
@@ -43,7 +42,7 @@ npm run build
 NODE_ENV=production npm start
 ```
 
-Testy API używają tymczasowej bazy i lokalnej atrapy usługi modelu. Sprawdzają
+Testy API używają tymczasowej bazy i jawnie testowej usługi modelu. Sprawdzają
 migrację, zapis danych, wykonanie SVL, katalog terminala, rozdzielenie sesji czatu,
 routing SSE i raportowanie niedostępnego modelu oraz błędów bazy.
 Nie wymagają kluczy API ani kont systemowych agentów.
@@ -84,3 +83,33 @@ API: `GET /api/codex/status` i `POST /api/codex/auth` z akcją `status`,
 tokenów i zbiorczego usuwania blokad zwracają błąd bez zmieniania plików.
 Logowanie wymaga dostępu sieciowego do usług uwierzytelniania OpenAI;
 dziedziczy ustawienia proxy i zaufanych certyfikatów serwera.
+
+## Kolejka agentów i panel mobilny
+
+Zakładka **Sterowanie** udostępnia trwałą kolejkę modelową, priorytety, anulowanie,
+heartbeat oraz diagnostykę osobnych kont Linux. Wybierz
+`BASTILLA_AGENT_PROVIDER=ollama` albo `gemini`; `GEMINI_MODEL` ustawia model Gemini.
+Dla Ollama kolejka korzysta z `model_primary` profilu w SQLite, a czat z
+`OLLAMA_MODEL` lub jawnego wyboru modelu dostępnego w katalogu usługi.
+Brak modelu lub autoryzacji daje rzeczywisty błąd. Kolejka nie daje modelowi
+samodzielnego dostępu do narzędzi lub GitHub.
+
+Domyślnie serwer słucha na `127.0.0.1`. Zdalny hosting wymaga
+`BASTILLA_HOST=0.0.0.0` i `BASTILLA_API_TOKEN` w sekretach serwera. Ustaw także
+`APP_URL` na publiczny adres HTTPS. Panel ma formularz dostępu; API przyjmuje
+również nagłówek Bearer. Sekrety nie należą do plików repozytorium.
+
+Automatyczny commit i push do `main` zostały wyłączone. Dawny endpoint
+`/api/git/sync` zwraca HTTP 409. Okresowa kontrola wykonuje tylko SQLite
+`quick_check`; nie wdraża funkcji, nie zmienia awatarów i nie przepisuje błędów
+poleceń na sukcesy. Biblioteka SVL oblicza parametry matematyczne i nie przyznaje
+uprawnień Linux ani dostępu do modeli.
+
+Adapter `BASTILLA_OLLAMA_BRIDGE=true` działa domyślnie na porcie **11435**,
+identyfikuje się jako Gemini i nie ogłasza lokalnych wag Ollama. Do lokalnej
+Ollama używaj jej rzeczywistego demona oraz faktycznie pobranego modelu.
+Provisioning nie zastępuje `sudo` i nie tworzy atrap narzędzi. Istniejące konta
+oraz polityki sudo ze starszych instalacji wymagają osobnego przeglądu administratora.
+
+Szczegóły: [projekt sterowania](docs/AGENT_CONTROL_DESIGN.md) oraz
+[raport diagnostyczny](docs/DIAGNOSTICS_2026-11-12.md).

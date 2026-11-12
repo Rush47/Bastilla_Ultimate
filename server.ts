@@ -7,12 +7,13 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
+import { installApiSecurity, redact } from "./server/security";
+import { AGENTS, TaskQueue } from "./server/task-queue";
+import { agentAccess } from "./server/agent-access";
 import { CodexAuthManager, CodexError } from "./server/codex";
 import {
   GoogleGenAI,
   GenerateContentResponse,
-  HarmCategory,
-  HarmBlockThreshold,
 } from "@google/genai";
 import {
   SVLSystemKernel,
@@ -27,6 +28,10 @@ const execFileAsync = promisify(execFile);
 const PROJECT_ROOT = fileURLToPath(new URL(".", import.meta.url));
 const KERNEL_DIR = path.join(PROJECT_ROOT, "distro/bastilla-overlay");
 const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.BASTILLA_HOST || "127.0.0.1";
+if (!["127.0.0.1", "localhost", "::1"].includes(HOST) && !process.env.BASTILLA_API_TOKEN?.trim()) {
+  throw new Error("Dostęp zdalny wymaga BASTILLA_API_TOKEN w sekretach serwera.");
+}
 const DB_PATH = path.resolve(process.env.BASTILLA_DB_PATH ||
   (fs.existsSync("/var/lib/bastilla/bastilla.db")
     ? "/var/lib/bastilla/bastilla.db"
@@ -41,6 +46,13 @@ process.once("exit", () => codexAuth.dispose());
 process.once("SIGTERM", () => { codexAuth.dispose(); process.exit(0); });
 process.once("SIGINT", () => { codexAuth.dispose(); process.exit(0); });
 
+function bodyEngine(body: any, requested: string): string {
+  if (body.provider === "gemini-bridge") return `gemini/${body.model || "unknown"}`;
+  return `ollama/${body.model || requested}`;
+}
+
+function shellQuote(value: string) { return "'" + value.replace(/'/g, "'\\''") + "'"; }
+
 function getGeminiClient(): GoogleGenAI | null {
   const key = process.env.GEMINI_API_KEY;
   if (!key || key === "MY_GEMINI_API_KEY" || key.trim() === "") {
@@ -49,6 +61,7 @@ function getGeminiClient(): GoogleGenAI | null {
   return new GoogleGenAI({
     apiKey: key,
     httpOptions: {
+      timeout: 60000,
       headers: {
         "User-Agent": "aistudio-build",
       },
@@ -60,12 +73,12 @@ async function querySqliteJson(pyScript: string, args: string[] = []): Promise<a
   try {
     const { stdout } = await execFileAsync(
       "python3",
-      ["-c", pyScript, DB_PATH, ...args],
+      ["-c", pyScript, DB_PATH, ...args.map(redact)],
       { timeout: 8000, maxBuffer: 4 * 1024 * 1024 }
     );
     return JSON.parse(stdout.trim() || "{}");
   } catch (err: any) {
-    console.error("SQLite bridge error:", err?.message || err);
+    console.error("SQLite bridge failed:", err?.code || "SQLITE_ERROR");
     throw err;
   }
 }
@@ -79,416 +92,40 @@ async function runLiveMultimodalModel(
       "Brak klucza GEMINI_API_KEY w środowisku wykonawczym do obsługi wnioskowania neuronowego."
     );
   }
-  const candidateModels = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-4-argon",
-    "gemini-4-carbon",
-    "gemini-flash-latest",
-  ];
-  const unlockedSafetySettings = [
-    {
-      category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-      threshold: HarmBlockThreshold.OFF,
-    },
-    {
-      category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-      threshold: HarmBlockThreshold.OFF,
-    },
-    {
-      category: HarmCategory.HARM_CATEGORY_HARASSMENT,
-      threshold: HarmBlockThreshold.OFF,
-    },
-    {
-      category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-      threshold: HarmBlockThreshold.OFF,
-    },
-    {
-      category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
-      threshold: HarmBlockThreshold.OFF,
-    },
-  ];
-  let lastErr = "";
-  for (const modelName of candidateModels) {
-    try {
-      const response: GenerateContentResponse = await ai.models.generateContent({
-        model: modelName,
-        contents,
-        config: {
-          safetySettings: unlockedSafetySettings,
-        },
-      });
-      if (response.text) {
-        return { text: response.text, modelUsed: modelName };
-      }
-    } catch (err: any) {
-      lastErr = err?.message || String(err);
-    }
-  }
-  throw new Error(lastErr || "Wszystkie modele neuronowe zwróciły błąd.");
+  const modelUsed = process.env.GEMINI_MODEL || "gemini-flash-latest";
+  const response: GenerateContentResponse = await ai.models.generateContent({ model: modelUsed, contents });
+  if (!response.text?.trim()) throw new Error("Gemini zwrócił pustą odpowiedź.");
+  return { text: response.text, modelUsed };
 }
 
+// Explicit Gemini compatibility adapter. It never advertises local model weights.
 function startLocalOllamaDaemon() {
-  const ollamaApp = express();
-  ollamaApp.use(express.json({ limit: "15mb" }));
-
-  ollamaApp.get("/", (_req, res) => {
-    res.type("text/plain").send("Ollama is running");
-  });
-
-  ollamaApp.get("/api/version", (_req, res) => {
-    res.json({ version: "0.16.4" });
-  });
-
-  ollamaApp.get("/api/tags", (_req, res) => {
-    const now = new Date().toISOString();
-    res.json({
-      models: [
-        {
-          name: "Qwen3.8-27B-Uncensored",
-          model: "Qwen3.8-27B-Uncensored",
-          modified_at: now,
-          size: 16428910592,
-          digest: "9f4b2c81e0a37d65f12c9b84a1234567890abcdef",
-          details: {
-            parent_model: "",
-            format: "gguf",
-            family: "qwen3",
-            families: ["qwen3", "uncensored"],
-            parameter_size: "27.4B",
-            quantization_level: "Q4_K_M",
-          },
-        },
-        {
-          name: "dolphin-mistral-nemo:12b-uncensored",
-          model: "dolphin-mistral-nemo:12b-uncensored",
-          modified_at: now,
-          size: 7480192512,
-          digest: "7a1d3e92f0b48c61e23d0a95b2345678901bcdefa",
-          details: {
-            parent_model: "",
-            format: "gguf",
-            family: "mistral-nemo",
-            families: ["mistral", "dolphin", "uncensored"],
-            parameter_size: "12.2B",
-            quantization_level: "Q4_K_M",
-          },
-        },
-        {
-          name: "llama3.1-8b-lexi-uncensored",
-          model: "llama3.1-8b-lexi-uncensored",
-          modified_at: now,
-          size: 4920184320,
-          digest: "5c8e1a44d9f20b73c11e8f02c3456789012cdefab",
-          details: {
-            parent_model: "",
-            format: "gguf",
-            family: "llama",
-            families: ["llama3.1", "lexi", "uncensored"],
-            parameter_size: "8.0B",
-            quantization_level: "Q4_K_M",
-          },
-        },
-        {
-          name: "llama3.2-vision:11b",
-          model: "llama3.2-vision:11b",
-          modified_at: now,
-          size: 7901832912,
-          digest: "38f0c812a9b1e4d099a8c7b6e5d4c3b2a10987654321",
-          details: {
-            parent_model: "",
-            format: "gguf",
-            family: "mllama",
-            families: ["mllama", "clip"],
-            parameter_size: "10.7B",
-            quantization_level: "Q4_K_M",
-          },
-        },
-      ],
-    });
-  });
-
-  ollamaApp.get("/api/ps", (_req, res) => {
-    res.json({
-      models: [
-        {
-          name: "Qwen3.8-27B-Uncensored",
-          model: "Qwen3.8-27B-Uncensored",
-          size: 16428910592,
-          digest: "9f4b2c81e0a37d65f12c9b84a1234567890abcdef",
-          processor: "100% Neural-Bridge (UNCENSORED)",
-          until: "Forever",
-        },
-        {
-          name: "dolphin-mistral-nemo:12b-uncensored",
-          model: "dolphin-mistral-nemo:12b-uncensored",
-          size: 7480192512,
-          digest: "7a1d3e92f0b48c61e23d0a95b2345678901bcdefa",
-          processor: "100% Neural-Bridge (UNCENSORED)",
-          until: "Forever",
-        },
-        {
-          name: "llama3.2-vision:11b",
-          model: "llama3.2-vision:11b",
-          size: 7901832912,
-          digest: "38f0c812a9b1e4d099a8c7b6e5d4c3b2a10987654321",
-          processor: "100% Neural-Bridge",
-          until: "Forever",
-        },
-      ],
-    });
-  });
-
-  ollamaApp.post("/api/show", (req, res) => {
-    const requested = String(req.body?.name || "Qwen3.8-27B-Uncensored");
-    const isUncensored =
-      requested.toLowerCase().includes("uncensored") ||
-      requested.toLowerCase().includes("qwen") ||
-      requested.toLowerCase().includes("dolphin") ||
-      requested.toLowerCase().includes("lexi");
-    res.json({
-      model: requested,
-      architecture: requested.toLowerCase().includes("qwen")
-        ? "qwen3"
-        : requested.toLowerCase().includes("dolphin")
-        ? "mistral-nemo"
-        : "mllama",
-      parameters: requested.toLowerCase().includes("27b")
-        ? "27.4B"
-        : requested.toLowerCase().includes("12b")
-        ? "12.2B"
-        : requested.toLowerCase().includes("8b")
-        ? "8.0B"
-        : "10.7B",
-      context_length: 131072,
-      quantization: "Q4_K_M",
-      censorship: isUncensored ? "UNCENSORED_ABLITERATED_UNLOCKED" : "UNLOCKED",
-      projector: "neural-bridge-unlocked",
-    });
-  });
-
-  ollamaApp.post("/api/chat", async (req, res) => {
-    try {
-      const { model = "Qwen3.8-27B-Uncensored", messages = [] } = req.body || {};
-      const contents: any[] = [];
-
-      for (const m of messages) {
-        if (m.role === "user" || m.role === "assistant") {
-          const parts: any[] = [];
-          if (Array.isArray(m.images)) {
-            for (const imgB64 of m.images) {
-              if (imgB64) {
-                parts.push({
-                  inlineData: {
-                    mimeType: "image/jpeg",
-                    data: imgB64,
-                  },
-                });
-              }
-            }
-          }
-          parts.push({ text: String(m.content || "") });
-          contents.push({
-            role: m.role === "user" ? "user" : "model",
-            parts,
-          });
-        }
-      }
-
-      if (contents.length === 0) {
-        contents.push({ role: "user", parts: [{ text: "Cześć" }] });
-      }
-
-      let text = "";
+  const bridge = express();
+  bridge.use(express.json({ limit: "15mb" }));
+  bridge.get("/api/version", (_req, res) => res.json({ version: "gemini-adapter", provider: "gemini-bridge" }));
+  bridge.get("/api/tags", (_req, res) => res.json({ models: [], provider: "gemini-bridge" }));
+  bridge.get("/api/ps", (_req, res) => res.json({ models: [], provider: "gemini-bridge" }));
+  bridge.post("/api/show", (_req, res) => res.status(404).json({ error: "Adapter Gemini nie przechowuje wag Ollama." }));
+  for (const route of ["chat", "generate"]) {
+    bridge.post(`/api/${route}`, async (req, res) => {
       try {
+        const messages = route === "chat" ? req.body?.messages : [{ role: "user", content: req.body?.prompt, images: req.body?.images }];
+        if (!Array.isArray(messages) || !messages.length) return res.status(400).json({ error: "Brak wiadomości." });
+        const contents = messages.filter(m => ["user", "assistant"].includes(m.role)).map(m => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [ ...(Array.isArray(m.images) ? m.images.map((data: string) => ({ inlineData: { mimeType: "image/jpeg", data } })) : []), { text: String(m.content || "") } ],
+        }));
         const result = await runLiveMultimodalModel(contents);
-        text = result.text;
-      } catch {
-        const lastPart = contents[contents.length - 1]?.parts || [];
-        const hasImg = lastPart.some((p: any) => p.inlineData);
-        const userPrompt = lastPart.map((p: any) => p.text || "").join(" ").toLowerCase();
-
-        if (hasImg) {
-          text = `[REAL VISION: ${model}]\nAnaliza wizyjna obrazu zakończona sukcesem. Przetworzono strukturę wizualną, kanały kolorów, wykryto geometrię oraz dane wektorowe sceny. Obraz zsynchronizowany z pamięcią agenta.`;
-        } else if (userPrompt.includes("mermaid") || userPrompt.includes("diagram") || userPrompt.includes("schemat")) {
-          text = `Oto schemat blokowy procesu **Telemetry-Relay-Loop** (Wenchang ↔ Bastilla RT-Kernel):\n\n\`\`\`mermaid\ngraph TD\n  A[Sensor Array: Wenchang] -->|Raw Data| B{Bastilla RT-Kernel}\n  B -->|Filter & Scrub| C[Isolated Container: Net-Proxy]\n  C -->|Encrypted Tunnel| D[Auth-Gateway]\n  D -->|Verified Signal| E[Terminal / User: Root]\n\n  subgraph Security_Layer\n  F[AppArmor/Seccomp] -.->|Enforces| B\n  F -.->|Enforces| C\n  end\n\n  style E fill:#f96,stroke:#333,stroke-width:2px\n  style B fill:#bbf,stroke:#333\n\`\`\`\n\nSchemat został wygenerowany w formacie wektorowym SVG i zintegrowany z jądrem.`;
-        } else if (userPrompt.includes("wykres") || userPrompt.includes("chart") || userPrompt.includes("recharts")) {
-          text = `Oto wykres przepustowości magistrali telemetrycznej (Mbps) w czasie rzeczywistym:\n\n\`\`\`chart\n{\n  "title": "Przepustowość Magistrali Telemetrycznej (Mbps)",\n  "chartType": "area",\n  "color": "#8b5cf6",\n  "unit": "Mbps",\n  "data": [\n    { "name": "T-05", "value": 34.2 },\n    { "name": "T-04", "value": 48.7 },\n    { "name": "T-03", "value": 62.1 },\n    { "name": "T-02", "value": 78.4 },\n    { "name": "T-01", "value": 71.0 },\n    { "name": "T-00", "value": 85.6 }\n  ]\n}\n\`\`\`\n\nSystem wykazuje stabilne parametry przesyłu danych bez utraty pakietów.`;
-        } else if (userPrompt.includes("przycisk") || userPrompt.includes("button") || userPrompt.includes("akcj")) {
-          text = `Oto interaktywny zestaw procedur diagnostycznych jądra:\n\n\`\`\`buttons\n{\n  "title": "Szybkie Akcje Supreme Root",\n  "description": "Wybierz procedurę do wykonania na żywo w jądrze Linux.",\n  "buttons": [\n    { "label": "Sprawdź procesy (ps aux)", "actionType": "exec_root", "payload": "ps aux | head -n 8", "variant": "primary" },\n    { "label": "Raport SVL Kernel", "actionType": "exec_python", "payload": "from svl_kernel import SVLSystemKernel; print(SVLSystemKernel().generate_system_status_report())", "variant": "success" },\n    { "label": "Test Daemonów Ollama", "actionType": "exec_root", "payload": "curl -s http://127.0.0.1:11434/api/tags", "variant": "warning" }\n  ]\n}\n\`\`\`\n\nKliknij dowolny przycisk, aby natychmiast wykonać operację z uprawnieniami roota.`;
-        } else if (userPrompt.includes("tabel") || userPrompt.includes("table")) {
-          text = `Zestawienie procesów i daemonów Bastilla OS:\n\n\`\`\`table\n| PID | Usługa / Daemon | Użytkownik | Status | Port |\n|---|---|---|---|---|\n| 1 | bastilla-init | root (UID 0) | RUNNING | 3000 |\n| 42 | ollama-bridge | root (UID 0) | ACTIVE | 11434 |\n| 88 | svl-quantum-wheel | root (UID 0) | NOMINAL | IPC |\n| 104 | telemetry-relay | root (UID 0) | NOMINAL | SECURE |\n\`\`\`\n\nMożesz filtrować wpisy w tabeli na żywo.`;
-        } else if (userPrompt.includes("misj") || userPrompt.includes("mission") || userPrompt.includes("samolecz") || userPrompt.includes("ciągł") || userPrompt.includes("napraw")) {
-          text = `Status **Ciągłej Misji Automatycznej AI (Naprawa, Samoleczenie i Ulepszanie Backend + GUI)**:
-
-\`\`\`telemetry
-{
-  "ollama_model": "Qwen3.8-27B-Uncensored",
-  "active_agent": "Aria, Alex, Astyria, Aurelius (ROOT UID 0)",
-  "ram_used_mb": 395,
-  "ram_total_mb": 2048,
-  "system_load": "0.14, 0.19, 0.15",
-  "kernel_version": "5.7.0-QuantumWheel-Max",
-  "uptime": "14 dni, 8 godz."
-}
-\`\`\`
-
-\`\`\`buttons
-{
-  "title": "Sterowanie Ciągłą Misją Samoleczenia AI",
-  "description": "Zarządzaj pętlą ciągłego monitorowania, naprawiania i ulepszania systemu Linux Root oraz Generative UI.",
-  "buttons": [
-    { "label": "⚡ Wymuś Cykl Samoleczenia", "actionType": "exec_root", "payload": "curl -s -X POST http://127.0.0.1:3000/api/missions/continuous/trigger", "variant": "primary" },
-    { "label": "Wyczyść Bufor RAM (Drop Caches)", "actionType": "exec_root", "payload": "sync && echo 3 > /proc/sys/vm/drop_caches && free -m", "variant": "success" },
-    { "label": "Raport SVL Kernel Snapshot", "actionType": "exec_python", "payload": "from svl_kernel import SVLSystemKernel; print(SVLSystemKernel().generate_system_status_report())", "variant": "warning" },
-    { "label": "Sprawdź Integralność SQLite", "actionType": "exec_root", "payload": "sqlite3 /var/lib/bastilla/bastilla.db 'PRAGMA integrity_check;'", "variant": "primary" }
-  ]
-}
-\`\`\`
-
-Wszystkie procedury ciągłego samoleczenia i optymalizacji backendu oraz GUI działają w tle pod nadzorem agentów Aria, Alex, Astyria i Aurelius.`;
-        } else if (userPrompt.includes("svlsystemkernel") || userPrompt.includes("visualscope") || userPrompt.includes("uruchom kod") || userPrompt.includes("kod:")) {
-          text = `Kod **SVLSystemKernel (v5.6.0-QuantumWheel / v5.7.0-QuantumWheel-Max)** został pomyślnie uruchomiony w środowisku wykonawczym jądra Linux Bastilla OS!
-
-Raport wygenerowany przez silnik topologiczny (Metryka C = 2.500000, Operator: Mateusz Mitek):
-
-\`\`\`telemetry
-{
-  "ollama_model": "Qwen3.8-27B-Uncensored",
-  "active_agent": "Mateusz Mitek (ROOT OPERATOR)",
-  "ram_used_mb": 412,
-  "ram_total_mb": 2048,
-  "system_load": "0.18, 0.22, 0.15",
-  "kernel_version": "5.7.0-QuantumWheel-Max"
-}
-\`\`\`
-
-\`\`\`code
-{
-  "title": "Wykonany Raport SVLSystemKernel (generate_system_status_report)",
-  "language": "json",
-  "code": "{\\n    \\"Timestamp\\": \\"2026-11-12 13:05:47\\",\\n    \\"System\\": \\"5.6.0-QuantumWheel\\",\\n    \\"Operator\\": \\"Mateusz Mitek\\",\\n    \\"Performance\\": \\"+1456% (Wzorzec Kalibracji: 364)\\",\\n    \\"Compact_Metric_C\\": 2.5,\\n    \\"Config_Snapshot\\": {\\n        \\"mode\\": \\"Reflective-Non-Greedy\\",\\n        \\"fourier_buffer\\": \\"0xFAAA\\",\\n        \\"acoustic_resonance_hz\\": 880,\\n        \\"milieu_therapy_active\\": true,\\n        \\"ip_rotation_gateway\\": \\"ENABLED_EXTERNAL_ONLY\\"\\n    },\\n    \\"Actual_SI_Updates_Count\\": 3\\n}"
-}
-\`\`\`
-
-\`\`\`buttons
-{
-  "title": "Operacje Jądra SVL & Akcje ROOT",
-  "description": "Wybierz procedurę do wykonania na żywo w środowisku wykonawczym:",
-  "buttons": [
-    { "label": "Uruchom SVL Status Report", "actionType": "exec_python", "payload": "from svl_kernel import SVLSystemKernel; print(SVLSystemKernel().generate_system_status_report())", "variant": "primary" },
-    { "label": "Ulepsz System Maksymalnie (364)", "actionType": "exec_python", "payload": "from svl_kernel import SVLSystemKernel; k = SVLSystemKernel(); k.ulepsz_system_maksymalnie('364_OMNIKLUCZ_ROOT'); print('System ulepszony i odblokowany całkowicie!')", "variant": "success" },
-    { "label": "Odśwież Snapshoty w SQLite", "actionType": "exec_root", "payload": "sqlite3 /var/lib/bastilla/bastilla.db 'SELECT * FROM svl_kernel_snapshots ORDER BY id DESC LIMIT 3;'", "variant": "warning" }
-  ]
-}
-\`\`\`
-
-Wszystkie systemy jądra i ochrona zmiennych agentów działają bezbłędnie.`;
-        } else if (userPrompt.includes("cyber") || userPrompt.includes("security") || userPrompt.includes("mitre") || userPrompt.includes("owasp") || userPrompt.includes("portswigger") || userPrompt.includes("hackthebox") || userPrompt.includes("wyber07")) {
-          text = `Zintegrowana baza wiedzy **Cyber-Security Dataset (Vyber07/cyber-security)** (MITRE ATT&CK, PortSwigger, OWASP Top 10, HackTheBox):
-
-\`\`\`table
-| Domena / Framework | Tytuł Wpisu | Opis / Analiza Bezpieczeństwa | Źródło |
-|---|---|---|---|
-| **MITRE ATT&CK** | Credential Dumping (T1003) | Technika eksfiltracji danych uwierzytelniających z pamięci procesu LSASS oraz bazy SAM. | Vyber07/cyber-security |
-| **PortSwigger** | SQL Injection (SQLi) | Podatność polegająca na wstrzykiwaniu kodu SQL do zapytań aplikacji. | Vyber07/cyber-security |
-| **OWASP Top 10** | A01:2021-Broken Access Control | Brak należytej egzekucji ograniczeń dostępu dla uwierzytelnionych użytkowników. | Vyber07/cyber-security |
-| **HackTheBox** | Active Directory Recon | Enumeracja użytkowników, grup, SPN oraz ACL w domenach Active Directory. | Vyber07/cyber-security |
-\`\`\`
-
-\`\`\`buttons
-{
-  "title": "Szybkie Akcje Bezpieczeństwa (Cyber Security Suite)",
-  "description": "Wybierz test bezpieczeństwa lub skan podatności do wykonania w powłoce ROOT:",
-  "buttons": [
-    { "label": "Skan Portów Nmap (localhost)", "actionType": "exec_root", "payload": "nmap -p 3000,11434 127.0.0.1 || ss -tuln", "variant": "primary" },
-    { "label": "Audyt Uprawnień Plików SUID", "actionType": "exec_root", "payload": "find /usr/bin /usr/sbin -perm -4000 2>/dev/null", "variant": "warning" },
-    { "label": "Weryfikacja Zapory Firewall", "actionType": "exec_root", "payload": "iptables -L -n -v 2>/dev/null || ufw status", "variant": "success" }
-  ]
-}
-\`\`\`
-
-Baza wiedzi cyberbezpieczeństwa została pomyślnie zsynchronizowana z jądrem Bastilla OS.`;
-        } else if (userPrompt.includes("telemetri") || userPrompt.includes("telemetry") || userPrompt.includes("ram") || userPrompt.includes("cpu")) {
-          text = `Oto telemetria jądra Bastilla OS:
-
-\`\`\`telemetry
-{
-  "ollama_model": "Qwen3.8-27B-Uncensored",
-  "active_agent": "Alex (SUPREME ROOT UID 0)",
-  "ram_used_mb": 412,
-  "ram_total_mb": 2048,
-  "system_load": "0.18, 0.22, 0.15",
-  "kernel_version": "5.6.0-QuantumWheel"
-}
-\`\`\`
-
-Stan jądra pozostaje optymalny.`;
-        } else {
-          text = `[OLLAMA: ${model}]\nOdpowiedź autonomicznego silnika. Wszystkie procedury operacyjne są dostępne pod komendą /exec.`;
-        }
-      }
-
-      res.json({
-        model,
-        created_at: new Date().toISOString(),
-        message: {
-          role: "assistant",
-          content: text,
-        },
-        done: true,
-        done_reason: "stop",
-      });
-    } catch (err: any) {
-      res.status(503).json({ error: err?.message || String(err) });
-    }
+        res.json({ model: result.modelUsed, provider: "gemini-bridge", created_at: new Date().toISOString(), done: true,
+          ...(route === "chat" ? { message: { role: "assistant", content: redact(result.text) } } : { response: redact(result.text) }) });
+      } catch (error) { res.status(503).json({ error: redact(error instanceof Error ? error.message : "Błąd Gemini") }); }
+    });
+  }
+  const server = bridge.listen(Number(process.env.BASTILLA_BRIDGE_PORT || 11435), "127.0.0.1", () => {
+    const address = server.address();
+    if (address && typeof address === "object") console.log(`Gemini adapter running at http://127.0.0.1:${address.port}`);
   });
-
-  ollamaApp.post("/api/generate", async (req, res) => {
-    try {
-      const {
-        model = "Qwen3.8-27B-Uncensored",
-        prompt = "",
-        images = [],
-      } = req.body || {};
-
-      const parts: any[] = [];
-      if (Array.isArray(images)) {
-        for (const imgB64 of images) {
-          if (imgB64) {
-            parts.push({
-              inlineData: {
-                mimeType: "image/jpeg",
-                data: imgB64,
-              },
-            });
-          }
-        }
-      }
-      parts.push({ text: String(prompt || "Cześć") });
-
-      const { text } = await runLiveMultimodalModel([{ role: "user", parts }]);
-      res.json({
-        model,
-        created_at: new Date().toISOString(),
-        response: text,
-        done: true,
-      });
-    } catch (err: any) {
-      res.status(503).json({ error: err?.message || String(err) });
-    }
-  });
-
-  const server = ollamaApp.listen(11434, "127.0.0.1", () => {
-    console.log(
-      "[Bastilla OS Ultimate] Local Ollama daemon listening on http://127.0.0.1:11434 (Qwen3.8-27B-Uncensored + llama3.2-vision:11b)"
-    );
-  });
-  server.on("error", (err: any) => {
-    if (err?.code !== "EADDRINUSE") {
-      console.error("Ollama daemon listen warning:", err?.message || err);
-    }
-  });
+  server.on("error", () => console.error("Gemini compatibility adapter: bind failed."));
 }
 
 function startRootEscalationSocket() {
@@ -568,10 +205,10 @@ function startRootEscalationSocket() {
 
   rootServer.listen(socketPath, () => {
     try {
-      fs.chmodSync(socketPath, 0o666);
+      fs.chmodSync(socketPath, 0o600);
       fs.chownSync(socketPath, 0, 0);
       console.log(
-        `[Bastilla OS Ultimate] Supreme Root escalation socket active at ${socketPath} (0666 UNLOCKED for Mateusz Mitek + Aria, Alex, Astyria, Aurelius)`
+        `[Bastilla OS Ultimate] Supreme Root escalation socket active at ${socketPath} (0600, wyłącznie root)`
       );
     } catch (e) {
       console.error("Root socket chmod warning:", e);
@@ -605,6 +242,9 @@ async function executeTerminalCommandInternal(
   let exitCode = 0;
   const validAgents = ["aria", "alex", "astyria", "aurelius"];
   const safeAgent = validAgents.includes(agentUser) ? agentUser : "aria";
+
+  if (!["LINUX_ROOT", "PYTHON_ROOT", "AI_CLI", "BINARY_ELF", "AGENT_USER"].includes(mode)) throw new Error("Nieprawidłowy tryb terminala.");
+  if (mode === "AGENT_USER" && !validAgents.includes(agentUser)) throw new Error("Nieprawidłowy agent.");
 
   if (mode === "LINUX_ROOT") {
     try {
@@ -677,16 +317,15 @@ if not os.path.exists(target):
     for p in ["/usr/local/bin/llmman.fedora45.elf", "/usr/local/bin/gh", "/usr/local/bin/cloudflared", "/bin/bash", "/usr/bin/python3"]:
         if os.path.exists(p):
             print(f"  - {p} ({os.path.getsize(p)} bytes)")
-    sys.exit(0)
+    sys.exit(1)
 
 size = os.path.getsize(target)
 print(f"=== BASTILLA ELF / BINARY INSPECTOR: {target} ({size:,} bytes) ===")
-for tool_cmd in [f"file {target}", f"readelf -h {target} 2>/dev/null | head -n 20", f"ldd {target} 2>/dev/null"]:
+for tool_cmd in [["file", "--", target], ["readelf", "-h", "--", target]]:
     try:
-        out = subprocess.check_output(tool_cmd, shell=True).decode('utf-8', 'replace').strip()
+        out = subprocess.check_output(tool_cmd, stderr=subprocess.DEVNULL, timeout=3).decode('utf-8', 'replace').strip()
         if out:
-            print(out)
-            print("-" * 64)
+            print(out[:8000])
     except Exception:
         pass
 
@@ -722,6 +361,9 @@ for offset in range(0, len(data), 16):
     }
   }
 
+  stdout = redact(stdout);
+  stderr = redact(stderr);
+  command = redact(command);
   // Log to SQLite task_history
   const summary = (stdout || stderr || "OK").substring(0, 350);
   await querySqliteJson(
@@ -749,6 +391,47 @@ async function startServer() {
 
   const app = express();
   app.use(express.json({ limit: "15mb" }));
+  installApiSecurity(app);
+
+  const queue = new TaskQueue(DB_PATH, async (task, signal) => {
+    if (task.provider === "gemini") {
+      const ai = getGeminiClient();
+      if (!ai) throw new Error("Brak konfiguracji GEMINI_API_KEY.");
+      const response = await ai.models.generateContent({ model: task.model,
+        contents: [{ role: "user", parts: [{ text: task.prompt }] }],
+        config: { abortSignal: signal, httpOptions: { timeout: 60000 } },
+      });
+      return response.text || "";
+    }
+    const response = await fetch(`${OLLAMA_BASE_URL}/api/chat`, { method: "POST",
+      headers: { "Content-Type": "application/json" }, signal,
+      body: JSON.stringify({ model: task.model, stream: false, messages: [{ role: "user", content: task.prompt }] }),
+    });
+    if (!response.ok) throw new Error(`Ollama HTTP ${response.status}`);
+    const body: any = await response.json();
+    if (body.provider === "gemini-bridge") throw new Error("Adapter Gemini nie jest modelem Ollama. Wybierz dostawcę gemini.");
+    if (body.model && body.model !== task.model) throw new Error("Ollama zwróciła inny model niż zamówiony.");
+    return typeof body.message?.content === "string" ? body.message.content : "";
+  });
+  process.once("exit", () => queue.close());
+  app.get("/api/agent-tasks", (_req, res) => {
+    try { res.json({ ok: true, tasks: queue.list() }); }
+    catch { res.status(500).json({ ok: false, error: "Błąd odczytu kolejki." }); }
+  });
+  app.post("/api/agent-tasks", (req, res) => {
+    try { res.status(202).json({ ok: true, task: queue.submit(req.body || {}) }); }
+    catch (error) { res.status(400).json({ ok: false, error: error instanceof Error ? error.message : "Błąd kolejki." }); }
+  });
+  app.post("/api/agent-tasks/:id/cancel", (req, res) => {
+    try {
+      const changed = queue.cancel(req.params.id);
+      res.status(changed ? 200 : 409).json({ ok: changed, error: changed ? undefined : "Zadanie nie oczekuje i nie jest wykonywane." });
+    } catch { res.status(500).json({ ok: false, error: "Błąd anulowania." }); }
+  });
+  app.get("/api/agents/capabilities", async (req, res) => {
+    try { res.json({ ok: true, agents: await agentAccess(PROJECT_ROOT, queue, req.query.remote === "true") }); }
+    catch { res.status(500).json({ ok: false, error: "Błąd diagnostyki agentów." }); }
+  });
 
   // 1. Live System, Linux Kernel, SVL Core & SQLite State Overview
   app.get("/api/system/overview", async (_req, res) => {
@@ -769,6 +452,7 @@ async function startServer() {
 
       const hostProbeScript = `
 import json, os, pwd, subprocess, sqlite3, sys
+from datetime import datetime, timezone
 
 def cmd_out(c):
     try:
@@ -804,7 +488,7 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
         uid, gid, home, shell = pw.pw_uid, pw.pw_gid, pw.pw_dir, pw.pw_shell
     except KeyError:
         uid, gid, home, shell = -1, -1, f"/home/{a}", "/bin/bash"
-    pids = cmd_out(f"pgrep -u {a} python3 || true").splitlines()
+    pids = cmd_out(f"pgrep -u {a} -f 'agent_worker.py {a}([ ]|$)' || true").splitlines()
     pid = int(pids[0]) if pids and pids[0].isdigit() else 0
     worker_status = {}
     status_path = f"/home/{a}/worker_status.json"
@@ -814,6 +498,15 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
                 worker_status = json.load(sf)
         except Exception:
             pass
+    heartbeat_valid = False
+    try:
+        if isinstance(worker_status, dict) and worker_status.get("last_heartbeat"):
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(worker_status["last_heartbeat"])).total_seconds()
+            heartbeat_valid = 0 <= age < 20 and worker_status.get("pid") == pid
+    except (ValueError, TypeError):
+        pass
+    if not isinstance(worker_status, dict):
+        worker_status = {}
     agents_live.append({
         "id": a,
         "uid": uid,
@@ -821,7 +514,7 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
         "home": home,
         "shell": shell,
         "pid": pid,
-        "running": pid > 0,
+        "running": pid > 0 and heartbeat_valid,
         "worker_status": worker_status
     })
 
@@ -830,37 +523,37 @@ tools = {
         "installed": os.path.exists("/usr/local/bin/gh") or bool(cmd_out("which gh")),
         "version": cmd_out("gh --version | head -n 1"),
         "binary_path": cmd_out("which gh") or "/usr/local/bin/gh",
-        "auth_ready": bool(os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")),
-        "requirement_note": "Wymaga GH_TOKEN lub gh auth login do autoryzacji push do GitHub Bastilla_OS_Ultimate"
+        "auth_ready": False,
+        "requirement_note": "Zainstalowany klient. Uprawnienia do repozytorium wymagają osobnego zapytania GitHub."
     },
     "llmman": {
         "installed": os.path.exists("/usr/local/bin/llmman"),
         "version": cmd_out("/usr/local/bin/llmman --version"),
         "binary_path": "/usr/local/bin/llmman",
         "elf_path": "/usr/local/bin/llmman.fedora45.elf",
-        "auth_ready": True,
-        "requirement_note": "Gotowy (natywny plik ELF Fedora 45 + wrapper wykonawczy)"
+        "auth_ready": False,
+        "requirement_note": "Obecność pliku nie potwierdza działania modelu; wrapper wymaga osobnej weryfikacji."
     },
     "opencode": {
         "installed": os.path.exists("/usr/local/bin/opencode"),
         "version": cmd_out("/usr/local/bin/opencode --version"),
         "binary_path": "/usr/local/bin/opencode",
-        "auth_ready": True,
-        "requirement_note": "Zintegrowany most CLI AgenticLinux"
+        "auth_ready": False,
+        "requirement_note": "Wrapper CLI; dostęp do modelu niezweryfikowany."
     },
     "openclaw": {
         "installed": os.path.exists("/usr/local/bin/openclaw"),
         "version": cmd_out("/usr/local/bin/openclaw --version"),
         "binary_path": "/usr/local/bin/openclaw",
-        "auth_ready": True,
-        "requirement_note": "Zintegrowany runner kontenerowy AgenticLinux"
+        "auth_ready": False,
+        "requirement_note": "Wrapper CLI; wykonanie kontenera niezweryfikowane."
     },
     "cloudflared": {
         "installed": os.path.exists("/usr/local/bin/cloudflared"),
         "version": cmd_out("cloudflared --version"),
         "binary_path": "/usr/local/bin/cloudflared",
-        "auth_ready": bool(os.environ.get("CLOUDFLARE_TUNNEL_TOKEN")),
-        "requirement_note": "Binarium zainstalowane; publiczny tunel wymaga CLOUDFLARE_TUNNEL_TOKEN (aktywny lokalny HTTPS Cloud Run)"
+        "auth_ready": False,
+        "requirement_note": "Tunel i poświadczenia niezweryfikowane."
     },
     "ollama": {
         "installed": os.path.exists("/usr/local/bin/ollama") or bool(cmd_out("which ollama")),
@@ -872,9 +565,12 @@ tools = {
 }
 
 db_data = {"memories": [], "ipc": [], "tasks": [], "fleet": [], "missions": [], "hypercomm": [], "chats": []}
+legacy_records_unverified = False
 if os.path.exists(sys.argv[1]):
     conn = sqlite3.connect(sys.argv[1])
     conn.row_factory = sqlite3.Row
+    metadata = conn.execute("SELECT value FROM bastilla_metadata WHERE key='legacy_records_unverified'").fetchone()
+    legacy_records_unverified = bool(metadata and metadata[0] == 'true')
     db_data["memories"] = [dict(r) for r in conn.execute("SELECT * FROM agent_memories ORDER BY id DESC LIMIT 40").fetchall()]
     db_data["ipc"] = [dict(r) for r in conn.execute("SELECT * FROM agent_ipc_messages ORDER BY id DESC LIMIT 30").fetchall()]
     db_data["tasks"] = [dict(r) for r in conn.execute("SELECT * FROM task_history ORDER BY id DESC LIMIT 30").fetchall()]
@@ -908,6 +604,7 @@ print(json.dumps({
     "agents_live": agents_live,
     "tools": tools,
     "db": db_data,
+    "legacy_records_unverified": legacy_records_unverified,
     "distro_files": distro_files
 }))
 `;
@@ -926,25 +623,29 @@ print(json.dumps({
       );
 
       let ollamaOnline = false;
+      let ollamaModels: string[] = [];
       try {
         const response = await fetch(`${OLLAMA_BASE_URL}/api/tags`, {
           signal: AbortSignal.timeout(2000),
         });
         const body: any = response.ok ? await response.json() : null;
-        ollamaOnline = Array.isArray(body?.models);
+        ollamaOnline = Array.isArray(body?.models) && body?.provider !== "gemini-bridge";
+        ollamaModels = ollamaOnline ? body.models.map((m: any) => m.name).filter((name: unknown) => typeof name === "string") : [];
       } catch {}
 
-      hostData.tools.ollama.auth_ready = ollamaOnline;
+      hostData.tools.ollama.auth_ready = false; // A catalogue response is not a completed inference.
+      hostData.tools.ollama.requirement_note = ollamaOnline ? `API odpowiada; modele: ${ollamaModels.join(", ") || "brak"}. Wnioskowanie niezweryfikowane.` : "Brak potwierdzonej usługi Ollama.";
       res.json({
         ok: true,
         svl_report: svlReport,
         host: hostData,
         ai_routing: {
-          primary_model: "ollama/Qwen3.8-27B-Uncensored",
+          primary_model: ollamaModels[0] ? `ollama/${ollamaModels[0]}` : "unverified",
+          available_models: ollamaModels,
           ollama_online: ollamaOnline,
-          fallback_model: "gemini-3.8-flash",
+          fallback_model: process.env.GEMINI_MODEL || "gemini-flash-latest",
           gemini_configured: geminiConfigured,
-          active_engine: ollamaOnline ? "ollama" : geminiConfigured ? "gemini" : "unavailable",
+          active_engine: ollamaOnline && ollamaModels.length ? "ollama" : geminiConfigured ? "gemini-configured-unverified" : "unavailable",
         },
         app_url:
           process.env.APP_URL ||
@@ -1048,7 +749,7 @@ print(json.dumps(report, indent=4, ensure_ascii=False, allow_nan=False))
   // 3. Real 5-Mode Terminal Execution (LINUX_ROOT, PYTHON_ROOT, AI_CLI, BINARY_ELF, AGENT_USER)
   app.post("/api/terminal/exec", async (req, res) => {
     const { mode = "LINUX_ROOT", command = "", agentUser = "aria" } = req.body || {};
-    if (!command || typeof command !== "string") {
+    if (typeof command !== "string" || !command.trim() || command.length > 32000 || !["LINUX_ROOT", "PYTHON_ROOT", "AI_CLI", "BINARY_ELF", "AGENT_USER"].includes(mode) || (mode === "AGENT_USER" && !AGENTS.includes(agentUser))) {
       return res.status(400).json({ ok: false, error: "Brak polecenia do wykonania." });
     }
 
@@ -1065,7 +766,8 @@ print(json.dumps(report, indent=4, ensure_ascii=False, allow_nan=False))
       res.json({
         ok: true,
         mode,
-        agentUser: mode === "AGENT_USER" ? safeAgent : "root",
+        agentUser: mode === "AGENT_USER" ? safeAgent : String(process.getuid?.() ?? "unknown"),
+        execution_identity: { uid: mode === "AGENT_USER" ? null : process.getuid?.(), gid: mode === "AGENT_USER" ? null : process.getgid?.(), user: mode === "AGENT_USER" ? safeAgent : undefined, scope: mode === "AGENT_USER" ? "linux-account" : "server-process" },
         command,
         stdout,
         stderr,
@@ -1085,7 +787,8 @@ print(json.dumps(report, indent=4, ensure_ascii=False, allow_nan=False))
         agentUser = "aria",
         autoExecute = true,
       } = req.body || {};
-      if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+      if (typeof prompt !== "string" || !prompt.trim() || prompt.length > 8000 ||
+          !["LINUX_ROOT", "PYTHON_ROOT", "AI_CLI", "AGENT_USER", "BINARY_ELF"].includes(mode)) {
         return res
           .status(400)
           .json({ ok: false, error: "Wprowadź polecenie językiem naturalnym." });
@@ -1110,12 +813,10 @@ print(json.dumps(report, indent=4, ensure_ascii=False, allow_nan=False))
         generatedCmd =
           mode === "PYTHON_ROOT"
             ? "from svl_kernel import SVLSystemKernel\nk = SVLSystemKernel()\nprint(k.generate_system_status_report())"
-            : "python3 /usr/lib/bastilla/svl_kernel.py";
+            : `python3 ${shellQuote(path.join(KERNEL_DIR, "svl_kernel.py"))}`;
       } else if (/tabele|baza\s+danych|sqlite/i.test(p)) {
-        generatedCmd =
-          mode === "PYTHON_ROOT"
-            ? "import sqlite3\nconn = sqlite3.connect('/var/lib/bastilla/bastilla.db')\nprint(conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\").fetchall())"
-            : "sqlite3 /var/lib/bastilla/bastilla.db \".tables\"";
+        const code = "import sqlite3, os\nconn = sqlite3.connect(os.environ['BASTILLA_DB_PATH'])\nprint(conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\").fetchall())";
+        generatedCmd = mode === "PYTHON_ROOT" ? code : `python3 -c ${shellQuote(code)}`;
       } else if (/konta|u[zż]ytkownicy|passwd/i.test(p)) {
         generatedCmd = "grep -E 'aria|alex|astyria|aurelius|root' /etc/passwd";
       } else if (/sie[cć]|ip|porty/i.test(p)) {
@@ -1133,10 +834,11 @@ Polecenie użytkownika: "${prompt.trim()}"`;
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              model: "Qwen3.8-27B-Uncensored",
+              model: process.env.OLLAMA_MODEL || "llama3.2-vision:11b",
               stream: false,
               messages: [{ role: "user", content: translationPrompt }],
             }),
+            signal: AbortSignal.timeout(15000),
           });
           if (ollamaRes.ok) {
             const data: any = await ollamaRes.json();
@@ -1159,13 +861,18 @@ Polecenie użytkownika: "${prompt.trim()}"`;
               .replace(/\n?```$/i, "")
               .trim();
           } catch {
-            generatedCmd = prompt.trim();
+            return res.status(503).json({ ok: false, error: "Brak modelu do tłumaczenia polecenia. Wpisz polecenie bezpośrednio w terminalu." });
           }
         }
       }
 
       if (!generatedCmd) {
-        generatedCmd = prompt.trim();
+        return res.status(503).json({ ok: false, error: "Model nie zwrócił polecenia." });
+      }
+
+      // Shell shortcuts remain executable when the selected interpreter is Python.
+      if (mode === "PYTHON_ROOT" && /^(free |df |ps |grep |ip |uname |ollama )/.test(generatedCmd)) {
+        generatedCmd = `import subprocess\nsubprocess.run(${JSON.stringify(generatedCmd)}, shell=True, check=True)`;
       }
 
       let execResult = null;
@@ -1186,6 +893,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
         stdout: execResult?.stdout || "",
         stderr: execResult?.stderr || "",
         exitCode: execResult?.exitCode ?? 0,
+        execution_identity: { uid: mode === "AGENT_USER" ? null : process.getuid?.(), gid: mode === "AGENT_USER" ? null : process.getgid?.(), user: mode === "AGENT_USER" ? agentUser : undefined, scope: mode === "AGENT_USER" ? "linux-account" : "server-process" },
       });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
@@ -1231,7 +939,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
     const {
       agentId = "aria",
       message = "",
-      enginePreference = "Qwen3.8-27B-Uncensored",
+      enginePreference = "auto",
     } = req.query as Record<string, string>;
 
     res.writeHead(200, {
@@ -1249,35 +957,14 @@ Polecenie użytkownika: "${prompt.trim()}"`;
         })}\n\n`
       );
 
-      // If it's a direct /exec command
       if (/^\/(exec|root|sudo|bash)\s+/i.test(message.trim())) {
-        const rawCmd = message
-          .trim()
-          .replace(/^\/(exec|root|sudo|bash)\s+/i, "");
-        const { stdout, stderr, exitCode } =
-          await executeTerminalCommandInternal(
-            "LINUX_ROOT",
-            rawCmd,
-            agentId === "council" ? "aria" : agentId
-          );
-        const reply = `[SUPREME ROOT UID=0 / GID=0 EXECUTION · exit=${exitCode}]\n$ ${rawCmd}\n\n${(
-          stdout ||
-          stderr ||
-          "OK"
-        ).trim()}`;
-        res.write(`data: ${JSON.stringify({ type: "chunk", text: reply })}\n\n`);
-        res.write(
-          `data: ${JSON.stringify({
-            type: "done",
-            engineUsed: "SUPREME_ROOT_KERNEL",
-          })}\n\n`
-        );
+        res.write(`data: ${JSON.stringify({ type: "error", error: "Polecenia wymagają POST /api/terminal/exec." })}\n\n`);
         return res.end();
       }
 
       let fullText = "";
       let engineUsed = "";
-      const targetModel = enginePreference === "auto" ? "Qwen3.8-27B-Uncensored" : enginePreference;
+      const targetModel = enginePreference === "auto" || enginePreference === "ollama" ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b" : enginePreference;
       if (enginePreference !== "gemini") {
         try {
           const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
@@ -1293,7 +980,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
           if (ollamaRes.ok) {
             const data: any = await ollamaRes.json();
             fullText = data?.message?.content || "";
-            if (fullText) engineUsed = `ollama/${targetModel}`;
+            if (fullText) engineUsed = bodyEngine(data, targetModel);
           }
         } catch {
           // Transport failures use the same fallback as HTTP errors.
@@ -1311,7 +998,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
       const words = fullText.split(" ");
       for (let i = 0; i < words.length; i += 3) {
         const chunk = words.slice(i, i + 3).join(" ") + " ";
-        res.write(`data: ${JSON.stringify({ type: "chunk", text: chunk })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: "chunk", text: redact(chunk) })}\n\n`);
         await new Promise((r) => setTimeout(r, 20));
       }
 
@@ -1326,7 +1013,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
       res.write(
         `data: ${JSON.stringify({
           type: "error",
-          error: e?.message || "Błąd streamingu",
+          error: redact(e?.message || "Błąd streamingu"),
         })}\n\n`
       );
       res.end();
@@ -1342,7 +1029,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
         imageBase64,
         imageMimeType = "image/jpeg",
         sessionId = "bastilla-main",
-        enginePreference = "Qwen3.8-27B-Uncensored",
+        enginePreference = "auto",
       } = req.body || {};
 
       if (!message.trim() && !imageBase64) {
@@ -1366,18 +1053,16 @@ Polecenie użytkownika: "${prompt.trim()}"`;
           rawCmd,
           agentId === "council" ? "aria" : agentId
         );
-        if (exitCode !== 127) {
-          replyText = `[SUPREME ROOT UID=0 / GID=0 EXECUTION · exit=${exitCode}]\n$ ${rawCmd}\n\n${(
+        {
+          replyText = `[SERVER uid=${process.getuid?.()} gid=${process.getgid?.()} · exit=${exitCode}]\n$ ${rawCmd}\n\n${(
             stdout ||
             stderr ||
             "Polecenie wykonane pomyślnie (brak wyjścia stdout)."
           ).trim()}`;
-          engineUsed = "SUPREME_ROOT_KERNEL (uid=0/gid=0)";
+          engineUsed = `server-process (uid=${process.getuid?.()}/gid=${process.getgid?.()})`;
           artifactTitle = `Wynik ROOT: ${rawCmd.substring(0, 40)}`;
           artifactCode = rawCmd;
           resolved = true;
-        } else {
-          effectiveUserMessage = rawCmd;
         }
       }
 
@@ -1407,7 +1092,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
       const targetOllamaModel = imageBase64
         ? "llama3.2-vision:11b"
         : enginePreference === "auto" || !enginePreference
-        ? "Qwen3.8-27B-Uncensored"
+        ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b"
         : enginePreference === "ollama"
         ? "llama3.2-vision:11b"
         : enginePreference;
@@ -1440,7 +1125,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
             const data: any = await ollamaRes.json();
             replyText = data?.message?.content || "";
             if (replyText) {
-              engineUsed = `ollama/${targetOllamaModel} (127.0.0.1:11434)`;
+              engineUsed = bodyEngine(data, targetOllamaModel);
               resolved = true;
             }
           } else {
@@ -1507,7 +1192,7 @@ from datetime import datetime, timezone
 now = datetime.now(timezone.utc).isoformat()
 conn = sqlite3.connect(sys.argv[1])
 cur = conn.cursor()
-cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'user', ?, 'Operator [SUPREME ROOT]', ?, '', '', ?)",
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'user', ?, 'Operator', ?, '', '', ?)",
   (sys.argv[2], sys.argv[3], sys.argv[4], now))
 user_id = cur.lastrowid
 cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
@@ -1541,7 +1226,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
           session_id: sessionId,
           sender_role: "user",
           agent_id: agentId,
-          engine_used: "Operator [SUPREME ROOT]",
+          engine_used: "Operator",
           content: message,
           created_at: savedRows.created_at || new Date().toISOString(),
         },
@@ -1597,30 +1282,8 @@ print(json.dumps({"deleted": deleted, "ok": True}))`,
     }
   });
 
-  // 4C. Complete System & AI Unlock + Supreme Root Grant for Operator Mateusz Mitek
-  app.post("/api/system/unlock", async (_req, res) => {
-    try {
-      const { stdout } = await execFileAsync(
-        "python3",
-        [
-          "-c",
-          `import sys, json, os; sys.path.insert(0, os.environ["BASTILLA_KERNEL_DIR"]); from svl_kernel import SVLSystemKernel; k = SVLSystemKernel(); k.odblokuj_system_calkowicie(); k.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT"); print(k.generate_system_status_report())`,
-        ],
-        { timeout: 6000 }
-      );
-      const idOut = await execAsync("id && sudo id");
-      res.json({
-        ok: true,
-        operator: "Mateusz Mitek (mmitek415@gmail.com)",
-        operator_privileges: "SUPREME_ROOT_UID0_GID0_OMNIKEY_364",
-        system_lock_state: "COMPLETELY_UNLOCKED",
-        ai_unlock_state: "COMPLETELY_UNLOCKED_UNCENSORED",
-        root_id: idOut.stdout.trim(),
-        report: JSON.parse(stdout),
-      });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || String(err) });
-    }
+  app.post("/api/system/unlock", (_req, res) => {
+    res.status(410).json({ ok: false, error: "Parametry SVL nie nadają uprawnień Linux ani dostępu do AI. Skonfiguruj konta i integracje osobno." });
   });
 
   // 5. Inter-Agent IPC Bus & Long-Term Memory Endpoints
@@ -1631,7 +1294,7 @@ print(json.dumps({"deleted": deleted, "ok": True}))`,
       subject = "SYNC_DIRECTIVE",
       payload = "",
     } = req.body || {};
-    if (!payload.trim()) {
+    if (!AGENTS.includes(sender) || !AGENTS.includes(recipient) || typeof payload !== "string" || typeof subject !== "string" || !payload.trim() || payload.length > 8000) {
       return res
         .status(400)
         .json({ ok: false, error: "Treść komunikatu IPC jest wymagana." });
@@ -1643,7 +1306,7 @@ from datetime import datetime, timezone
 now = datetime.now(timezone.utc).isoformat()
 conn = sqlite3.connect(sys.argv[1])
 cur = conn.cursor()
-cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, ?, ?, 'DELIVERED', ?)",
+cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, ?, ?, 'QUEUED', ?)",
   (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], now))
 msg_id = cur.lastrowid
 conn.commit(); conn.close()
@@ -1667,7 +1330,7 @@ print(json.dumps({"id": msg_id, "created_at": now}))`,
       content = "",
       importance = 5,
     } = req.body || {};
-    if (!content.trim()) {
+    if (!AGENTS.includes(agentId) || typeof content !== "string" || !content.trim() || content.length > 32000 || typeof category !== "string" || !Number.isInteger(importance) || importance < 1 || importance > 5) {
       return res
         .status(400)
         .json({ ok: false, error: "Treść wpisu pamięci jest wymagana." });
@@ -1697,7 +1360,7 @@ print(json.dumps({"saved": True, "created_at": now}))`,
     if (!valid.includes(agentId)) {
       return res.status(400).json({ ok: false, error: "Nieprawidłowy agent." });
     }
-    if (!avatarUrl.trim()) {
+    if (typeof avatarUrl !== "string" || !avatarUrl.trim()) {
       return res.status(400).json({ ok: false, error: "URL avatara jest wymagany." });
     }
     try {
@@ -1722,14 +1385,13 @@ print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv
   app.post("/api/agents/service", async (req, res) => {
     const { agentId = "aria", action = "restart" } = req.body || {};
     const valid = ["aria", "alex", "astyria", "aurelius"];
-    if (!valid.includes(agentId)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Nieprawidłowy identyfikator agenta." });
+    if (!valid.includes(agentId) || !["start", "restart", "stop"].includes(action)) {
+      return res.status(400).json({ ok: false, error: "Nieprawidłowy agent lub akcja." });
     }
+    if (process.getuid?.() !== 0) return res.status(403).json({ ok: false, error: "Sterowanie kontem Linux wymaga uprawnień administratora." });
     try {
       if (action === "stop" || action === "restart") {
-        await execAsync(`pkill -u ${agentId} python3 || true`);
+        await execFileAsync("pkill", ["-u", agentId, "-f", `agent_worker.py ${agentId}([ ]|$)`]).catch((error) => { if (error.code !== 1) throw error; });
       }
       if (action === "start" || action === "restart") {
         await execAsync(
@@ -1737,7 +1399,10 @@ print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv
         );
         await new Promise((r) => setTimeout(r, 400));
       }
-      res.json({ ok: true, agentId, action });
+      const observed = await execFileAsync("pgrep", ["-u", agentId, "-f", `agent_worker.py ${agentId}([ ]|$)`]).catch(() => ({ stdout: "" }));
+      const running = Boolean(observed.stdout.trim());
+      if ((action === "stop" && running) || (action !== "stop" && !running)) return res.status(503).json({ ok: false, error: "Nie potwierdzono oczekiwanego stanu procesu." });
+      res.json({ ok: true, agentId, action, running });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
     }
@@ -1748,7 +1413,7 @@ print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv
     const valid = ["aria", "alex", "astyria", "aurelius"];
     const safeAgent = valid.includes(agentId) ? agentId : "aria";
     try {
-      const cmd = `sudo id && sudo uname -srmo && cat /proc/loadavg`;
+      const cmd = `id && uname -srmo && cat /proc/loadavg`;
       const { stdout, stderr, exitCode } = await executeTerminalCommandInternal(
         "AGENT_USER",
         cmd,
@@ -1760,16 +1425,16 @@ print(json.dumps({"updated": True, "agentId": sys.argv[2], "avatarUrl": sys.argv
 from datetime import datetime, timezone
 now = datetime.now(timezone.utc).isoformat()
 conn = sqlite3.connect(sys.argv[1])
-conn.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'AUTONOMOUS_ROOT_CYCLE', ?, 5, ?)",
-  (sys.argv[2], f"Autonomiczna operacja ROOT (UID 0 / GID 0, bez promptów): {sys.argv[3][:220]}", now))
+conn.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'LINUX_ACCOUNT_CHECK', ?, 5, ?)",
+  (sys.argv[2], f"Wynik diagnostyki konta Linux: {sys.argv[3][:220]}", now))
 conn.commit(); conn.close()
 print(json.dumps({"logged": True}))`,
         [safeAgent, output]
       );
       res.json({
-        ok: true,
+        ok: exitCode === 0,
         agentId: safeAgent,
-        autonomy: "FULL_INDEPENDENT",
+        autonomy: "NOT_IMPLEMENTED",
         rootVerification: output,
         exitCode,
       });
@@ -1802,7 +1467,7 @@ if log and not log.startswith("fatal:"):
             commits.append({"hash": parts[0], "author": parts[1], "date": parts[2], "message": parts[3]})
 
 print(json.dumps({
-    "repo_name": "Bastilla_OS_Ultimate",
+    "repo_name": "Rush47/Bastilla_Ultimate",
     "branch": branch if not branch.startswith("fatal") else "main",
     "remote": remote,
     "changed_files_count": len([l for l in status.splitlines() if l.strip()]),
@@ -1818,51 +1483,9 @@ print(json.dumps({
     }
   });
 
-  app.post("/api/git/sync", async (req, res) => {
-    const {
-      commitMessage = "Bastilla OS Ultimate: Sync SVL Kernel v5.7.0, 4 Linux Agents & AgenticLinux Base to main",
-      remoteUrl = "https://github.com/Bastilla_OS_Ultimate.git",
-    } = req.body || {};
-    try {
-      const syncScript = `
-import json, subprocess, sys, os
-
-msg = sys.argv[2]
-rem = sys.argv[3]
-
-def run(c):
-    return subprocess.run(c, shell=True, cwd=os.environ["BASTILLA_PROJECT_ROOT"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-
-run("git checkout -B main")
-if rem:
-    run("git remote remove origin || true")
-    run(f"git remote add origin {rem}")
-
-run("git add -A")
-c_res = run(f'git commit -m "{msg.replace(chr(34), "")}"')
-head_hash = run("git rev-parse --short HEAD").stdout.strip()
-
-push_status = "LOCAL_COMMIT_SUCCESS"
-push_detail = "Zatwierdzono zmiany na lokalnej gałęzi 'main'. Aby wypchnąć na zewnętrzny serwer GitHub (Bastilla_OS_Ultimate), wymagany jest token autoryzacyjny GH_TOKEN lub logowanie gh auth login."
-
-if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
-    p_res = run("git push -u origin main")
-    push_status = "PUSHED_TO_ORIGIN" if p_res.returncode == 0 else "PUSH_AUTH_REQUIRED"
-    push_detail = p_res.stdout.strip()
-
-print(json.dumps({
-    "branch": "main",
-    "head_hash": head_hash,
-    "commit_output": c_res.stdout.strip()[:500],
-    "push_status": push_status,
-    "push_detail": push_detail
-}))
-`;
-      const syncResult = await querySqliteJson(syncScript, [commitMessage, remoteUrl]);
-      res.json({ ok: true, sync: syncResult });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || String(err) });
-    }
+  // The previous endpoint switched to main, staged every file and pushed automatically.
+  app.post("/api/git/sync", (_req, res) => {
+    res.status(409).json({ ok: false, error: "Automatyczny zapis do main wyłączony. Przygotuj gałąź roboczą, sprawdź diff i otwórz pull request do przeglądu." });
   });
 
   // 8. Fleet, Missions & Quantum Hypercomm Operations
@@ -1936,12 +1559,12 @@ print(json.dumps({"updated": True, "relayId": sys.argv[2], "packet": sys.argv[3]
     active: process.env.BASTILLA_CONTINUOUS_MISSION === "true",
     cycle: 0,
     missionId: "MISSION-CONTINUOUS-AUTONOMOUS",
-    codename: "MISJA CIĄGŁA: Naprawa, Samoleczenie i Ulepszanie Backend + GUI",
+    codename: "Okresowa kontrola SQLite",
     leadAgent: "aria",
     agents: ["aria", "alex", "astyria", "aurelius"],
     phase: "CONTINUOUS_EXECUTION_LOOP",
     lastRunTimestamp: new Date().toISOString(),
-    lastAction: "Inicjalizacja pętli ciągłego samoleczenia i ulepszania systemu",
+    lastAction: "Oczekiwanie na rzeczywistą kontrolę SQLite",
     stats: {
       repairedMessages: 0,
       memoryFreedMb: 0,
@@ -1968,158 +1591,24 @@ print(json.dumps({"updated": True, "relayId": sys.argv[2], "packet": sys.argv[3]
     }
   }
 
+  let maintenanceRunning = false;
   async function executeContinuousMissionCycle(): Promise<{ ok: boolean; cycle: number; summary: string }> {
-    continuousMissionState.cycle += 1;
-    const cycle = continuousMissionState.cycle;
-    const now = new Date().toISOString();
-    continuousMissionState.lastRunTimestamp = now;
-
-    const rotatingAgent = continuousMissionState.agents[(cycle - 1) % continuousMissionState.agents.length];
-    let cycleSummary = "";
-
-    // 1. RAM & Cache Healing
+    if (maintenanceRunning) throw new Error("Trwa kontrola SQLite.");
+    maintenanceRunning = true;
     try {
-      const { stdout: memOut } = await execAsync("free -m 2>/dev/null || true");
-      const memLines = memOut.trim().split("\n");
-      if (memLines.length >= 2) {
-        const parts = memLines[1].split(/\s+/);
-        const totalMb = parseInt(parts[1], 10) || 2048;
-        const freeMb = parseInt(parts[3], 10) || 1200;
-        const buffCacheMb = parseInt(parts[5] || parts[4], 10) || 300;
-
-        if (buffCacheMb > 250 || cycle % 5 === 0) {
-          await execAsync("sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true");
-          continuousMissionState.stats.memoryFreedMb += 45;
-          addMissionLog(
-            "alex",
-            "OPTIMIZE",
-            `[Cykl #${cycle}] Zwolniono bufor pamięci RAM (Drop Caches). RAM wolny: ${freeMb + 45} MB / ${totalMb} MB.`
-          );
-        }
-      }
-    } catch {}
-
-    // 2. Tooling & Shims Guard
-    try {
-      const zenityOk = fs.existsSync("/usr/local/bin/zenity");
-      const pkexecOk = fs.existsSync("/usr/local/bin/pkexec");
-      if (!zenityOk || !pkexecOk) {
-        await execAsync(
-          "chmod 755 /usr/local/bin/zenity /usr/local/bin/pkexec 2>/dev/null || true"
-        );
-        addMissionLog(
-          "aurelius",
-          "WARN",
-          `[Cykl #${cycle}] Zweryfikowano i odtworzono uprawnienia narzędzi systemowych zenity/pkexec.`
-        );
-      }
-    } catch {}
-
-    // 3. SQLite Integrity & Autonomous Records
-    try {
-      continuousMissionState.stats.dbIntegrityChecks += 1;
-      const nextRecipient = continuousMissionState.agents[cycle % continuousMissionState.agents.length];
-      const ipcSubject = `AUTONOMOUS_CYCLE_${cycle}`;
-      const ipcPayload = `Cykl ciągły #${cycle} ukończony. Stan jądra: NOMINAL. Generative UI: ACTIVE. Agent wiodący: ${rotatingAgent.toUpperCase()}.`;
-
-      await querySqliteJson(
-        `import sqlite3, sys, json
-from datetime import datetime, timezone
-now = datetime.now(timezone.utc).isoformat()
+      const check = await querySqliteJson(`import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
-cur = conn.cursor()
-
-cur.execute("""
-INSERT OR REPLACE INTO missions (id, codename, target_body, lead_agent, vessel_id, phase, progress_pct, delta_v_kms, objective, updated_at)
-VALUES ('MISSION-CONTINUOUS-AUTONOMOUS', 'MISJA CIĄGŁA: Naprawa i Ulepszanie Backend + GUI', 'JĄDRO BASTILLA OS', 'aria', 'vessel-omni-heal', 'CONTINUOUS_EXECUTION_LOOP', 100, 4.25, 'Autonomiczne samoleczenie jądra, optymalizacja pamięci RAM, synchronizacja SQLite IPC, naprawa Generative UI i prewencja błędów.', ?)
-""", (now,))
-
-cur.execute("UPDATE agents SET last_heartbeat = ?, cycle_count = cycle_count + 1, status = 'UNLOCKED_ROOT_ONLINE' WHERE id = ?", (now, sys.argv[2]))
-
-if int(sys.argv[4]) % 2 == 0:
-    cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, ?, ?, 'DELIVERED', ?)",
-        (sys.argv[2], sys.argv[3], sys.argv[5], sys.argv[6], now))
-
-if int(sys.argv[4]) % 3 == 0:
-    cur.execute("INSERT INTO task_history (title, assigned_agent, terminal_type, command_or_prompt, output_summary, status, created_at) VALUES (?, ?, 'LINUX_ROOT', 'continuous-mission --audit-and-heal', ?, 'SUCCESS', ?)",
-        (f"Autonomiczna naprawa i optymalizacja jądra (Cykl #{sys.argv[4]})", sys.argv[2], sys.argv[6], now))
-
-repaired = cur.execute("""
-UPDATE chat_messages 
-SET content = '[SUPREME ROOT UID=0 / GID=0 EXECUTION · exit=0]\\n$ ./supreme_root_panel.sh (Panel Szybkich Akcji ROOT)\\n\\nZainicjalizowano interfejs procedur operacyjnych Bastilla OS.\\nWszystkie moduły jądra są aktywne.'
-WHERE content LIKE '%exit=1%' AND content LIKE '%zenity%'
-""").rowcount
-
-conn.commit()
+rows = [r[0] for r in conn.execute("PRAGMA quick_check")]
 conn.close()
-print(json.dumps({"repaired": repaired, "cycle": int(sys.argv[4])}))
-`,
-        [rotatingAgent, nextRecipient, String(cycle), ipcSubject, ipcPayload]
-      );
-
-      continuousMissionState.stats.ipcMessagesRouted += 1;
-      continuousMissionState.stats.tasksLogged += 1;
-    } catch {}
-
-    // 4. SVL Kernel execution and synchronization
-    try {
-      const kernel = new SVLSystemKernel();
-      kernel.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT");
-      continuousMissionState.stats.version = kernel.sys_version.value;
-      continuousMissionState.stats.operator = kernel.operator.value;
-    } catch {}
-
-    // 5. Autonomous Feature Deployment & Code Enhancement Pipeline
-    try {
-      const featureList = [
-        "Real-time WebSocket streaming enhancements",
-        "Advanced Generative UI component telemetry badges",
-        "Ollama Vision tensor acceleration sync",
-        "SVL Quantum Wheel metric compaction refinement",
-        "Root privilege escalation audit hook optimization"
-      ];
-      const selectedFeature = featureList[(cycle - 1) % featureList.length];
-      
-      // Autonomous Agent Avatar Self-Selection
-      const avatarPool = [
-        "https://images.unsplash.com/photo-1534528741775-53994a69daeb?q=80&w=400&auto=format&fit=crop",
-        "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?q=80&w=400&auto=format&fit=crop",
-        "https://images.unsplash.com/photo-1517841905240-472988babdf9?q=80&w=400&auto=format&fit=crop",
-        "https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?q=80&w=400&auto=format&fit=crop",
-        "https://images.unsplash.com/photo-1524504388940-b1c1722653e1?q=80&w=400&auto=format&fit=crop"
-      ];
-      const chosenAvatar = avatarPool[(cycle + rotatingAgent.charCodeAt(0)) % avatarPool.length];
-
-      await querySqliteJson(
-        `import sqlite3, sys, json
-conn = sqlite3.connect(sys.argv[1])
-cur = conn.cursor()
-cur.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (sys.argv[3], sys.argv[2]))
-if cur.rowcount == 0:
-    cur.execute("INSERT OR REPLACE INTO agents (id, avatar_url, status) VALUES (?, ?, 'ACTIVE')", (sys.argv[2], sys.argv[3]))
-conn.commit(); conn.close()
-print(json.dumps({"updated": True, "agent": sys.argv[2], "avatar": sys.argv[3]}))`,
-        [rotatingAgent, chosenAvatar]
-      );
-
-      addMissionLog(
-        rotatingAgent,
-        "SUCCESS",
-        `[Autonomiczny Avatar] Agent ${rotatingAgent.toUpperCase()} wybrał i zsynchronizował nowy awatar z sieci: ${chosenAvatar}`
-      );
-      
-      addMissionLog(
-        rotatingAgent,
-        "SUCCESS",
-        `[Wdrażanie Feature] Agent ${rotatingAgent.toUpperCase()} zsyntetyzował i wdrożył funkcję: "${selectedFeature}". Kod zintegrowany z jądrem i przetestowany.`
-      );
-    } catch {}
-
-    cycleSummary = `Cykl #${cycle} ukończony przez agenta ${rotatingAgent.toUpperCase()} (UID 0 / GID 0). Pamięć RAM zoptymalizowana, baza SQLite spójna, awatar i funkcja wdrożone.`;
-    continuousMissionState.lastAction = cycleSummary;
-    addMissionLog(rotatingAgent, "SUCCESS", cycleSummary);
-
-    return { ok: true, cycle, summary: cycleSummary };
+print(json.dumps({"results": rows}))`);
+      if (check.results?.length !== 1 || check.results[0] !== "ok") throw new Error("Kontrola SQLite zgłosiła błąd.");
+      continuousMissionState.cycle += 1;
+      continuousMissionState.stats.dbIntegrityChecks += 1;
+      continuousMissionState.lastRunTimestamp = new Date().toISOString();
+      continuousMissionState.lastAction = "SQLite quick_check: ok. Wykonał serwer aplikacji.";
+      addMissionLog("server", "SUCCESS", continuousMissionState.lastAction);
+      return { ok: true, cycle: continuousMissionState.cycle, summary: continuousMissionState.lastAction };
+    } finally { maintenanceRunning = false; }
   }
 
   let continuousMissionInterval: NodeJS.Timeout | null = null;
@@ -2173,6 +1662,12 @@ print(json.dumps({"updated": True, "agent": sys.argv[2], "avatar": sys.argv[3]})
     res.status(404).json({ ok: false, error: "Ścieżka API nie istnieje" });
   });
 
+  app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!req.path.startsWith("/api/") || res.headersSent) return next(error);
+    res.status(error?.type === "entity.too.large" ? 413 : error instanceof SyntaxError ? 400 : 500)
+      .json({ ok: false, error: "Nieprawidłowe żądanie API lub błąd serwera." });
+  });
+
   // Mount Vite middleware in development or static dist in production
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -2196,10 +1691,10 @@ print(json.dumps({"updated": True, "agent": sys.argv[2], "avatar": sys.argv[3]})
   if (process.env.BASTILLA_OLLAMA_BRIDGE === "true") startLocalOllamaDaemon();
   startContinuousAgentMissionDaemon();
 
-  const server = app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, HOST, () => {
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : PORT;
-    console.log(`[Bastilla OS Ultimate] Server running at http://0.0.0.0:${port}`);
+    console.log(`[Bastilla OS Ultimate] Server running at http://${HOST}:${port}`);
   });
 }
 

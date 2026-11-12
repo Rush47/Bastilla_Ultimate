@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, chmodSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { once } from "node:events";
@@ -12,9 +12,10 @@ const stateDir = mkdtempSync(path.join(tmpdir(), "bastilla-test-"));
 const dbPath = path.join(stateDir, "state.db");
 const initDb = path.join(projectRoot, "distro/bastilla-overlay/init_db.py");
 const codexHome = path.join(stateDir, "codex");
-const codexBinary = path.join(projectRoot, "tests/fixtures/codex.mjs");
+const codexBinary = path.join(stateDir, "codex.mjs");
 let server: ChildProcess;
 let baseUrl: string;
+let bridgeUrl: string;
 let ollamaAvailable = true;
 const modelRequests: any[] = [];
 const ollama = createServer(async (req, res) => {
@@ -51,6 +52,7 @@ async function post(route: string, body: object) {
 }
 
 before(async () => {
+  copyFileSync(path.join(projectRoot, "tests/fixtures/codex.mjs"), codexBinary);
   chmodSync(codexBinary, 0o755);
   mkdirSync(codexHome);
   // Exercise an upgrade from the schema shipped in the original repository.
@@ -66,12 +68,15 @@ before(async () => {
     env: {
       ...process.env,
       PORT: "0",
+      BASTILLA_HOST: "127.0.0.1",
+      BASTILLA_API_TOKEN: "",
       NODE_ENV: "production",
       BASTILLA_DB_PATH: dbPath,
       BASTILLA_PROVISION_HOST: "false",
       BASTILLA_ROOT_SOCKET: "false",
       BASTILLA_CONTINUOUS_MISSION: "false",
-      BASTILLA_OLLAMA_BRIDGE: "false",
+      BASTILLA_OLLAMA_BRIDGE: "true",
+      BASTILLA_BRIDGE_PORT: "0",
       GEMINI_API_KEY: "",
       OPENAI_API_KEY: "synthetic-runtime-api-key",
       CODEX_HOME: codexHome,
@@ -85,8 +90,10 @@ before(async () => {
     const timeout = setTimeout(() => reject(new Error(`Startup timed out: ${output}`)), 15000);
     const onData = (chunk: Buffer) => {
       output += chunk.toString();
-      const match = output.match(/Server running at http:\/\/0\.0\.0\.0:(\d+)/);
-      if (match) {
+      const match = output.match(/Server running at http:\/\/(?:0\.0\.0\.0|127\.0\.0\.1):(\d+)/);
+      const adapter = output.match(/Gemini adapter running at http:\/\/127\.0\.0\.1:(\d+)/);
+      if (adapter) bridgeUrl = `http://127.0.0.1:${adapter[1]}`;
+      if (match && bridgeUrl) {
         baseUrl = `http://127.0.0.1:${match[1]}`;
         clearTimeout(timeout);
         resolve();
@@ -99,6 +106,17 @@ before(async () => {
       reject(new Error(`Server exited (${code}): ${output}`));
     });
   });
+});
+
+test("Gemini adapter advertises no local weights and never fabricates an answer on inference failure", async () => {
+  const catalog: any = await (await fetch(`${bridgeUrl}/api/tags`)).json();
+  assert.deepEqual(catalog.models, []);
+  assert.equal(catalog.provider, "gemini-bridge");
+  const response = await fetch(`${bridgeUrl}/api/chat`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: "Show system telemetry" }] }) });
+  assert.equal(response.status, 503);
+  const body: any = await response.json();
+  assert.equal(body.message, undefined);
+  assert.match(body.error, /GEMINI_API_KEY/);
 });
 
 after(async () => {
@@ -115,9 +133,55 @@ test("clean startup keeps host missions paused and retains database records on r
   const data: any = await response.json();
   assert.equal(data.mission.active, false);
   assert.equal(data.mission.cycle, 0);
+  assert.equal(sql("print(conn.execute('SELECT COUNT(*) FROM task_history').fetchone()[0])").trim(), "0");
+  assert.equal(sql("print(conn.execute('SELECT COUNT(*) FROM agent_ipc_messages').fetchone()[0])").trim(), "0");
   const before = sql("print(conn.execute('SELECT COUNT(*) FROM agent_memories').fetchone()[0])");
   execFileSync("python3", [initDb, dbPath]);
   assert.equal(sql("print(conn.execute('SELECT COUNT(*) FROM agent_memories').fetchone()[0])"), before);
+});
+
+test("git sync cannot change refs or push main and maintenance preserves failed execution evidence", async () => {
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf8" });
+  const blocked = await post("/api/git/sync", { remoteUrl: "https://example.invalid/$(touch injected)", commitMessage: "$(touch injected)" });
+  assert.equal(blocked.status, 409);
+  assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf8" }), head);
+  sql("conn.execute(\"INSERT INTO chat_messages (session_id,sender_role,agent_id,engine_used,content,created_at) VALUES ('audit','assistant','aria','terminal','zenity exit=1','now')\")");
+  const cycle = await post("/api/missions/continuous/trigger", {});
+  assert.equal(cycle.status, 200);
+  assert.equal(cycle.body.mission.stats.dbIntegrityChecks, 1);
+  assert.equal(cycle.body.mission.stats.memoryFreedMb, 0);
+  assert.equal(sql("print(conn.execute(\"SELECT content FROM chat_messages WHERE session_id='audit'\").fetchone()[0])").trim(), "zenity exit=1");
+  assert.equal(sql("print(conn.execute(\"SELECT COUNT(*) FROM agents WHERE status LIKE '%ONLINE%'\").fetchone()[0])").trim(), "0");
+});
+
+test("invalid terminal modes, IPC paths and GET command execution are rejected", async () => {
+  assert.equal((await post("/api/terminal/exec", { mode: "invalid", command: "id" })).status, 400);
+  assert.equal((await post("/api/agents/ipc", { recipient: "../../tmp", payload: "test" })).status, 400);
+  const response = await fetch(`${baseUrl}/api/chat/stream?message=${encodeURIComponent('/exec printf MUST_NOT_EXECUTE')}`);
+  const body = await response.text();
+  assert.match(body, /Polecenia wymagają POST/);
+  assert.equal(body.includes("MUST_NOT_EXECUTE"), false);
+});
+
+test("queued tasks reach the model endpoint and expose evidence scoped to the server", async () => {
+  const result = await post("/api/agent-tasks", { agentId: "astyria", prompt: "Queue inference diagnostic", idempotencyKey: "queue-api-once" });
+  assert.equal(result.status, 202);
+  let task: any;
+  for (let i = 0; i < 60; i++) {
+    const data: any = await (await fetch(`${baseUrl}/api/agent-tasks`)).json();
+    task = data.tasks.find((t: any) => t.id === result.body.task.id);
+    if (task.status === "succeeded") break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.equal(task.status, "succeeded");
+  assert.equal(task.result, "Test model response");
+  assert.equal(modelRequests.at(-1).messages[0].content, "Queue inference diagnostic");
+  const access: any = await (await fetch(`${baseUrl}/api/agents/capabilities`)).json();
+  const agent = access.agents.find((a: any) => a.id === "astyria");
+  assert.equal(agent.model.scope, "server-process");
+  assert.equal(agent.model.task_id, task.id);
+  assert.equal(agent.autonomous_tools, false);
+  assert.equal(agent.model_repository_access, false);
 });
 
 test("SQLite writes and migrated avatar columns work", async () => {
@@ -159,7 +223,7 @@ test("chat history remains inside its session", async () => {
 test("SSE reports the model actually used and honors an explicit Gemini choice", async () => {
   const response = await fetch(`${baseUrl}/api/chat/stream?message=Hello&enginePreference=auto`);
   const stream = await response.text();
-  assert.match(stream, /"type":"done","engineUsed":"ollama\/Qwen3.8-27B-Uncensored"/);
+  assert.match(stream, /"type":"done","engineUsed":"ollama\/llama3.2-vision:11b"/);
   const calls = modelRequests.length;
   const gemini = await fetch(`${baseUrl}/api/chat/stream?message=Hello&enginePreference=gemini`);
   assert.match(await gemini.text(), /"type":"error"/);

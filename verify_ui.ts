@@ -22,14 +22,20 @@ async function main() {
     });
     const overview = page.waitForResponse((response) => response.url().endsWith("/api/system/overview"));
     await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-    assert.equal((await overview).status(), 200);
+    const firstOverview = await overview;
+    if (firstOverview.status() === 401 && process.env.TEST_PANEL_TOKEN) {
+      await page.getByLabel("Token panelu", { exact: true }).fill(process.env.TEST_PANEL_TOKEN);
+      const authorizedOverview = page.waitForResponse(response => response.url().endsWith("/api/system/overview") && response.status() === 200);
+      await page.getByRole("button", { name: "Połącz", exact: true }).click();
+      await authorizedOverview;
+    } else assert.equal(firstOverview.status(), 200);
     await page.getByRole("button", { name: "ChatGPT Work", exact: true }).waitFor();
     const imagesLoaded = await page.locator("img").evaluateAll(async (images) => {
       await Promise.all(images.map((image) => (image as HTMLImageElement).decode().catch(() => {})));
       return images.every((image) => (image as HTMLImageElement).naturalWidth > 0);
     });
     assert.ok(imagesLoaded, "Desktop images must load in the production build");
-    for (const name of ["ChatGPT Work", "Terminale", "Agenci Linux", "Układ 3D", "Diagnostyka i GitHub", "Pulpit Violet"]) {
+    for (const name of ["Sterowanie", "ChatGPT Work", "Terminale", "Agenci Linux", "Układ 3D", "Diagnostyka i GitHub", "Pulpit Violet"]) {
       await page.getByRole("button", { name, exact: true }).first().click();
       await page.waitForTimeout(200);
       if (name === "ChatGPT Work") {
@@ -50,10 +56,19 @@ async function main() {
         }
       }
     }
+    for (const width of [360, 390, 768]) {
+      await page.setViewportSize({ width, height: 844 });
+      await page.getByRole("button", { name: "Sterowanie", exact: true }).click();
+      await page.getByRole("heading", { name: "Sterowanie agentami", exact: true }).waitFor();
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `Control panel must fit ${width}px`);
+      const input = await page.getByLabel("Treść zadania", { exact: true }).boundingBox();
+      assert.ok(input && input.x >= 0 && input.x + input.width <= width, `Task input must fit ${width}px`);
+      if (width === 390) await page.screenshot({ path: "/tmp/bastilla_mobile_verified.png", fullPage: true });
+    }
     assert.deepEqual(pageErrors, [], "Tabs must render without runtime errors");
     assert.deepEqual(failedAssets, [], "Built assets must be served successfully");
     await page.screenshot({ path: process.env.TEST_SCREENSHOT_PATH || "/tmp/bastilla_verified.png" });
-    console.log("UI verified: six tabs, production images, no page errors.");
+    console.log("UI verified: seven tabs, production images, mobile 360/390/768px, no page errors.");
   } finally {
     await browser.close();
   }

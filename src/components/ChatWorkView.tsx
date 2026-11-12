@@ -43,38 +43,32 @@ const AGENT_LABELS: Record<
 > = {
   aria: {
     name: "Aria",
-    role: "Autonomiczny Agent ROOT (SVL [-1, 1] · Bez promptów)",
-    uid: "UID 1001 · GID 0 (ROOT) · /home/aria",
+    role: "Profil agenta · wykonanie przez serwer",
+    uid: "Konto i dostęp: zakładka Sterowanie",
   },
   alex: {
     name: "Alex",
-    role: "Autonomiczny Agent ROOT (SVL [-364, 364] · Bez promptów)",
-    uid: "UID 1002 · GID 0 (ROOT) · /home/alex",
+    role: "Profil agenta · wykonanie przez serwer",
+    uid: "Konto i dostęp: zakładka Sterowanie",
   },
   astyria: {
     name: "Astyria",
-    role: "Autonomiczny Agent ROOT (SVL [-500, 500] · Bez promptów)",
-    uid: "UID 1003 · GID 0 (ROOT) · /home/astyria",
+    role: "Profil agenta · wykonanie przez serwer",
+    uid: "Konto i dostęp: zakładka Sterowanie",
   },
   aurelius: {
     name: "Aurelius",
-    role: "Autonomiczny Agent ROOT (SVL [-1000, 1000] · Bez promptów)",
-    uid: "UID 1004 · GID 0 (ROOT) · /home/aurelius",
+    role: "Profil agenta · wykonanie przez serwer",
+    uid: "Konto i dostęp: zakładka Sterowanie",
   },
   council: {
     name: "Konsylium 4X",
-    role: "Wspólna sesja Aria + Alex + Astyria + Aurelius (UID 0 / GID 0)",
-    uid: "Grupa: root (GID 0) · bastilla-agents",
+    role: "Wspólny profil rozmowy; pojedyncze wywołanie modelu",
+    uid: "Osobne konta wymagają konfiguracji",
   },
 };
 
-export type OllamaEngineChoice =
-  | "Qwen3.8-27B-Uncensored"
-  | "llama3.2-vision:11b"
-  | "dolphin-mistral-nemo:12b-uncensored"
-  | "llama3.1-8b-lexi-uncensored"
-  | "auto"
-  | "gemini";
+export type OllamaEngineChoice = string;
 
 // --- MEMOIZED, CARET-SAFE INPUT BAR TO PREVENT MIRROR/REVERSE TEXT BUG ---
 
@@ -326,7 +320,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [enginePreference, setEnginePreference] = useState<OllamaEngineChoice>(
-    "Qwen3.8-27B-Uncensored"
+    "auto"
   );
   const [filterByAgent, setFilterByAgent] = useState<boolean>(true);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
@@ -341,7 +335,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     output?: string;
   }>({
     title:
-      "svl_kernel.py — Jądro SVL v5.7.0-QuantumWheel-Max (SUPREME ROOT UNLOCKED)",
+      "svl_kernel.py — biblioteka matematyczna SVL",
     code: `from svl_kernel import SVLSystemKernel\n\nkernel = SVLSystemKernel()\nkernel.odblokuj_system_calkowicie("364_OMNIKLUCZ_ROOT")\nprint(kernel.generate_system_status_report())`,
   });
   const [executingArtifact, setExecutingArtifact] = useState<boolean>(false);
@@ -419,7 +413,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           session_id: "bastilla-main",
           sender_role: "user",
           agent_id: selectedAgent,
-          engine_used: "Operator [SUPREME ROOT UID=0]",
+          engine_used: "Operator",
           content: trimmed,
           created_at: new Date().toISOString(),
         };
@@ -438,7 +432,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           });
           const data = await res.json();
           const execOutput = data.ok
-            ? `[SUPREME ROOT UID=0 / GID=0 EXECUTION · exit=${data.exitCode ?? 0}]\n$ ${cmd}\n\n${data.stdout || data.stderr || "[Brak wyjścia (exit=0)]"}`
+            ? `[SERVER uid=${data.execution_identity?.uid ?? "?"} · exit=${data.exitCode ?? 0}]\n$ ${cmd}\n\n${data.stdout || data.stderr || "[Brak wyjścia (exit=0)]"}`
             : `[BŁĄD WYKONANIA LINUX ROOT · exit=${data.exitCode || 1}]\n$ ${cmd}\n\n${data.error || data.stderr || data.stdout || "Nieznany błąd powłoki."}`;
 
           const asstRecord: ChatMessageRecord = {
@@ -446,7 +440,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             session_id: "bastilla-main",
             sender_role: "assistant",
             agent_id: selectedAgent,
-            engine_used: "Linux Root Shell (UID 0)",
+            engine_used: "Powłoka serwera",
             content: execOutput,
             created_at: new Date().toISOString(),
           };
@@ -465,7 +459,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
         session_id: "bastilla-main",
         sender_role: "user",
         agent_id: selectedAgent,
-        engine_used: "Operator [SUPREME ROOT UID=0]",
+        engine_used: "Operator",
         content: trimmed || (imageBase64 ? "[Przesłano obraz do analizy Real Vision]" : ""),
         created_at: new Date().toISOString(),
       };
@@ -570,6 +564,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
         body: JSON.stringify({ token: "364_OMNIKLUCZ_ROOT" }),
       });
       const data = await res.json();
+      if (!res.ok) setErrorMsg(data.error || "Nie można zmienić uprawnień przez panel.");
       if (data.ok) {
         setStatusNotice(
           `ODBLOKOWANO: ${data.operator} · ${data.operator_privileges || "SUPREME_ROOT_UID0_GID0"}`
@@ -696,7 +691,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                     )}
                     <span className="font-semibold">{info.name}</span>
                     <span className="text-[9px] text-emerald-400 font-mono-tabular">
-                      ROOT
+                      PROFIL
                     </span>
                     {count > 0 && (
                       <span className="text-[9px] text-violet-300 font-mono-tabular">
@@ -716,10 +711,10 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               onClick={handleUnlockSystemAndRoot}
               disabled={unlocking}
               className="h-7 px-2 rounded-md bg-emerald-600/20 hover:bg-emerald-600/30 border border-emerald-500/50 text-emerald-300 text-[10px] font-mono-tabular flex items-center gap-1 whitespace-nowrap"
-              title="SUPREME ROOT (UID 0 / GID 0)"
+              title="Uprawnienia procesu serwera"
             >
               <Unlock className="w-3 h-3" />
-              <span className="hidden sm:inline">ROOT UID 0</span>
+              <span className="hidden sm:inline">Sprawdź dostęp</span>
             </button>
 
             <button
@@ -783,20 +778,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               }
               className="h-6 px-2 rounded bg-[#07090e] border border-violet-500/50 text-[11px] font-mono-tabular text-white focus:outline-none focus:border-violet-400 max-w-[280px] sm:max-w-none"
             >
-              <option value="Qwen3.8-27B-Uncensored">
-                Ollama: Qwen3.8-27B-Uncensored
-              </option>
-              <option value="llama3.2-vision:11b">
-                Ollama: llama3.2-vision:11b (Real Vision)
-              </option>
-              <option value="dolphin-mistral-nemo:12b-uncensored">
-                Ollama: dolphin-mistral-nemo:12b-uncensored
-              </option>
-              <option value="llama3.1-8b-lexi-uncensored">
-                Ollama: llama3.1-8b-lexi-uncensored
-              </option>
-              <option value="auto">Auto (Ollama → Gemini Fallback)</option>
-              <option value="gemini">Gemini API (Safety OFF)</option>
+              <option value="auto">Auto (Ollama → Gemini)</option>
+              {(overview?.ai_routing.available_models || []).map(model => <option key={model} value={model}>Ollama: {model}</option>)}
+              <option value="gemini">Gemini API (wymaga konfiguracji)</option>
             </select>
           </div>
 
@@ -857,7 +841,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                   Kanał: {AGENT_LABELS[selectedAgent].name} ({AGENT_LABELS[selectedAgent].uid}) — CAŁKOWICIE ODBLOKOWANY
                 </div>
                 <div className="text-slate-400">
-                  Model: <span className="text-white">{enginePreference}</span> · Uprawnienia: <span className="text-emerald-400">SUPREME ROOT (UID 0 / GID 0)</span>. Pisz swobodnie lub wpisz <span className="text-cyan-300">/exec &lt;komenda&gt;</span>.
+                  Model: <span className="text-white">{enginePreference}</span> · Uprawnienia: <span className="text-emerald-400">Uprawnienia procesu serwera</span>. Pisz swobodnie lub wpisz <span className="text-cyan-300">/exec &lt;komenda&gt;</span>.
                 </div>
               </div>
             )}
@@ -1038,7 +1022,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
 
             <div className="mt-3 pt-2 border-t border-slate-800 text-[10px] text-slate-400 font-mono-tabular flex items-center justify-between">
               <span>SVL v5.7.0</span>
-              <span>ROOT UID 0</span>
+              <span>Sprawdź dostęp</span>
             </div>
           </aside>
         )}

@@ -125,6 +125,7 @@ export interface SystemOverviewResponse {
   ok: boolean;
   svl_report: SVLKernelReport;
   host: {
+    legacy_records_unverified?: boolean;
     os_release: Record<string, string>;
     uname: string;
     loadavg: string[];
@@ -155,6 +156,7 @@ export interface SystemOverviewResponse {
   };
   ai_routing: {
     primary_model: string;
+    available_models: string[];
     ollama_online: boolean;
     fallback_model: string;
     gemini_configured: boolean;
@@ -164,6 +166,7 @@ export interface SystemOverviewResponse {
 }
 
 export type WorkspaceTab =
+  | "control"
   | "desktop"
   | "chat"
   | "terminals"

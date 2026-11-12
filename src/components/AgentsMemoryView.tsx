@@ -45,13 +45,15 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
   ) => {
     setBusyAgent(`${agentId}-${action}`);
     try {
-      await fetch("/api/agents/service", {
+      const response = await fetch("/api/agents/service", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ agentId, action }),
       });
+      const result = await response.json();
+      if (!response.ok || result.exitCode) setIpcError(result.error || result.rootVerification || "Błąd wykonania.");
       onRefresh();
-    } finally {
+    } catch { setIpcError("Brak połączenia z serwerem."); } finally {
       setBusyAgent(null);
     }
   };
@@ -59,13 +61,15 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
   const handleAutonomousRootCycle = async (agentId: AgentId) => {
     setBusyAgent(`${agentId}-autonomy`);
     try {
-      await fetch("/api/agents/autonomy", {
+      const response = await fetch("/api/agents/autonomy", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ agentId }),
       });
+      const result = await response.json();
+      if (!response.ok || result.exitCode) setIpcError(result.error || result.rootVerification || "Błąd wykonania.");
       onRefresh();
-    } finally {
+    } catch { setIpcError("Brak połączenia z serwerem."); } finally {
       setBusyAgent(null);
     }
   };
@@ -124,19 +128,20 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
 
   return (
     <div className="min-h-[calc(100vh-64px)] p-6 bg-[#07090e] space-y-6">
+      {ipcError && <p role="alert" className="text-amber-300">{ipcError}</p>}
       {/* Section 1: 4 Linux Accounts & Worker Daemons */}
       <section className="bg-[#0c1018] border border-slate-800 rounded-xl p-6">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-5">
           <div>
             <h2 className="font-display text-xl font-bold text-white">
-              01. Autonomiczni Agenci Linux ROOT, Workery Python i Izolacja SVL
+              01. Konta Linux i procesy heartbeat
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Pełna autonomia i niezależność (zero promptów sterujących) · Uprawnienia ROOT (GID 0 + sudo UID 0 NOPASSWD)
+              Worker Python raportuje stan procesu. Dostęp do modeli i repozytorium sprawdzisz w zakładce Sterowanie.
             </p>
           </div>
           <div className="text-xs font-mono-tabular text-emerald-400">
-            Uprawnienia: ROOT (UID 0 / GID 0) · Baza SQLite: {svl?.Database_Integration?.total_records ?? 36} rekordów
+            Raport SVL · Baza SQLite: {svl?.Database_Integration?.total_records ?? 0} rekordów
           </div>
         </div>
 
@@ -163,8 +168,8 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
                       </div>
                       <div className="text-xs font-mono-tabular text-emerald-400">
                         {live?.running
-                          ? `ROOT ONLINE · PID ${live.pid}`
-                          : "STANDBY DAEMON"}
+                          ? `PROCES AKTYWNY · PID ${live.pid}`
+                          : "BRAK ŚWIEŻEGO HEARTBEAT"}
                       </div>
                     </div>
                   </div>
@@ -173,19 +178,19 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
                     <div className="flex justify-between">
                       <span className="text-slate-400">Konto Linux:</span>
                       <span>
-                        {agentId} (UID {live?.uid ?? svlInfo?.uid} / GID 0)
+                        {agentId} (UID {live?.uid ?? "?"} / GID {live?.gid ?? "?"})
                       </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Uprawnienia:</span>
                       <span className="text-emerald-400 font-semibold">
-                        ROOT (sudo UID 0)
+                        Niezweryfikowane
                       </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Autonomia:</span>
                       <span className="text-violet-300">
-                        PEŁNA (Bez promptów)
+                        Brak wykonawcy narzędzi
                       </span>
                     </div>
                     <div className="flex justify-between">
@@ -196,7 +201,7 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Cykle Workera:</span>
-                      <span>{live?.worker_status?.cycle ?? 1}</span>
+                      <span>{live?.worker_status?.cycle ?? 0}</span>
                     </div>
                   </div>
                 </div>
@@ -209,8 +214,8 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
                     className="w-full py-1.5 px-2.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors whitespace-nowrap"
                   >
                     {busyAgent === `${agentId}-autonomy`
-                      ? "Wykonywanie cyklu ROOT..."
-                      : "Autonomiczny Cykl ROOT"}
+                      ? "Sprawdzanie..."
+                      : "Diagnostyka konta Linux"}
                   </button>
                   <div className="flex items-center gap-2">
                     <button

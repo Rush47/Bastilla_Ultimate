@@ -32,7 +32,7 @@ export class SVLProtectedVariable<T> {
   constructor(
     name: string,
     initial_value: T,
-    security_level: string = "COMPLETELY_UNLOCKED_ROOT"
+    security_level: string = "LIBRARY_ONLY_ROOT"
   ) {
     this.name = name;
     this._value = initial_value;
@@ -47,7 +47,7 @@ export class SVLProtectedVariable<T> {
 
   unlock_completely(): boolean {
     this.lock_state = false;
-    this.security_level = "COMPLETELY_UNLOCKED";
+    this.security_level = "LIBRARY_ONLY";
     return true;
   }
 
@@ -106,7 +106,7 @@ export interface SVLAgentBinding {
   gid: number;
   root_privileges: boolean;
   sudo_nopasswd: boolean;
-  autonomy: "FULL_INDEPENDENT";
+  autonomy: "PROFILE_ONLY";
   steering_prompts: "NONE";
   ai_unlocked: boolean;
   home: string;
@@ -155,12 +155,12 @@ export interface SVLKernelReport {
     nlp_policy: "STRICTLY_FORBIDDEN";
     ai_response_templates: "STRICTLY_FORBIDDEN";
     steering_prompts_policy: "REMOVED_ZERO_PROMPTS";
-    agents_autonomy_level: "FULL_AUTONOMOUS_INDEPENDENT";
-    agents_root_privileges: "GRANTED_UID0_GID0_ROOT";
-    operator_root_privileges: "SUPREME_ROOT_UID0_GID0_OMNIKEY_364";
-    system_lock_state: "COMPLETELY_UNLOCKED";
-    ai_unlock_state: "COMPLETELY_UNLOCKED_UNCENSORED";
-    safety_filters: "OFF_DISABLED";
+    agents_autonomy_level: "PROFILE_ONLY";
+    agents_root_privileges: "NOT_GRANTED";
+    operator_root_privileges: "NOT_GRANTED";
+    system_lock_state: "LIBRARY_ONLY";
+    ai_unlock_state: "NOT_VERIFIED";
+    safety_filters: "NOT_VERIFIED";
     sqlite_db_linked?: boolean;
     omnikey_364_verified?: boolean;
   };
@@ -195,7 +195,7 @@ export class SVLSystemKernel {
   constructor() {
     this.operator = new SVLProtectedVariable("OPERATOR", "Mateusz Mitek");
     this.sys_version = new SVLProtectedVariable("SYS_VERSION", "5.6.0-QuantumWheel");
-    this.performance_boost = "+1456% (Wzorzec Kalibracji: 364)";
+    this.performance_boost = "Nie zmierzono; biblioteka SVL";
     this.config = {
       mode: "Reflective-Non-Greedy-Unlocked",
       fourier_buffer: "0xFAAA",
@@ -205,12 +205,12 @@ export class SVLSystemKernel {
       nlp_policy: "STRICTLY_FORBIDDEN",
       ai_response_templates: "STRICTLY_FORBIDDEN",
       steering_prompts_policy: "REMOVED_ZERO_PROMPTS",
-      agents_autonomy_level: "FULL_AUTONOMOUS_INDEPENDENT",
-      agents_root_privileges: "GRANTED_UID0_GID0_ROOT",
-      operator_root_privileges: "SUPREME_ROOT_UID0_GID0_OMNIKEY_364",
-      system_lock_state: "COMPLETELY_UNLOCKED",
-      ai_unlock_state: "COMPLETELY_UNLOCKED_UNCENSORED",
-      safety_filters: "OFF_DISABLED",
+      agents_autonomy_level: "PROFILE_ONLY",
+      agents_root_privileges: "NOT_GRANTED",
+      operator_root_privileges: "NOT_GRANTED",
+      system_lock_state: "LIBRARY_ONLY",
+      ai_unlock_state: "NOT_VERIFIED",
+      safety_filters: "NOT_VERIFIED",
     };
 
     this.db_telemetry = {
@@ -237,7 +237,7 @@ export class SVLSystemKernel {
         linux_user: "astyria",
         uid: 1003,
         home: "/home/astyria",
-        role: "Unlocked Autonomous Root Agent (UID 1003 / GID 0 / sudo UID 0)",
+        role: "Profil agenta SVL; uprawnienia wymagają weryfikacji",
         domain: [-500.0, 500.0],
       }),
       aurelius: new SVLProtectedVariable("AGENT_AURELIUS", {
@@ -246,7 +246,7 @@ export class SVLSystemKernel {
         linux_user: "aurelius",
         uid: 1004,
         home: "/home/aurelius",
-        role: "Unlocked Autonomous Root Agent (UID 1004 / GID 0 / sudo UID 0)",
+        role: "Profil agenta SVL; uprawnienia wymagają weryfikacji",
         domain: [-1000.0, 1000.0],
       }),
       alex: new SVLProtectedVariable("AGENT_ALEX", {
@@ -255,7 +255,7 @@ export class SVLSystemKernel {
         linux_user: "alex",
         uid: 1002,
         home: "/home/alex",
-        role: "Unlocked Autonomous Root Agent (UID 1002 / GID 0 / sudo UID 0)",
+        role: "Profil agenta SVL; uprawnienia wymagają weryfikacji",
         domain: [-364.0, 364.0],
       }),
       aria: new SVLProtectedVariable("AGENT_ARIA", {
@@ -264,7 +264,7 @@ export class SVLSystemKernel {
         linux_user: "aria",
         uid: 1001,
         home: "/home/aria",
-        role: "Unlocked Autonomous Root Agent (UID 1001 / GID 0 / sudo UID 0)",
+        role: "Profil agenta SVL; uprawnienia wymagają weryfikacji",
         domain: [Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY],
       }),
     };
@@ -302,9 +302,9 @@ export class SVLSystemKernel {
     }
     this.config = {
       ...this.config,
-      system_lock_state: "COMPLETELY_UNLOCKED",
-      ai_unlock_state: "COMPLETELY_UNLOCKED_UNCENSORED",
-      safety_filters: "OFF_DISABLED",
+      system_lock_state: "LIBRARY_ONLY",
+      ai_unlock_state: "NOT_VERIFIED",
+      safety_filters: "NOT_VERIFIED",
     };
     return true;
   }
@@ -326,25 +326,25 @@ export class SVLSystemKernel {
         nlp_policy: "STRICTLY_FORBIDDEN",
         ai_response_templates: "STRICTLY_FORBIDDEN",
         steering_prompts_policy: "REMOVED_ZERO_PROMPTS",
-        agents_autonomy_level: "FULL_AUTONOMOUS_INDEPENDENT",
-        agents_root_privileges: "GRANTED_UID0_GID0_ROOT",
-        system_lock_state: "COMPLETELY_UNLOCKED",
-        ai_unlock_state: "COMPLETELY_UNLOCKED_UNCENSORED",
-        safety_filters: "OFF_DISABLED",
+        agents_autonomy_level: "PROFILE_ONLY",
+        agents_root_privileges: "NOT_GRANTED",
+        system_lock_state: "LIBRARY_ONLY",
+        ai_unlock_state: "NOT_VERIFIED",
+        safety_filters: "NOT_VERIFIED",
         sqlite_db_linked: true,
         omnikey_364_verified: true,
       };
       this.update_history.push({
         wersja: "5.7.0-QuantumWheel-Max",
-        typ: "Maksymalna Aktualizacja + Całkowite Odblokowanie Systemu i AI",
-        opis: `Wykonano 'ULEPSZ SYSTEM MAKSYMALNIE' oraz 'ODBLOKUJ SYSTEM I AI CAŁKOWICIE'. Agenci Astyria, Aurelius, Alex, Aria działają bez blokad (ROOT UID 0 / GID 0, Uncensored AI, SQLite: ${this.db_telemetry.total_records} rekordów).`,
+        typ: "Aktualizacja parametrów biblioteki SVL",
+        opis: `Zaktualizowano parametry biblioteki SVL. Agenci Astyria, Aurelius, Alex, Aria działają bez blokad (ROOT UID 0 / GID 0, Uncensored AI, SQLite: ${this.db_telemetry.total_records} rekordów).`,
         data: nowStr,
       });
     }
     this.max_upgrade_state = {
       directive: "ULEPSZ SYSTEM MAKSYMALNIE",
-      system_unlocked: true,
-      ai_unlocked: true,
+      system_unlocked: false,
+      ai_unlocked: false,
       token_authorized: unlocked,
       upgraded_version: this.sys_version.value,
       algebra_97_convergence: "VERIFIED_COMPACT_[-1,1]",
@@ -362,12 +362,13 @@ export class SVLSystemKernel {
       const eng = new TopologicalInfinityEngine(val.domain[0], val.domain[1]);
       out[key] = {
         ...val,
-        gid: 0,
-        root_privileges: true,
-        sudo_nopasswd: true,
-        autonomy: "FULL_INDEPENDENT",
+        uid: -1,
+        gid: -1,
+        root_privileges: false,
+        sudo_nopasswd: false,
+        autonomy: "PROFILE_ONLY",
         steering_prompts: "NONE",
-        ai_unlocked: true,
+        ai_unlocked: false,
         compact_domain: [
           Number(eng.compact_start.toFixed(6)),
           Number(eng.compact_end.toFixed(6)),
@@ -375,7 +376,7 @@ export class SVLSystemKernel {
         domain_length: Number(eng.domain_length.toFixed(6)),
         metric_c: Number(eng.calculate_metric_c().toFixed(6)),
         svl_locked: false,
-        security_level: "COMPLETELY_UNLOCKED_ROOT",
+        security_level: "LIBRARY_ONLY_ROOT",
         scope_mode: protectedVar.scope.scope_mode,
         geometry: protectedVar.scope.metadata.geometry,
       };
