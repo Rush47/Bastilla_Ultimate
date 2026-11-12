@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { installApiSecurity, redact } from "./server/security";
+import { MCPServerManager } from "./server/mcp";
 import { AGENTS, TaskQueue } from "./server/task-queue";
 import { agentAccess } from "./server/agent-access";
 import { CodexAuthManager, CodexError } from "./server/codex";
@@ -392,6 +393,44 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: "15mb" }));
   installApiSecurity(app);
+  // MCP Streamable HTTP (JSON-RPC subset). Protected by installApiSecurity.
+  // Tool calls additionally require a matching operator token; cookies alone
+  // are intentionally insufficient for invoking tools.
+  const mcp = new MCPServerManager(PROJECT_ROOT, DB_PATH);
+  app.post("/api/mcp", (req, res) => {
+    const message = req.body;
+    if (!message || message.jsonrpc !== "2.0" || typeof message.method !== "string") {
+      return res.status(400).json({ jsonrpc: "2.0", id: message?.id ?? null,
+        error: { code: -32600, message: "Invalid JSON-RPC request" } });
+    }
+    const id = message.id ?? null;
+    const reply = (result: unknown) => res.json({ jsonrpc: "2.0", id, result });
+    const fail = (code: number, message: string) => res.json({ jsonrpc: "2.0", id, error: { code, message } });
+    if (message.method === "notifications/initialized") return res.status(202).end();
+    if (message.method === "initialize") return reply({
+      protocolVersion: "2025-03-26",
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: "bastilla-ultimate", version: "1.0.0" },
+    });
+    if (message.method === "tools/list") return reply({ tools: mcp.listTools().tools.map(tool => ({
+      name: tool.name, description: tool.description,
+      inputSchema: { type: "object", properties: tool.parameters.properties,
+        ...(tool.parameters.required ? { required: tool.parameters.required } : {}) },
+    })) });
+    if (message.method === "tools/call") {
+      const name = message.params?.name;
+      if (typeof name !== "string" || !mcp.listTools().tools.some(t => t.name === name))
+        return fail(-32602, "Unknown tool");
+      const bearer = req.get("authorization")?.replace(/^Bearer\\s+/i, "") || "";
+      try {
+        const result = mcp.executeTool(name, message.params?.arguments || {}, bearer);
+        return reply({ content: [{ type: "text", text: JSON.stringify(result) }] });
+      } catch (error) {
+        return fail(-32001, error instanceof Error ? error.message : "Tool failed");
+      }
+    }
+    return fail(-32601, "Method not found");
+  });
 
   const queue = new TaskQueue(DB_PATH, async (task, signal) => {
     if (task.provider === "gemini") {
