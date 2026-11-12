@@ -1,5 +1,5 @@
 import { AgentControlView } from "./components/AgentControlView";
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useRef } from "react";
 import type {
   AgentId,
   SystemOverviewResponse,
@@ -24,12 +24,16 @@ export default function App() {
     AgentId | "council"
   >("aria");
   const [overview, setOverview] = useState<SystemOverviewResponse | null>(null);
+  const [overviewError, setOverviewError] = useState<string | null>(null);
   const [needsLogin, setNeedsLogin] = useState(false);
   const [accessToken, setAccessToken] = useState("");
   const [accessError, setAccessError] = useState("");
   const [loading, setLoading] = useState<boolean>(true);
   const [syncing, setSyncing] = useState<boolean>(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
+  const overviewBusyRef = useRef(false);
+  const overviewFailCountRef = useRef(0);
+  const missionBusyRef = useRef(false);
 
   const [continuousMission, setContinuousMission] = useState<{
     active: boolean;
@@ -54,25 +58,37 @@ export default function App() {
   }, []);
 
   const fetchOverview = useCallback(async () => {
+    if (overviewBusyRef.current) return;
+    overviewBusyRef.current = true;
     try {
       const data = await apiFetchJson<SystemOverviewResponse>("/api/system/overview", {
-        timeoutMs: 12000,
+        timeoutMs: 15000,
       });
       if (data.ok) {
         setOverview(data);
+        overviewFailCountRef.current = 0;
+        setOverviewError(null);
       }
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         setNeedsLogin(true);
         return;
       }
-      console.error("Failed to fetch Bastilla OS overview:", e);
+      overviewFailCountRef.current += 1;
+      if (overviewFailCountRef.current >= 2) {
+        setOverviewError(
+          e instanceof Error ? e.message : "Chwilowy brak połączenia z backendem Bastilla OS."
+        );
+      }
     } finally {
+      overviewBusyRef.current = false;
       setLoading(false);
     }
   }, []);
 
   const fetchContinuousMission = useCallback(async () => {
+    if (missionBusyRef.current) return;
+    missionBusyRef.current = true;
     try {
       const data = await apiFetchJson<{ ok: boolean; mission: any }>(
         "/api/missions/continuous/status",
@@ -81,18 +97,21 @@ export default function App() {
       if (data.ok) {
         setContinuousMission(data.mission);
       }
-    } catch {}
+    } catch {
+    } finally {
+      missionBusyRef.current = false;
+    }
   }, []);
 
   useEffect(() => {
     fetchOverview();
-    const interval = setInterval(fetchOverview, 4000);
+    const interval = setInterval(fetchOverview, 5000);
     return () => clearInterval(interval);
   }, [fetchOverview]);
 
   useEffect(() => {
     fetchContinuousMission();
-    const interval = setInterval(fetchContinuousMission, 3500);
+    const interval = setInterval(fetchContinuousMission, 4500);
     return () => clearInterval(interval);
   }, [fetchContinuousMission]);
 
@@ -338,6 +357,18 @@ export default function App() {
       </div>
 
       {/* Main Content Stage */}
+      {overviewError && (
+        <div role="status" className="px-3 sm:px-6 py-1.5 text-xs text-amber-200 bg-amber-950/50 border-b border-amber-800/70 flex flex-wrap items-center justify-between gap-2 shrink-0">
+          <span className="truncate">{overviewError}</span>
+          <button
+            type="button"
+            onClick={() => void fetchOverview()}
+            className="px-2.5 py-0.5 rounded bg-amber-800/80 hover:bg-amber-700 text-amber-100 font-semibold shrink-0"
+          >
+            Ponów połączenie
+          </button>
+        </div>
+      )}
       {overview?.host.legacy_records_unverified && (
         <p className={`px-3 sm:px-6 py-1.5 sm:py-2.5 text-xs sm:text-sm text-amber-200 border-b border-amber-900 shrink-0 ${activeTab === "chat" ? "hidden sm:block" : ""}`}>
           Zachowano historię starszej wersji, która może zawierać dane demonstracyjne. Dostęp agentów i rzeczywiste wyniki sprawdź w zakładce Sterowanie.

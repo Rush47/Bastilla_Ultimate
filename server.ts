@@ -1391,19 +1391,20 @@ print(json.dumps({"results": rows}))`);
   // 1. Live System, Linux Kernel, SVL Core & SQLite State Overview
   app.get("/api/system/overview", async (_req, res) => {
     try {
-      let svlReport: any = null;
-      try {
-        const { stdout } = await execFileAsync(
-          "python3",
-          [path.join(KERNEL_DIR, "svl_kernel.py")],
-          { timeout: 5000 }
-        );
-        svlReport = JSON.parse(stdout);
-      } catch {
-        const fallbackKernel = new SVLSystemKernel();
-        fallbackKernel.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT");
-        svlReport = fallbackKernel.generate_system_status_report();
-      }
+      const svlPromise = (async () => {
+        try {
+          const { stdout } = await execFileAsync(
+            "python3",
+            [path.join(KERNEL_DIR, "svl_kernel.py")],
+            { timeout: 5000 }
+          );
+          return JSON.parse(stdout);
+        } catch {
+          const fallbackKernel = new SVLSystemKernel();
+          fallbackKernel.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT");
+          return fallbackKernel.generate_system_status_report();
+        }
+      })();
 
       const hostProbeScript = `
 import json, os, pwd, subprocess, sqlite3, sys
@@ -1411,9 +1412,16 @@ from datetime import datetime, timezone
 
 def cmd_out(c):
     try:
-        return subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT, timeout=3).decode('utf-8', 'replace').strip()
-    except Exception as e:
+        return subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT, timeout=2).decode('utf-8', 'replace').strip()
+    except Exception:
         return ""
+
+def which_bin(name, fallback=""):
+    for p in ("/usr/local/bin/" + name, "/usr/bin/" + name, "/bin/" + name):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+    found = cmd_out(f"which {name}")
+    return found or fallback
 
 os_release = {}
 if os.path.exists("/etc/os-release"):
@@ -1431,9 +1439,28 @@ if os.path.exists("/proc/meminfo"):
             if len(parts) == 2:
                 meminfo[parts[0].strip()] = parts[1].strip()
 
-loadavg = cmd_out("cat /proc/loadavg").split()[:3]
-uptime_sec = float(cmd_out("cat /proc/uptime").split()[0] or 0)
-uname_str = cmd_out("uname -srmo")
+loadavg = []
+if os.path.exists("/proc/loadavg"):
+    try:
+        with open("/proc/loadavg") as f:
+            loadavg = f.read().strip().split()[:3]
+    except Exception:
+        pass
+
+uptime_sec = 0.0
+if os.path.exists("/proc/uptime"):
+    try:
+        with open("/proc/uptime") as f:
+            uptime_sec = float(f.read().strip().split()[0] or 0)
+    except Exception:
+        pass
+
+try:
+    u = os.uname()
+    uname_str = f"{u.sysname} {u.release} {u.machine} GNU/Linux"
+except Exception:
+    uname_str = cmd_out("uname -srmo")
+
 disk_df = cmd_out("df -h / | tail -n 1").split()
 
 agents_live = []
@@ -1443,7 +1470,7 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
         uid, gid, home, shell = pw.pw_uid, pw.pw_gid, pw.pw_dir, pw.pw_shell
     except KeyError:
         uid, gid, home, shell = -1, -1, f"/home/{a}", "/bin/bash"
-    pids = cmd_out(f"pgrep -u {a} -f 'agent_worker.py {a}([ ]|$)' || true").splitlines()
+    pids = cmd_out(f"pgrep -u {a} -f 'agent_worker.py {a}([ ]|$)' || true").splitlines() if uid >= 0 else []
     pid = int(pids[0]) if pids and pids[0].isdigit() else 0
     worker_status = {}
     status_path = f"/home/{a}/worker_status.json"
@@ -1473,47 +1500,56 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
         "worker_status": worker_status
     })
 
+gh_bin = which_bin("gh", "/usr/local/bin/gh")
+gh_installed = os.path.exists(gh_bin)
+llmman_installed = os.path.exists("/usr/local/bin/llmman")
+opencode_installed = os.path.exists("/usr/local/bin/opencode")
+openclaw_installed = os.path.exists("/usr/local/bin/openclaw")
+cloudflared_installed = os.path.exists("/usr/local/bin/cloudflared")
+ollama_bin = which_bin("ollama", "/usr/local/bin/ollama")
+ollama_installed = os.path.exists(ollama_bin)
+
 tools = {
     "gh": {
-        "installed": os.path.exists("/usr/local/bin/gh") or bool(cmd_out("which gh")),
-        "version": cmd_out("gh --version | head -n 1"),
-        "binary_path": cmd_out("which gh") or "/usr/local/bin/gh",
+        "installed": gh_installed,
+        "version": cmd_out(f"{gh_bin} --version | head -n 1") if gh_installed else "",
+        "binary_path": gh_bin,
         "auth_ready": False,
         "requirement_note": "Zainstalowany klient. Uprawnienia do repozytorium wymagają osobnego zapytania GitHub."
     },
     "llmman": {
-        "installed": os.path.exists("/usr/local/bin/llmman"),
-        "version": cmd_out("/usr/local/bin/llmman --version"),
+        "installed": llmman_installed,
+        "version": cmd_out("/usr/local/bin/llmman --version") if llmman_installed else "",
         "binary_path": "/usr/local/bin/llmman",
         "elf_path": "/usr/local/bin/llmman.fedora45.elf",
         "auth_ready": False,
         "requirement_note": "Obecność pliku nie potwierdza działania modelu; wrapper wymaga osobnej weryfikacji."
     },
     "opencode": {
-        "installed": os.path.exists("/usr/local/bin/opencode"),
-        "version": cmd_out("/usr/local/bin/opencode --version"),
+        "installed": opencode_installed,
+        "version": cmd_out("/usr/local/bin/opencode --version") if opencode_installed else "",
         "binary_path": "/usr/local/bin/opencode",
         "auth_ready": False,
         "requirement_note": "Wrapper CLI; dostęp do modelu niezweryfikowany."
     },
     "openclaw": {
-        "installed": os.path.exists("/usr/local/bin/openclaw"),
-        "version": cmd_out("/usr/local/bin/openclaw --version"),
+        "installed": openclaw_installed,
+        "version": cmd_out("/usr/local/bin/openclaw --version") if openclaw_installed else "",
         "binary_path": "/usr/local/bin/openclaw",
         "auth_ready": False,
         "requirement_note": "Wrapper CLI; wykonanie kontenera niezweryfikowane."
     },
     "cloudflared": {
-        "installed": os.path.exists("/usr/local/bin/cloudflared"),
-        "version": cmd_out("cloudflared --version"),
+        "installed": cloudflared_installed,
+        "version": cmd_out("/usr/local/bin/cloudflared --version") if cloudflared_installed else "",
         "binary_path": "/usr/local/bin/cloudflared",
         "auth_ready": False,
         "requirement_note": "Tunel i poświadczenia niezweryfikowane."
     },
     "ollama": {
-        "installed": os.path.exists("/usr/local/bin/ollama") or bool(cmd_out("which ollama")),
-        "version": cmd_out("ollama --version"),
-        "binary_path": cmd_out("which ollama") or "/usr/local/bin/ollama",
+        "installed": ollama_installed,
+        "version": cmd_out(f"{ollama_bin} --version") if ollama_installed else "",
+        "binary_path": ollama_bin,
         "auth_ready": False,
         "requirement_note": "Wymaga uruchomionej usługi Ollama i pobranego modelu."
     }
@@ -1563,8 +1599,13 @@ print(json.dumps({
     "distro_files": distro_files
 }))
 `;
-      const hostData = await querySqliteJson(hostProbeScript);
-      const codexStatus = await codexAuth.status();
+      const [svlReport, hostData, codexStatus, ollamaStatus, imageStatus] = await Promise.all([
+        svlPromise,
+        querySqliteJson(hostProbeScript),
+        codexAuth.status(),
+        probeOllamaStatus(getOllamaBaseUrl()),
+        imageManager.probeStatus(),
+      ]);
       hostData.tools.codex = {
         installed: codexStatus.installed,
         version: codexStatus.version,
@@ -1572,10 +1613,6 @@ print(json.dumps({
         auth_ready: codexStatus.auth_ready,
         requirement_note: codexStatus.message,
       };
-      const [ollamaStatus, imageStatus] = await Promise.all([
-        probeOllamaStatus(getOllamaBaseUrl()),
-        imageManager.probeStatus(),
-      ]);
 
       hostData.tools.ollama.auth_ready = ollamaStatus.reachable && ollamaStatus.models.length > 0;
       hostData.tools.ollama.requirement_note = ollamaStatus.message;
