@@ -34,4 +34,10 @@ for agent in aria alex astyria aurelius; do
     BASTILLA_DB_PATH="$database_path" runuser -u "$agent" -- nohup python3 /usr/lib/bastilla/agent_worker.py "$agent" >"/var/log/bastilla/$agent-worker.log" 2>&1 &
   fi
 done
-echo 'Provisioned account heartbeats. Model and GitHub access require separate verification.'
+if command -v ollama >/dev/null 2>&1 && file -b "$(command -v ollama)" 2>/dev/null | grep -qi "ELF"; then
+  if ! pgrep -f "(^|/)ollama serve" >/dev/null 2>&1; then
+    OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}" OLLAMA_MODELS="${OLLAMA_MODELS:-/root/.ollama/models}" OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-10m}" \
+      nohup "$(command -v ollama)" serve >/var/log/bastilla/ollama-daemon.log 2>&1 &
+  fi
+fi
+echo 'Provisioned account heartbeats and Ollama daemon check. Model weights and GitHub access require separate verification.'

@@ -16,19 +16,54 @@ import {
   buildApiUrl,
   onApiUnauthorized,
 } from "./utils/apiClient";
+import { useBastillaStore } from "./store/bastillaStore";
+import {
+  LayoutGrid,
+  MessageSquare,
+  Sliders,
+  Terminal,
+  Users,
+  Globe,
+  Activity,
+  PanelLeftClose,
+  PanelLeftOpen,
+  RefreshCw,
+} from "lucide-react";
+
 const ChatWorkView = React.lazy(() => import("./components/ChatWorkView").then(m => ({ default: m.ChatWorkView })));
 const TerminalsView = React.lazy(() => import("./components/TerminalsView").then(m => ({ default: m.TerminalsView })));
 const AgentsMemoryView = React.lazy(() => import("./components/AgentsMemoryView").then(m => ({ default: m.AgentsMemoryView })));
 const SolarSystem3DView = React.lazy(() => import("./components/SolarSystem3DView").then(m => ({ default: m.SolarSystem3DView })));
 const DistroDiagnosticsView = React.lazy(() => import("./components/DistroDiagnosticsView").then(m => ({ default: m.DistroDiagnosticsView })));
 
+const NAV_ITEMS: Array<{
+  id: WorkspaceTab;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}> = [
+  { id: "control", label: "Sterowanie", icon: Sliders },
+  { id: "desktop", label: "Pulpit Violet", icon: LayoutGrid },
+  { id: "chat", label: "ChatGPT Work", icon: MessageSquare },
+  { id: "terminals", label: "Terminale", icon: Terminal },
+  { id: "agents", label: "Agenci Linux", icon: Users },
+  { id: "space3d", label: "Układ 3D", icon: Globe },
+  { id: "diagnostics", label: "Diagnostyka i GitHub", icon: Activity },
+];
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>("desktop");
-  const [selectedChatAgent, setSelectedChatAgent] = useState<
-    AgentId | "council"
-  >("aria");
-  const [overview, setOverview] = useState<SystemOverviewResponse | null>(null);
-  const [overviewError, setOverviewError] = useState<string | null>(null);
+  const {
+    activeTab,
+    selectedChatAgent,
+    sidebarCollapsed,
+    overview,
+    overviewError,
+    setActiveTab,
+    setSelectedChatAgent,
+    toggleSidebar,
+    setOverview,
+    setOverviewError,
+  } = useBastillaStore();
+
   const [needsLogin, setNeedsLogin] = useState(false);
   const [accessToken, setAccessToken] = useState("");
   const [accessError, setAccessError] = useState("");
@@ -91,7 +126,7 @@ export default function App() {
       overviewBusyRef.current = false;
       setLoading(false);
     }
-  }, []);
+  }, [setOverview, setOverviewError]);
 
   const fetchContinuousMission = useCallback(async () => {
     if (missionBusyRef.current) return;
@@ -111,14 +146,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchOverview();
-    const interval = setInterval(fetchOverview, 5000);
+    void fetchOverview();
+    const interval = setInterval(() => void fetchOverview(), 10000);
     return () => clearInterval(interval);
   }, [fetchOverview]);
 
   useEffect(() => {
-    fetchContinuousMission();
-    const interval = setInterval(fetchContinuousMission, 4500);
+    void fetchContinuousMission();
+    const interval = setInterval(() => void fetchContinuousMission(), 8000);
     return () => clearInterval(interval);
   }, [fetchContinuousMission]);
 
@@ -144,6 +179,8 @@ export default function App() {
     es.addEventListener("git_sync", handleGitSyncEvent as EventListener);
     es.addEventListener("mission_cycle", handleRefreshEvent);
     es.addEventListener("image_generated", handleRefreshEvent);
+    es.addEventListener("desktop_status", handleRefreshEvent);
+    es.addEventListener("agent_task", handleRefreshEvent);
     return () => {
       es.close();
     };
@@ -230,94 +267,138 @@ export default function App() {
     </form>
   </main>;
 
+  const ollamaOnline = Boolean(overview?.ai_routing?.ollama_online);
+  const desktopIsolated = Boolean(overview?.desktop_status?.sessionIsolated);
+
   return (
     <div
       className={`${
         activeTab === "chat"
           ? "h-[100dvh] overflow-hidden"
           : "min-h-screen overflow-x-hidden"
-      } bg-[#07090e] text-slate-100 flex flex-col`}
+      } bg-[#07090e] text-slate-100 flex flex-col lg:flex-row`}
     >
-      {/* Responsive Compact Top Bar */}
-      <header className="flex flex-wrap lg:flex-nowrap items-center justify-between gap-2 sm:gap-3 px-3 sm:px-6 py-2 border-b border-slate-800 bg-[#0a0d14] shrink-0">
-        {/* Zone 1: Single text element wordmark */}
-        <a
-          href="#desktop"
-          onClick={(e) => {
-            e.preventDefault();
-            setActiveTab("desktop");
-          }}
-          className="font-display text-base sm:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
-        >
-          Bastilla OS Ultimate
-        </a>
+      {/* Desktop Collapsible Left Sidebar (lg+) — hidden on <lg so accessible button names stay unique */}
+      <aside
+        aria-label="Panel boczny Bastilla"
+        className={`hidden lg:flex lg:sticky lg:top-0 lg:h-screen overflow-y-auto flex-col justify-between border-r border-slate-800/90 bg-[#0a0d14] shrink-0 transition-[width] duration-200 ${
+          sidebarCollapsed ? "w-16" : "w-60"
+        }`}
+      >
+        <div className="flex flex-col min-h-0">
+          <div className="flex items-center justify-between gap-2 px-3 py-3 border-b border-slate-800/80">
+            {!sidebarCollapsed && (
+              <a
+                href="#desktop"
+                onClick={(e) => {
+                  e.preventDefault();
+                  setActiveTab("desktop");
+                }}
+                className="font-display text-base font-bold tracking-tight text-white whitespace-nowrap truncate"
+              >
+                Bastilla OS Ultimate
+              </a>
+            )}
+            <button
+              type="button"
+              onClick={toggleSidebar}
+              aria-label={sidebarCollapsed ? "Rozwiń menu boczne" : "Zwiń menu boczne"}
+              title={sidebarCollapsed ? "Rozwiń menu boczne" : "Zwiń menu boczne"}
+              className="min-h-9 min-w-9 flex items-center justify-center rounded-lg bg-[#111723] hover:bg-slate-800 border border-slate-800 text-slate-300 hover:text-white transition-colors shrink-0"
+            >
+              {sidebarCollapsed ? (
+                <PanelLeftOpen className="w-4 h-4 text-violet-400" />
+              ) : (
+                <PanelLeftClose className="w-4 h-4 text-violet-400" />
+              )}
+            </button>
+          </div>
 
-        {/* Zone 2: 5 concise single-line text navigation links */}
-        <nav
-          aria-label="Główna nawigacja systemu"
-          className="order-3 lg:order-none flex w-full lg:w-auto min-w-0 items-center gap-4 sm:gap-5 text-xs sm:text-sm font-medium text-slate-300 overflow-x-auto no-scrollbar"
-        >
-          <button type="button" onClick={() => setActiveTab("control")} className={`min-h-11 whitespace-nowrap shrink-0 border-b-2 ${activeTab === "control" ? "border-violet-500 text-white" : "border-transparent text-slate-400"}`}>Sterowanie</button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("desktop")}
-            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeTab === "desktop"
-                ? "text-white border-violet-500"
-                : "text-slate-400 border-transparent hover:text-white"
-            }`}
-          >
-            Pulpit Violet
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("chat")}
-            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeTab === "chat"
-                ? "text-white border-violet-500"
-                : "text-slate-400 border-transparent hover:text-white"
-            }`}
-          >
-            ChatGPT Work
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("terminals")}
-            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeTab === "terminals"
-                ? "text-white border-violet-500"
-                : "text-slate-400 border-transparent hover:text-white"
-            }`}
-          >
-            Terminale
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("agents")}
-            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeTab === "agents"
-                ? "text-white border-violet-500"
-                : "text-slate-400 border-transparent hover:text-white"
-            }`}
-          >
-            Agenci Linux
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("space3d")}
-            className={`min-h-11 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
-              activeTab === "space3d"
-                ? "text-white border-violet-500"
-                : "text-slate-400 border-transparent hover:text-white"
-            }`}
-          >
-            Układ 3D
-          </button>
-        </nav>
+          <nav aria-label="Główna nawigacja systemu" className="p-2 space-y-1">
+            {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
+              const active = activeTab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setActiveTab(id)}
+                  aria-label={label}
+                  title={sidebarCollapsed ? label : undefined}
+                  className={`w-full min-h-10 px-2.5 py-2 rounded-lg text-xs font-medium flex items-center gap-2.5 transition-colors whitespace-nowrap ${
+                    sidebarCollapsed ? "justify-center" : "justify-start"
+                  } ${
+                    active
+                      ? "bg-violet-600/20 border border-violet-500/60 text-white"
+                      : "border border-transparent text-slate-400 hover:text-white hover:bg-[#111723]"
+                  }`}
+                >
+                  <Icon className={`w-4 h-4 shrink-0 ${active ? "text-violet-400" : "text-slate-400"}`} />
+                  {!sidebarCollapsed && <span className="truncate">{label}</span>}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
 
-        {/* Zone 3: Operator Avatar + Primary actions */}
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="hidden sm:flex items-center gap-2 px-2.5 py-1 rounded-lg bg-[#111723] border border-slate-800 text-xs text-slate-200">
+        {/* Bottom Operator & Compact Subsystem Telemetry */}
+        <div className="p-2.5 border-t border-slate-800/80 space-y-2">
+          {!sidebarCollapsed && (
+            <div className="px-2 py-1.5 rounded-lg bg-[#0d121c] border border-slate-800/80 text-[11px] font-mono-tabular space-y-1">
+              <div className="flex items-center justify-between text-slate-400">
+                <span>Ollama</span>
+                <span className={ollamaOnline ? "text-emerald-400 font-semibold" : "text-amber-300"}>
+                  {overview?.ollama_status?.state || (ollamaOnline ? "ONLINE" : "OFFLINE")}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-slate-400">
+                <span>Pulpit X11</span>
+                <span className={desktopIsolated ? "text-violet-300 font-semibold" : "text-slate-400"}>
+                  {desktopIsolated ? overview?.desktop_status?.display || ":99" : "GOTOWY"}
+                </span>
+              </div>
+            </div>
+          )}
+
+          <div className={`flex items-center gap-2 p-1.5 rounded-lg bg-[#111723] border border-slate-800 ${sidebarCollapsed ? "justify-center" : ""}`}>
+            <img
+              src={getOperatorAvatarUrl(overview)}
+              alt="Operator Mateusz Mitek"
+              referrerPolicy="no-referrer"
+              className="w-7 h-7 rounded-full object-cover border border-violet-500/70 shrink-0"
+              onError={(e) => {
+                (e.currentTarget as HTMLImageElement).src = OPERATOR_AVATAR;
+              }}
+            />
+            {!sidebarCollapsed && (
+              <div className="min-w-0 flex-1">
+                <div className="text-xs font-semibold text-white truncate">
+                  {overview?.svl_report?.Operator || "Mateusz Mitek"}
+                </div>
+                <div className="text-[10px] text-slate-400 font-mono-tabular truncate">
+                  SVL {overview?.svl_report?.System?.slice(0, 14) || "5.7.0"}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </aside>
+
+      {/* Main Column */}
+      <div className="flex-1 min-w-0 flex flex-col min-h-0">
+        {/* Mobile & Tablet Compact Header (<lg) — hidden on lg+ */}
+        <header className="flex lg:hidden flex-wrap items-center justify-between gap-2 px-3 py-2 border-b border-slate-800 bg-[#0a0d14] shrink-0">
+          <a
+            href="#desktop"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveTab("desktop");
+            }}
+            className="font-display text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+          >
+            Bastilla OS Ultimate
+          </a>
+
+          <div className="flex items-center gap-2 shrink-0">
             <img
               src={getOperatorAvatarUrl(overview)}
               alt="Operator Mateusz Mitek"
@@ -327,157 +408,156 @@ export default function App() {
                 (e.currentTarget as HTMLImageElement).src = OPERATOR_AVATAR;
               }}
             />
-            <span className="font-semibold truncate max-w-[130px]">
-              {overview?.svl_report?.Operator || "Mateusz Mitek"}
-            </span>
           </div>
-          <button
-            type="button"
-            onClick={() => setActiveTab("diagnostics")}
-            className={`min-h-11 px-4 py-2 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
-              activeTab === "diagnostics"
-                ? "bg-violet-500 text-white"
-                : "bg-violet-600 hover:bg-violet-500 text-white"
-            }`}
-          >
-            Diagnostyka i GitHub
-          </button>
-        </div>
-      </header>
 
-      {/* Continuous Autonomous Background Mission Bar (Aria, Alex, Astyria, Aurelius) */}
-      <div className="bg-[#0b0f1a] border-b border-violet-900/40 px-3 sm:px-6 py-1.5 flex flex-wrap items-center justify-between gap-1.5 sm:gap-2 text-xs font-mono-tabular shrink-0">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="relative flex h-2.5 w-2.5 shrink-0">
-            {continuousMission?.active && (
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-            )}
+          <nav
+            aria-label="Nawigacja mobilna systemu"
+            className="flex w-full min-w-0 items-center gap-3 text-xs font-medium text-slate-300 overflow-x-auto no-scrollbar"
+          >
+            {NAV_ITEMS.map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setActiveTab(id)}
+                className={`min-h-10 py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 ${
+                  activeTab === id
+                    ? "text-white border-violet-500"
+                    : "text-slate-400 border-transparent hover:text-white"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+        </header>
+
+        {/* Continuous Autonomous Background Mission & Sync Bar */}
+        <div className="bg-[#0b0f1a] border-b border-violet-900/40 px-3 sm:px-6 py-1.5 flex flex-wrap lg:flex-nowrap items-center justify-between gap-1.5 sm:gap-2 text-xs font-mono-tabular shrink-0">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
             <span
-              className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
+              className={`inline-block rounded-full h-2 w-2 shrink-0 ${
                 continuousMission?.active ? "bg-emerald-500" : "bg-amber-500"
               }`}
             />
-          </span>
-          <span className="font-bold text-white uppercase text-[11px] tracking-wide shrink-0 flex items-center gap-1.5">
-            {continuousMission?.active
-              ? "MISJA CIĄGŁA AI: ROZWÓJ LINUX & BACKEND"
-              : "MISJA CIĄGŁA AI WSTRZYMANA"}
-          </span>
-          <span className="px-1.5 py-0.5 rounded bg-violet-950/80 border border-violet-700/50 text-violet-300 text-[10px] shrink-0 font-bold">
-            Cykl #{continuousMission?.cycle ?? 0} · Nowości: +{continuousMission?.stats?.innovationsAdded ?? 0}
-          </span>
-          <span className="text-slate-400 hidden md:inline truncate max-w-sm lg:max-w-xl text-[11px]">
-            {syncNotice || continuousMission?.lastAction || "Ciągłe dostosowywanie systemu Linux i backendu SQLite"}
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 flex-wrap">
-          <span className="text-[10px] text-slate-400 hidden xl:inline">
-            Linux: <strong className="text-emerald-300">+{continuousMission?.stats?.linuxAdaptations || 0}</strong> · Backend: <strong className="text-cyan-300">+{continuousMission?.stats?.backendUpgrades || 0}</strong>
-          </span>
-          <button
-            type="button"
-            onClick={handleGlobalSync}
-            disabled={syncing}
-            className="min-h-9 sm:min-h-7 px-2.5 sm:px-3 py-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 whitespace-nowrap"
-          >
-            {syncing ? "Synchronizacja..." : "Synchronizuj"}
-          </button>
-          <button
-            type="button"
-            onClick={() => void triggerMissionCycle(true)}
-            disabled={triggeringCycle}
-            className="min-h-9 sm:min-h-7 px-2 sm:px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap"
-            title="Wygeneruj i wdróż nową innowację AI dla Linuxa i backendu"
-          >
-            <span>{triggeringCycle ? "Wdrażanie nowości AI..." : "Wdróż Nowość AI"}</span>
-          </button>
-          <button
-            type="button"
-            onClick={toggleMission}
-            className={`min-h-9 sm:min-h-7 px-2 sm:px-2.5 py-1 rounded text-[11px] font-semibold transition-colors whitespace-nowrap ${
-              continuousMission?.active
-                ? "bg-slate-800 hover:bg-slate-700 text-slate-300"
-                : "bg-emerald-600 hover:bg-emerald-500 text-white"
-            }`}
-          >
-            {continuousMission?.active ? "Wstrzymaj" : "Wznów misję"}
-          </button>
-        </div>
-      </div>
-
-      {/* Main Content Stage */}
-      {overviewError && (
-        <div role="status" className="px-3 sm:px-6 py-1.5 text-xs text-amber-200 bg-amber-950/50 border-b border-amber-800/70 flex flex-wrap items-center justify-between gap-2 shrink-0">
-          <span className="truncate">{overviewError}</span>
-          <button
-            type="button"
-            onClick={() => void fetchOverview()}
-            className="px-2.5 py-0.5 rounded bg-amber-800/80 hover:bg-amber-700 text-amber-100 font-semibold shrink-0"
-          >
-            Ponów połączenie
-          </button>
-        </div>
-      )}
-      {overview?.host.legacy_records_unverified && (
-        <p className={`px-3 sm:px-6 py-1.5 sm:py-2.5 text-xs sm:text-sm text-amber-200 border-b border-amber-900 shrink-0 ${activeTab === "chat" ? "hidden sm:block" : ""}`}>
-          Zachowano historię starszej wersji, która może zawierać dane demonstracyjne. Dostęp agentów i rzeczywiste wyniki sprawdź w zakładce Sterowanie.
-        </p>
-      )}
-      <main className={`flex-1 min-w-0 ${activeTab === "chat" ? "min-h-0 flex flex-col overflow-hidden" : ""}`}>
-        <React.Suspense fallback={<p className="p-6">Ładowanie panelu…</p>}>
-        {loading && !overview ? (
-          <div className="p-8 max-w-5xl mx-auto space-y-4">
-            <div className="h-24 rounded-xl bg-slate-900/80 border border-slate-800 animate-pulse" />
-            <div className="grid grid-cols-2 gap-4">
-              <div className="h-64 rounded-xl bg-slate-900/80 border border-slate-800 animate-pulse" />
-              <div className="h-64 rounded-xl bg-slate-900/80 border border-slate-800 animate-pulse" />
-            </div>
+            <span className="font-bold text-white uppercase text-[11px] tracking-wide shrink-0">
+              {continuousMission?.active
+                ? "MISJA CIĄGŁA AI: LINUX & BACKEND"
+                : "MISJA CIĄGŁA AI WSTRZYMANA"}
+            </span>
+            <span className="text-violet-300 text-[11px] shrink-0">
+              · Cykl #{continuousMission?.cycle ?? 0} (+{continuousMission?.stats?.innovationsAdded ?? 0})
+            </span>
+            <span className="text-slate-400 hidden md:inline truncate text-[11px]">
+              · {syncNotice || continuousMission?.lastAction || "Gotowość operacyjna Bastilla OS"}
+            </span>
           </div>
-        ) : (
-          <>
-            {activeTab === "control" && <AgentControlView />}
-            {activeTab === "desktop" && (
-              <BastillaDesktopView
-                overview={overview}
-                onNavigate={setActiveTab}
-                onSelectAgentForChat={(a) => setSelectedChatAgent(a)}
-                onRefresh={fetchOverview}
-              />
-            )}
-            {activeTab === "chat" && (
-              <ChatWorkView
-                overview={overview}
-                selectedAgent={selectedChatAgent}
-                onSelectAgent={setSelectedChatAgent}
-                onRefresh={fetchOverview}
-              />
-            )}
-            {activeTab === "terminals" && (
-              <TerminalsView onRefresh={fetchOverview} />
-            )}
-            {activeTab === "agents" && (
-              <AgentsMemoryView
-                overview={overview}
-                onRefresh={fetchOverview}
-              />
-            )}
-            {activeTab === "space3d" && (
-              <SolarSystem3DView
-                overview={overview}
-                onRefresh={fetchOverview}
-              />
-            )}
-            {activeTab === "diagnostics" && (
-              <DistroDiagnosticsView
-                overview={overview}
-                onRefresh={fetchOverview}
-              />
-            )}
-          </>
+
+          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 flex-wrap">
+            <button
+              type="button"
+              onClick={handleGlobalSync}
+              disabled={syncing}
+              className="min-h-9 sm:min-h-7 px-2.5 sm:px-3 py-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap"
+            >
+              <RefreshCw className={`w-3 h-3 ${syncing ? "animate-spin" : ""}`} />
+              <span>{syncing ? "Synchronizacja..." : "Synchronizuj"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => void triggerMissionCycle(true)}
+              disabled={triggeringCycle}
+              className="min-h-9 sm:min-h-7 px-2 sm:px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 whitespace-nowrap"
+              title="Wygeneruj i wdróż nową innowację AI dla Linuxa i backendu"
+            >
+              {triggeringCycle ? "Wdrażanie..." : "Wdróż Nowość AI"}
+            </button>
+            <button
+              type="button"
+              onClick={toggleMission}
+              className={`min-h-9 sm:min-h-7 px-2 sm:px-2.5 py-1 rounded text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                continuousMission?.active
+                  ? "bg-slate-800 hover:bg-slate-700 text-slate-300"
+                  : "bg-emerald-600 hover:bg-emerald-500 text-white"
+              }`}
+            >
+              {continuousMission?.active ? "Wstrzymaj" : "Wznów misję"}
+            </button>
+          </div>
+        </div>
+
+        {/* Main Content Stage */}
+        {overviewError && (
+          <div role="status" className="px-3 sm:px-6 py-1.5 text-xs text-amber-200 bg-amber-950/50 border-b border-amber-800/70 flex flex-wrap items-center justify-between gap-2 shrink-0">
+            <span className="truncate">{overviewError}</span>
+            <button
+              type="button"
+              onClick={() => void fetchOverview()}
+              className="px-2.5 py-0.5 rounded bg-amber-800/80 hover:bg-amber-700 text-amber-100 font-semibold shrink-0"
+            >
+              Ponów połączenie
+            </button>
+          </div>
         )}
-        </React.Suspense>
-      </main>
+        {overview?.host.legacy_records_unverified && (
+          <p className={`px-3 sm:px-6 py-1.5 sm:py-2 text-xs text-amber-200 border-b border-amber-900 shrink-0 ${activeTab === "chat" ? "hidden sm:block" : ""}`}>
+            Zachowano historię starszej wersji, która może zawierać dane demonstracyjne. Dostęp agentów i rzeczywiste wyniki sprawdź w zakładce Sterowanie.
+          </p>
+        )}
+        <main className={`flex-1 min-w-0 ${activeTab === "chat" ? "min-h-0 flex flex-col overflow-hidden" : ""}`}>
+          <React.Suspense fallback={<p className="p-6 text-xs text-slate-400">Ładowanie panelu…</p>}>
+          {loading && !overview ? (
+            <div className="p-8 max-w-5xl mx-auto space-y-4">
+              <div className="h-24 rounded-xl bg-slate-900/80 border border-slate-800 animate-pulse" />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="h-64 rounded-xl bg-slate-900/80 border border-slate-800 animate-pulse" />
+                <div className="h-64 rounded-xl bg-slate-900/80 border border-slate-800 animate-pulse" />
+              </div>
+            </div>
+          ) : (
+            <>
+              {activeTab === "control" && <AgentControlView />}
+              {activeTab === "desktop" && (
+                <BastillaDesktopView
+                  overview={overview}
+                  onNavigate={setActiveTab}
+                  onSelectAgentForChat={(a) => setSelectedChatAgent(a)}
+                  onRefresh={fetchOverview}
+                />
+              )}
+              {activeTab === "chat" && (
+                <ChatWorkView
+                  overview={overview}
+                  selectedAgent={selectedChatAgent}
+                  onSelectAgent={setSelectedChatAgent}
+                  onRefresh={fetchOverview}
+                />
+              )}
+              {activeTab === "terminals" && (
+                <TerminalsView onRefresh={fetchOverview} />
+              )}
+              {activeTab === "agents" && (
+                <AgentsMemoryView
+                  overview={overview}
+                  onRefresh={fetchOverview}
+                />
+              )}
+              {activeTab === "space3d" && (
+                <SolarSystem3DView
+                  overview={overview}
+                  onRefresh={fetchOverview}
+                />
+              )}
+              {activeTab === "diagnostics" && (
+                <DistroDiagnosticsView
+                  overview={overview}
+                  onRefresh={fetchOverview}
+                />
+              )}
+            </>
+          )}
+          </React.Suspense>
+        </main>
+      </div>
     </div>
   );
 }

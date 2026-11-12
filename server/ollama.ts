@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { existsSync, openSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -144,7 +144,7 @@ export async function pullOllamaModelSafe(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: cleanModel, stream: false }),
-      signal: AbortSignal.timeout(120000),
+      signal: AbortSignal.timeout(600000),
     });
     const text = await res.text();
     let parsed: any = {};
@@ -203,7 +203,15 @@ async function detectOllamaBinary(): Promise<{
     try {
       const stat = statSync(binaryPath);
       if (stat.isFile()) {
-        const head = readFileSync(binaryPath, { encoding: "utf8" }).slice(0, 256);
+        const fd = openSync(binaryPath, "r");
+        const buf = Buffer.alloc(256);
+        let bytesRead = 0;
+        try {
+          bytesRead = readSync(fd, buf, 0, 256, 0);
+        } finally {
+          closeSync(fd);
+        }
+        const head = buf.subarray(0, bytesRead).toString("utf8");
         if (head.startsWith("#!") && head.includes("python")) {
           binaryType = "python-http-wrapper";
         } else {
@@ -217,7 +225,7 @@ async function detectOllamaBinary(): Promise<{
 
   let daemonPid: number | null = null;
   try {
-    const { stdout } = await execFileAsync("pgrep", ["-f", "ollama serve"], { timeout: 1500 });
+    const { stdout } = await execFileAsync("pgrep", ["-f", "(^|/)ollama serve"], { timeout: 1500 });
     const pid = parseInt(stdout.trim().split(/\s+/)[0] || "", 10);
     if (!Number.isNaN(pid) && pid > 0) daemonPid = pid;
   } catch {}
@@ -400,14 +408,30 @@ export async function startOllamaDaemon(ollamaBaseUrl: string): Promise<{
 
   try {
     const logFd = openSync("/tmp/bastilla-ollama.log", "a");
+    let hostEnv = "127.0.0.1:11434";
+    try {
+      const parsed = new URL(ollamaBaseUrl);
+      if (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "0.0.0.0") {
+        hostEnv = `${parsed.hostname}:${parsed.port || "11434"}`;
+      }
+    } catch {}
     const child = spawn(before.binaryPath, ["serve"], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        OLLAMA_HOST: process.env.OLLAMA_HOST || hostEnv,
+        OLLAMA_MODELS: process.env.OLLAMA_MODELS || "/root/.ollama/models",
+        OLLAMA_KEEP_ALIVE: process.env.OLLAMA_KEEP_ALIVE || "10m",
+        HOME: process.env.HOME || "/root",
+      },
     });
     child.unref();
+    try {
+      closeSync(logFd);
+    } catch {}
 
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 15; i++) {
       await new Promise((r) => setTimeout(r, 400));
       const check = await probeOllamaStatus(ollamaBaseUrl);
       if (check.reachable) {
@@ -455,7 +479,7 @@ export async function streamOllamaChat(options: {
         payload.tools = options.tools;
       }
 
-      const res = await fetch(`${endpoint}/api/chat`, {
+      let res = await fetch(`${endpoint}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -464,7 +488,22 @@ export async function streamOllamaChat(options: {
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        throw new Error(`Ollama HTTP ${res.status}: ${errText.slice(0, 200) || res.statusText}`);
+        if (res.status === 400 && payload.tools && /does not support tools|tool/i.test(errText)) {
+          const retryPayload = { ...payload };
+          delete retryPayload.tools;
+          res = await fetch(`${endpoint}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(retryPayload),
+            signal: options.signal,
+          });
+          if (!res.ok) {
+            const retryErrText = await res.text().catch(() => "");
+            throw new Error(`Ollama HTTP ${res.status}: ${retryErrText.slice(0, 200) || res.statusText}`);
+          }
+        } else {
+          throw new Error(`Ollama HTTP ${res.status}: ${errText.slice(0, 200) || res.statusText}`);
+        }
       }
 
       const contentType = (res.headers.get("content-type") || "").toLowerCase();

@@ -3,6 +3,7 @@ import { redact } from "./security";
 import type { MCPServerManager } from "./mcp";
 import type { ImageEnginesStatus, GeneratedImageRecord } from "./images";
 import type { OllamaStatusReport } from "./ollama";
+import type { DesktopScreenshotResult, DesktopStatusReport, DesktopWindowInfo } from "./desktop";
 
 export type AgentToolPermission =
   | "public_diag"
@@ -10,7 +11,7 @@ export type AgentToolPermission =
   | "mcp_token_required"
   | "privileged_exec";
 
-export type AgentToolSource = "backend" | "mcp" | "image_engine" | "terminal";
+export type AgentToolSource = "backend" | "mcp" | "image_engine" | "terminal" | "desktop";
 
 export interface AgentToolDefinition {
   name: string;
@@ -191,6 +192,121 @@ export const AGENT_TOOL_CATALOG: AgentToolDefinition[] = [
       required: ["command"],
     },
   },
+  {
+    name: "desktop_status",
+    description:
+      "Sprawdza dostępność lokalnej sesji graficznej Linux (DISPLAY X11, Wayland, rozdzielczość, aktywne okno, VNC/noVNC i zgodę na sterowanie AI).",
+    source: "desktop",
+    permission: "public_diag",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "desktop_screenshot",
+    description:
+      "Wykonuje świeży zrzut ekranu bieżącej sesji X11 (nigdy nie zwraca przestarzałego zrzutu z poprzedniej sesji).",
+    source: "desktop",
+    permission: "operator_auth",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "desktop_window_list",
+    description: "Pobiera listę okien w aktywnej sesji pulpitu X11 (wmctrl).",
+    source: "desktop",
+    permission: "public_diag",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "desktop_window_focus",
+    description: "Przenosi fokus na wskazane okno w izolowanej sesji pulpitu AI.",
+    source: "desktop",
+    permission: "privileged_exec",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "ID okna (0x...) lub fragment tytułu okna." },
+      },
+      required: ["target"],
+    },
+  },
+  {
+    name: "desktop_mouse_move",
+    description: "Przesuwa kursor myszy w izolowanej sesji pulpitu AI na zweryfikowane współrzędne (x, y).",
+    source: "desktop",
+    permission: "privileged_exec",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "Pozycja pozioma X (px)." },
+        y: { type: "number", description: "Pozycja pionowa Y (px)." },
+      },
+      required: ["x", "y"],
+    },
+  },
+  {
+    name: "desktop_mouse_click",
+    description: "Klika myszą w izolowanej sesji pulpitu AI pod wskazanymi współrzędnymi (x, y).",
+    source: "desktop",
+    permission: "privileged_exec",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "Pozycja pozioma X (px)." },
+        y: { type: "number", description: "Pozycja pionowa Y (px)." },
+        button: { type: "string", description: "Przycisk myszy.", enum: ["left", "middle", "right"] },
+        doubleClick: { type: "boolean", description: "Czy wykonać podwójne kliknięcie." },
+      },
+      required: ["x", "y"],
+    },
+  },
+  {
+    name: "desktop_mouse_scroll",
+    description: "Przewija widok myszą w izolowanej sesji pulpitu AI.",
+    source: "desktop",
+    permission: "privileged_exec",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: {
+      type: "object",
+      properties: {
+        direction: { type: "string", description: "Kierunek przewijania.", enum: ["up", "down", "left", "right"] },
+        clicks: { type: "number", description: "Liczba kroków przewijania (1-15)." },
+      },
+      required: ["direction"],
+    },
+  },
+  {
+    name: "desktop_keyboard_type",
+    description: "Wpisuje krótki bezpieczny tekst w aktywnym oknie izolowanego pulpitu AI.",
+    source: "desktop",
+    permission: "privileged_exec",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Tekst do wpisania (maks. 500 znaków)." },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "desktop_keyboard_press",
+    description: "Naciska pojedynczy dozwolony klawisz lub kombinację (np. Return, Escape, ctrl+c).",
+    source: "desktop",
+    permission: "privileged_exec",
+    allowedAgents: ALL_AGENT_IDS,
+    parameters: {
+      type: "object",
+      properties: {
+        key: { type: "string", description: "Nazwa klawisza lub kombinacji (np. Return, Tab, ctrl+l)." },
+      },
+      required: ["key"],
+    },
+  },
 ];
 
 function cleanImagePrompt(raw: string): string {
@@ -326,6 +442,16 @@ export function detectUserIntents(
     addTool("system_diagnostics_snapshot");
   }
 
+  // Local AI desktop inspection intent
+  if (
+    /\b(desktop_status|desktop_screenshot|zrzut\w*\s+(?:pulpitu|ekranu)|stan\s+pulpitu|zdalny\s+pulpit|novnc|x11\s+display)\b/i.test(
+      trimmed
+    )
+  ) {
+    intents.push("desktop_status");
+    addTool("desktop_status");
+  }
+
   let mode: DetectedUserIntents["mode"] = "chat";
   if (intents.includes("terminal_exec")) mode = "terminal";
   else if (intents.includes("image_generate")) mode = "image_generate";
@@ -399,6 +525,17 @@ export interface AgentToolRuntimeDeps {
     command: string,
     agentId: string
   ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  desktop?: {
+    getStatus: () => Promise<DesktopStatusReport>;
+    captureScreenshot: (agentId: string) => Promise<DesktopScreenshotResult>;
+    listWindows: () => Promise<DesktopWindowInfo[]>;
+    focusWindow: (target: string, agentId: string) => Promise<any>;
+    mouseMove: (x: number, y: number, agentId: string) => Promise<any>;
+    mouseClick: (x: number, y: number, button: "left" | "middle" | "right", doubleClick: boolean, agentId: string) => Promise<any>;
+    mouseScroll: (direction: "up" | "down" | "left" | "right", clicks: number, agentId: string) => Promise<any>;
+    keyboardType: (text: string, agentId: string) => Promise<any>;
+    keyboardPress: (key: string, agentId: string) => Promise<any>;
+  };
 }
 
 export class AgentToolRuntime {
@@ -731,6 +868,180 @@ export class AgentToolRuntime {
           executedAt,
           durationMs: Date.now() - startedAt,
         };
+      }
+
+      if (toolName.startsWith("desktop_")) {
+        if (!this.deps.desktop) {
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "unavailable",
+            summary: `Moduł pulpitu X11 nie jest skonfigurowany w bieżącym środowisku.`,
+            data: null,
+            error: "DesktopSessionManager nie został podłączony.",
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (def.permission === "operator_auth" && !context.authorizedOperator) {
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "denied",
+            summary: "Zrzut ekranu wymaga autoryzowanej sesji operatora.",
+            data: null,
+            error: "Brak autoryzacji operatora.",
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (def.permission === "privileged_exec" && !context.authorizedOperator) {
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "denied",
+            summary: "Sterowanie pulpitem wymaga autoryzowanej sesji operatora.",
+            data: null,
+            error: "Brak uprawnień operatora do sterowania GUI.",
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_status") {
+          const st = await this.deps.desktop.getStatus();
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Pulpit: DISPLAY=${st.display || "brak"}, X11=${st.x11SessionActive}, VNC=${st.vncRunning}, AI=${st.aiControlEnabled}`,
+            data: st as unknown as Record<string, any>,
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_window_list") {
+          const windows = await this.deps.desktop.listWindows();
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Lista okien pulpitu: ${windows.length} okien.`,
+            data: { windows },
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_screenshot") {
+          const shot = await this.deps.desktop.captureScreenshot(safeAgent);
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Zrzut ekranu X11 ${shot.width}x${shot.height} (${shot.byteSize} B, sesja ${shot.sessionId}).`,
+            data: {
+              mimeType: shot.mimeType,
+              width: shot.width,
+              height: shot.height,
+              display: shot.display,
+              sessionId: shot.sessionId,
+              capturedAt: shot.capturedAt,
+              byteSize: shot.byteSize,
+              imageDataUrl: `data:${shot.mimeType};base64,${shot.base64}`,
+            },
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_window_focus") {
+          const res = await this.deps.desktop.focusWindow(String(args.target || ""), safeAgent);
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Przełączono fokus na okno ${res.focused}.`,
+            data: res,
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_mouse_move") {
+          const res = await this.deps.desktop.mouseMove(Number(args.x), Number(args.y), safeAgent);
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Kursor przesunięty na (${res.x}, ${res.y}).`,
+            data: res,
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_mouse_click") {
+          const btn = ["left", "middle", "right"].includes(String(args.button))
+            ? (String(args.button) as "left" | "middle" | "right")
+            : "left";
+          const res = await this.deps.desktop.mouseClick(Number(args.x), Number(args.y), btn, Boolean(args.doubleClick), safeAgent);
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Kliknięto ${btn} na (${res.x}, ${res.y}).`,
+            data: res,
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_mouse_scroll") {
+          const dir = ["up", "down", "left", "right"].includes(String(args.direction))
+            ? (String(args.direction) as "up" | "down" | "left" | "right")
+            : "down";
+          const res = await this.deps.desktop.mouseScroll(dir, Number(args.clicks || 3), safeAgent);
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Przewinięto ${res.direction} (${res.clicks}x).`,
+            data: res,
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_keyboard_type") {
+          const res = await this.deps.desktop.keyboardType(String(args.text || ""), safeAgent);
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Wpisano ${res.typedLength} znaków.`,
+            data: res,
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
+        if (toolName === "desktop_keyboard_press") {
+          const res = await this.deps.desktop.keyboardPress(String(args.key || ""), safeAgent);
+          return {
+            tool: toolName,
+            source: "desktop",
+            permission: def.permission,
+            status: "executed",
+            summary: `Naciśnięto klawisz ${res.key}.`,
+            data: res,
+            executedAt,
+            durationMs: Date.now() - startedAt,
+          };
+        }
       }
 
       return {

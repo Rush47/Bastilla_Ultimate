@@ -75,7 +75,7 @@ export interface TaskHistoryRecord {
 
 export interface ToolExecutionOutcomeSummary {
   tool: string;
-  source: "backend" | "mcp" | "image_engine" | "terminal";
+  source: "backend" | "mcp" | "image_engine" | "terminal" | "desktop";
   permission: "public_diag" | "operator_auth" | "mcp_token_required" | "privileged_exec";
   status: "executed" | "planned" | "unavailable" | "denied" | "error";
   summary: string;
@@ -88,7 +88,7 @@ export interface ToolExecutionOutcomeSummary {
 export interface AgentToolCatalogItem {
   name: string;
   description: string;
-  source: "backend" | "mcp" | "image_engine" | "terminal";
+  source: "backend" | "mcp" | "image_engine" | "terminal" | "desktop";
   permission: "public_diag" | "operator_auth" | "mcp_token_required" | "privileged_exec";
   allowedAgents: string[];
   usableNow: boolean;
@@ -206,6 +206,71 @@ export interface GeneratedImageItem {
   url?: string;
 }
 
+export interface DesktopWindowInfo {
+  id: string;
+  desktop: string;
+  pid: number | null;
+  title: string;
+}
+
+export interface DesktopAuditEntry {
+  id: string;
+  timestamp: string;
+  agentId: string;
+  tool: string;
+  args: Record<string, any>;
+  ok: boolean;
+  summary: string;
+}
+
+export interface DesktopStatusReport {
+  display: string | null;
+  wayland: boolean;
+  x11SessionActive: boolean;
+  x11CaptureAvailable: boolean;
+  xauthorityPath: string | null;
+  displayAccessError: string | null;
+  resolution: { width: number; height: number } | null;
+  activeWindow: string | null;
+  tools: {
+    import: boolean;
+    xdotool: boolean;
+    wmctrl: boolean;
+    xprop: boolean;
+    xdpyinfo: boolean;
+    xvfb: boolean;
+    x11vnc: boolean;
+    novnc: boolean;
+  };
+  sessionIsolated: boolean;
+  sessionId: string | null;
+  vncRunning: boolean;
+  vncPort: number | null;
+  novncUrl: string | null;
+  aiControlEnabled: boolean;
+  activeAgent: string | null;
+  lastCaptureAt: string | null;
+  lastCaptureSessionId: string | null;
+  auditLog: DesktopAuditEntry[];
+  checkedAt: string;
+}
+
+export interface SphericalStreamResult<T = unknown> {
+  stream: string;
+  ok: boolean;
+  latencyMs: number;
+  data?: T;
+  error?: string;
+}
+
+export interface SphericalContextSnapshot {
+  collectedAt: string;
+  concurrencyCap: number;
+  memAvailableMb: number;
+  degradedStreams: string[];
+  streams: Record<string, SphericalStreamResult>;
+}
+
 export interface SystemOverviewResponse {
   ok: boolean;
   svl_report: SVLKernelReport;
@@ -252,6 +317,8 @@ export interface SystemOverviewResponse {
   ollama_status?: OllamaStatusData;
   image_status?: ImageEnginesStatusData;
   images?: GeneratedImageItem[];
+  desktop_status?: DesktopStatusReport;
+  spherical_context?: SphericalContextSnapshot;
   app_url: string;
 }
 

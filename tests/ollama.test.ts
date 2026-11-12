@@ -72,3 +72,42 @@ test("probeOllamaStatus reports READY with real models and pullOllamaModelSafe r
   assert.equal(offlinePull.status.state, "OFFLINE");
 });
 
+test("streamOllamaChat retries without tools when a local model does not support tool calling", async () => {
+  const { streamOllamaChat } = await import("../server/ollama.js");
+  const payloads: any[] = [];
+  const server = createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const parsed = JSON.parse(body || "{}");
+    payloads.push(parsed);
+    if (Array.isArray(parsed.tools) && parsed.tools.length > 0) {
+      res.statusCode = 400;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "registry.ollama.ai/library/qwen2.5:0.5b does not support tools" }));
+      return;
+    }
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ model: "qwen2.5:0.5b", message: { role: "assistant", content: "Odpowiedź bez tools." }, done: true }));
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  const address = server.address(); assert.ok(address && typeof address !== "string");
+  try {
+    let streamed = "";
+    const result = await streamOllamaChat({
+      ollamaBaseUrl: `http://127.0.0.1:${address.port}`,
+      model: "qwen2.5:0.5b",
+      messages: [{ role: "user", content: "Cześć" }],
+      signal: AbortSignal.timeout(5000),
+      tools: [{ type: "function", function: { name: "sys_info", parameters: { type: "object", properties: {} } } }],
+      onChunk: (d) => { streamed += d; },
+    });
+    assert.equal(result.text, "Odpowiedź bez tools.");
+    assert.equal(result.model, "ollama/qwen2.5:0.5b");
+    assert.equal(streamed, "Odpowiedź bez tools.");
+    assert.equal(payloads.length, 2);
+    assert.ok(Array.isArray(payloads[0].tools));
+    assert.equal(payloads[1].tools, undefined);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

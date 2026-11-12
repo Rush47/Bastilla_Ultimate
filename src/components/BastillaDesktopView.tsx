@@ -5,22 +5,28 @@ import astyriaAvatar from "../assets/images/agent_astyria_avatar_1794463015211.j
 import aureliusAvatar from "../assets/images/agent_aurelius_avatar_1794463016020.jpg";
 import operatorLucyAvatar from "../assets/images/operator_lucy_vault33.webp";
 import wallpaper from "../assets/images/bastilla_violet_wallpaper_1794463012010.jpg";
-import type { SystemOverviewResponse, WorkspaceTab, AgentId } from "../types/bastilla";
+import type {
+  SystemOverviewResponse,
+  WorkspaceTab,
+  AgentId,
+  DesktopStatusReport,
+} from "../types/bastilla";
 import {
   Terminal,
   MessageSquare,
-  Cpu,
   Globe,
-  ShieldCheck,
   Database,
   Play,
   RefreshCw,
   Hand,
-  Layers,
   GitBranch,
-  HardDrive,
+  Monitor,
+  Camera,
+  Eye,
+  ShieldOff,
+  Power,
 } from "lucide-react";
-import { apiFetchJson } from "../utils/apiClient";
+import { apiFetchJson, buildApiUrl } from "../utils/apiClient";
 
 export const AGENT_AVATARS: Record<AgentId, string> = {
   aria: ariaAvatar,
@@ -84,10 +90,141 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
     "Tryb dotykowy i gesty aktywne: Przesuń poziomo (Swipe) lub użyj gestu wielodotykowego na pulpicie Bastilla Violet."
   );
   const [virtualDesktopIdx, setVirtualDesktopIdx] = useState<number>(1);
+  const [desktopBusy, setDesktopBusy] = useState<boolean>(false);
+  const [novncConnected, setNovncConnected] = useState<boolean>(false);
+  const [desktopScreenshot, setDesktopScreenshot] = useState<{
+    base64: string;
+    mimeType: string;
+    width: number;
+    height: number;
+    display: string;
+    capturedAt: string;
+    sessionId: string;
+  } | null>(null);
+  const [visionGoal, setVisionGoal] = useState<string>(
+    "Opisz aktualny stan pulpitu Linux i otwarte okna."
+  );
+  const [visionResult, setVisionResult] = useState<{
+    modelUsed: string;
+    analysis: string;
+    proposedAction?: any;
+  } | null>(null);
+  const [desktopNotice, setDesktopNotice] = useState<string>("");
   const touchStartRef = useRef<{ x: number; y: number } | null>(null);
 
   const svl = overview?.svl_report;
   const host = overview?.host;
+  const desktop: DesktopStatusReport | undefined = overview?.desktop_status;
+
+  const handleDesktopSession = async (action: "start" | "stop") => {
+    setDesktopBusy(true);
+    setDesktopNotice("");
+    try {
+      const res = await apiFetchJson<{ ok: boolean; status?: DesktopStatusReport; error?: string }>(
+        "/api/desktop/session",
+        {
+          method: "POST",
+          body: JSON.stringify({ action, agentId: "aria" }),
+          timeoutMs: 15000,
+        }
+      );
+      if (action === "stop") {
+        setNovncConnected(false);
+        setDesktopScreenshot(null);
+      }
+      setDesktopNotice(
+        res.status?.sessionIsolated
+          ? `Sesja X11 ${res.status.display} uruchomiona (noVNC ${res.status.vncRunning ? "ONLINE" : "OFFLINE"}).`
+          : "Sesja X11 została zatrzymana."
+      );
+      onRefresh();
+    } catch (e: any) {
+      setDesktopNotice(`Błąd sesji pulpitu: ${e?.message || String(e)}`);
+    } finally {
+      setDesktopBusy(false);
+    }
+  };
+
+  const handleToggleAiControl = async (enable: boolean) => {
+    setDesktopBusy(true);
+    setDesktopNotice("");
+    try {
+      const res = await apiFetchJson<{ ok: boolean; aiControlEnabled: boolean; activeAgent: string | null }>(
+        "/api/desktop/control",
+        {
+          method: "POST",
+          body: JSON.stringify({ aiControlEnabled: enable, agentId: "astyria" }),
+        }
+      );
+      setDesktopNotice(
+        res.aiControlEnabled
+          ? `Sterowanie GUI aktywne dla agenta ${res.activeAgent}.`
+          : "Sterowanie pulpitem przez AI zostało natychmiast zatrzymane."
+      );
+      onRefresh();
+    } catch (e: any) {
+      setDesktopNotice(`Błąd sterowania AI: ${e?.message || String(e)}`);
+    } finally {
+      setDesktopBusy(false);
+    }
+  };
+
+  const handleCaptureDesktopScreenshot = async () => {
+    setDesktopBusy(true);
+    setDesktopNotice("");
+    try {
+      const res = await apiFetchJson<{ ok: boolean; screenshot?: any; error?: string }>(
+        "/api/desktop/screenshot",
+        {
+          method: "POST",
+          body: JSON.stringify({ agentId: "astyria" }),
+        }
+      );
+      if (res.ok && res.screenshot) {
+        setDesktopScreenshot(res.screenshot);
+        setDesktopNotice(
+          `Świeży zrzut ekranu: ${res.screenshot.display} (${res.screenshot.width}x${res.screenshot.height}px)`
+        );
+        onRefresh();
+      }
+    } catch (e: any) {
+      setDesktopNotice(`Zrzut X11 niedostępny: ${e?.message || String(e)}`);
+    } finally {
+      setDesktopBusy(false);
+    }
+  };
+
+  const handleRunVisionLoop = async (executeAction = false) => {
+    setDesktopBusy(true);
+    setDesktopNotice("");
+    try {
+      const res = await apiFetchJson<any>("/api/desktop/vision-analyze", {
+        method: "POST",
+        body: JSON.stringify({
+          agentId: "astyria",
+          goal: visionGoal,
+          executeAction,
+        }),
+        timeoutMs: 45000,
+      });
+      if (res.ok) {
+        if (res.verificationScreenshot || res.screenshot) {
+          setDesktopScreenshot(res.verificationScreenshot || res.screenshot);
+        }
+        setVisionResult({
+          modelUsed: res.modelUsed,
+          analysis: res.analysis,
+          proposedAction: res.proposedAction,
+        });
+        setDesktopNotice(`Analiza wizualna zakończona (${res.modelUsed}).`);
+        onRefresh();
+      }
+    } catch (e: any) {
+      setDesktopNotice(`Błąd analizy wizualnej: ${e?.message || String(e)}`);
+    } finally {
+      setDesktopBusy(false);
+    }
+  };
 
   const handleAiSelectAvatars = async () => {
     setSelectingAvatars(true);
@@ -504,6 +641,191 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Section 03: Local AI Desktop (X11, TigerVNC/x11vnc, Authenticated noVNC & Visual Loop) */}
+      <section className="mb-6 bg-[#0c1018]/95 border border-slate-800 rounded-xl p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-display text-lg font-bold text-white flex items-center gap-2">
+              <Monitor className="w-5 h-5 text-violet-400" />
+              03. Lokalny Pulpit AI (X11 · x11vnc · noVNC · Analiza Wizualna)
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5 font-mono-tabular">
+              DISPLAY: {desktop?.display || "brak"} · Rozdzielczość:{" "}
+              {desktop?.resolution ? `${desktop.resolution.width}x${desktop.resolution.height}` : "N/A"} · Okno:{" "}
+              {desktop?.activeWindow || "brak"} · Sesja: {desktop?.sessionIsolated ? desktop.sessionId : "nieuruchomiona"}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {desktop?.sessionIsolated ? (
+              <button
+                type="button"
+                disabled={desktopBusy}
+                onClick={() => void handleDesktopSession("stop")}
+                className="min-h-9 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-rose-300 flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <Power className="w-3.5 h-3.5" />
+                Zatrzymaj sesję X11
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={desktopBusy}
+                onClick={() => void handleDesktopSession("start")}
+                className="min-h-9 px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-xs font-semibold text-white flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <Power className="w-3.5 h-3.5" />
+                Uruchom sesję X11 + noVNC
+              </button>
+            )}
+
+            <button
+              type="button"
+              disabled={!desktop?.vncRunning || !desktop?.novncUrl}
+              onClick={() => setNovncConnected((v) => !v)}
+              className={`min-h-9 px-3 py-1.5 rounded-lg text-xs font-semibold border whitespace-nowrap disabled:opacity-40 ${
+                novncConnected
+                  ? "bg-emerald-700/80 border-emerald-500 text-white"
+                  : "bg-[#111723] hover:bg-slate-800 border-slate-700 text-cyan-300"
+              }`}
+            >
+              {novncConnected ? "Rozłącz noVNC" : "Połącz noVNC"}
+            </button>
+
+            <button
+              type="button"
+              disabled={desktopBusy || !desktop?.x11CaptureAvailable}
+              onClick={() => void handleCaptureDesktopScreenshot()}
+              className="min-h-9 px-3 py-1.5 rounded-lg bg-[#111723] hover:bg-slate-800 disabled:opacity-40 border border-slate-700 text-xs font-semibold text-slate-200 flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <Camera className="w-3.5 h-3.5 text-cyan-400" />
+              Zrób zrzut X11
+            </button>
+
+            <button
+              type="button"
+              disabled={desktopBusy || !desktop?.sessionIsolated}
+              onClick={() => void handleToggleAiControl(!desktop?.aiControlEnabled)}
+              className={`min-h-9 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap disabled:opacity-40 ${
+                desktop?.aiControlEnabled
+                  ? "bg-rose-600 hover:bg-rose-500 text-white"
+                  : "bg-amber-600/20 hover:bg-amber-600/30 border border-amber-500/60 text-amber-200"
+              }`}
+            >
+              <ShieldOff className="w-3.5 h-3.5" />
+              {desktop?.aiControlEnabled
+                ? `Zatrzymaj sterowanie AI (${desktop.activeAgent || "AI"})`
+                : "Włącz sterowanie AI"}
+            </button>
+          </div>
+        </div>
+
+        {desktopNotice && (
+          <div className="px-3 py-2 rounded-lg bg-[#111723] border border-violet-700/50 text-xs font-mono-tabular text-cyan-200">
+            {desktopNotice}
+          </div>
+        )}
+
+        {desktop?.displayAccessError && !desktop.sessionIsolated && (
+          <div className="px-3 py-2 rounded-lg bg-amber-950/30 border border-amber-800/50 text-xs font-mono-tabular text-amber-200">
+            {desktop.displayAccessError}
+          </div>
+        )}
+
+        {/* Interactive Visual Loop (Etap D) + Live Preview / noVNC Stage */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+          <div className="lg:col-span-7 space-y-3">
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                value={visionGoal}
+                onChange={(e) => setVisionGoal(e.target.value)}
+                aria-label="Cel analizy wizualnej pulpitu AI"
+                placeholder="Opisz zadanie dla agenta wizualnego na pulpicie..."
+                className="flex-1 min-h-10 px-3 py-1.5 rounded-lg bg-[#07090e] border border-slate-700 text-xs text-white focus:outline-none focus:border-violet-500"
+              />
+              <button
+                type="button"
+                disabled={desktopBusy || !desktop?.x11CaptureAvailable}
+                onClick={() => void handleRunVisionLoop(false)}
+                className="min-h-10 px-3.5 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-xs font-semibold text-white flex items-center gap-1.5 whitespace-nowrap"
+              >
+                <Eye className="w-3.5 h-3.5" />
+                Analiza wizualna AI
+              </button>
+            </div>
+
+            {novncConnected && desktop?.novncUrl ? (
+              <div className="rounded-lg overflow-hidden border border-violet-500/60 bg-black aspect-[16/10] w-full">
+                <iframe
+                  src={buildApiUrl(desktop.novncUrl)}
+                  title="Zdalny Pulpit Bastilla noVNC"
+                  className="w-full h-full border-0"
+                />
+              </div>
+            ) : desktopScreenshot ? (
+              <div className="rounded-lg overflow-hidden border border-slate-700 bg-[#07090e] p-2 space-y-1.5">
+                <div className="flex items-center justify-between text-[11px] font-mono-tabular text-slate-400">
+                  <span>
+                    Zrzut sesji {desktopScreenshot.sessionId} ({desktopScreenshot.width}x{desktopScreenshot.height})
+                  </span>
+                  <span>{new Date(desktopScreenshot.capturedAt).toLocaleTimeString()}</span>
+                </div>
+                <img
+                  src={`data:${desktopScreenshot.mimeType};base64,${desktopScreenshot.base64}`}
+                  alt="Aktualny zrzut pulpitu X11"
+                  className="w-full max-h-80 object-contain rounded bg-black"
+                />
+              </div>
+            ) : (
+              <div className="rounded-lg border border-dashed border-slate-800 bg-[#07090e]/80 p-6 text-center text-xs text-slate-400 font-mono-tabular">
+                Uruchom izolowaną sesję X11 (:99), aby wyświetlić pulpit w przeglądarce przez noVNC lub wykonać zrzut ekranu do analizy AI.
+              </div>
+            )}
+          </div>
+
+          <div className="lg:col-span-5 flex flex-col justify-between rounded-lg bg-[#111723] border border-slate-800 p-4 space-y-3 text-xs">
+            <div className="space-y-2">
+              <div className="font-semibold text-white">Wynik pętli wizualnej i narzędzia GUI</div>
+              <div className="grid grid-cols-2 gap-1.5 font-mono-tabular text-[11px] text-slate-300">
+                <div>Xvfb: <span className={desktop?.tools?.xvfb ? "text-emerald-400" : "text-amber-400"}>{desktop?.tools?.xvfb ? "OK" : "BRAK"}</span></div>
+                <div>x11vnc: <span className={desktop?.tools?.x11vnc ? "text-emerald-400" : "text-amber-400"}>{desktop?.tools?.x11vnc ? "OK" : "BRAK"}</span></div>
+                <div>noVNC: <span className={desktop?.tools?.novnc ? "text-emerald-400" : "text-amber-400"}>{desktop?.tools?.novnc ? "OK" : "BRAK"}</span></div>
+                <div>xdotool: <span className={desktop?.tools?.xdotool ? "text-emerald-400" : "text-amber-400"}>{desktop?.tools?.xdotool ? "OK" : "BRAK"}</span></div>
+                <div>import: <span className={desktop?.tools?.import ? "text-emerald-400" : "text-amber-400"}>{desktop?.tools?.import ? "OK" : "BRAK"}</span></div>
+                <div>wmctrl: <span className={desktop?.tools?.wmctrl ? "text-emerald-400" : "text-amber-400"}>{desktop?.tools?.wmctrl ? "OK" : "BRAK"}</span></div>
+              </div>
+
+              {visionResult && (
+                <div className="p-2.5 rounded bg-[#07090e] border border-violet-700/40 space-y-1.5 max-h-40 overflow-y-auto">
+                  <div className="text-[10px] font-mono-tabular text-violet-300">
+                    Model: {visionResult.modelUsed}
+                  </div>
+                  <p className="text-[11px] text-slate-200 whitespace-pre-wrap">{visionResult.analysis}</p>
+                </div>
+              )}
+
+              <div className="space-y-1">
+                <div className="text-[11px] font-semibold text-slate-300">Dziennik operacji GUI:</div>
+                <div className="max-h-32 overflow-y-auto space-y-1 font-mono-tabular text-[10px]">
+                  {(desktop?.auditLog || []).length === 0 ? (
+                    <div className="text-slate-500">Brak zarejestrowanych operacji pulpitu w tej sesji.</div>
+                  ) : (
+                    (desktop?.auditLog || []).slice(0, 6).map((entry) => (
+                      <div key={entry.id} className="p-1.5 rounded bg-[#07090e] border border-slate-800 flex items-center justify-between gap-2">
+                        <span className="text-violet-300 shrink-0">{entry.agentId}</span>
+                        <span className="text-slate-300 truncate flex-1">{entry.summary}</span>
+                        <span className="text-slate-500 shrink-0">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
 
       {/* Bottom Interactive Bastilla Violet Dock */}
       <div className="flex items-center justify-center">

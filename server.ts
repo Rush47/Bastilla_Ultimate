@@ -34,6 +34,12 @@ import {
   GenerateContentResponse,
   type FunctionDeclaration,
 } from "@google/genai";
+import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  desktopSessionManager,
+  bridgeAuthenticatedVncWebSocket,
+} from "./server/desktop";
+import { collectSphericalContext } from "./server/spherical-worker";
 import {
   SVLSystemKernel,
   TopologicalInfinityEngine,
@@ -907,6 +913,19 @@ print(json.dumps({
     mcpManager: mcp,
     executeTerminal: (mode, command, agentId) =>
       executeTerminalCommandInternal(mode, command, agentId),
+    desktop: {
+      getStatus: () => desktopSessionManager.getStatus(),
+      captureScreenshot: (agentId) => desktopSessionManager.captureScreenshot(agentId),
+      listWindows: () => desktopSessionManager.listWindows(),
+      focusWindow: (target, agentId) => desktopSessionManager.focusWindow(target, agentId),
+      mouseMove: (x, y, agentId) => desktopSessionManager.mouseMove(x, y, agentId),
+      mouseClick: (x, y, button, doubleClick, agentId) =>
+        desktopSessionManager.mouseClick(x, y, button, doubleClick, agentId),
+      mouseScroll: (direction, clicks, agentId) =>
+        desktopSessionManager.mouseScroll(direction, clicks, agentId),
+      keyboardType: (text, agentId) => desktopSessionManager.keyboardType(text, agentId),
+      keyboardPress: (key, agentId) => desktopSessionManager.keyboardPress(key, agentId),
+    },
   });
 
   const applyImageOutcomeToReplyText = (
@@ -1631,12 +1650,13 @@ print(json.dumps({
     "distro_files": distro_files
 }))
 `;
-      const [svlReport, hostData, codexStatus, ollamaStatus, imageStatus] = await Promise.all([
+      const [svlReport, hostData, codexStatus, ollamaStatus, imageStatus, desktopStatus] = await Promise.all([
         svlPromise,
         querySqliteJson(hostProbeScript),
         codexAuth.status(),
         probeOllamaStatus(getOllamaBaseUrl()),
         imageManager.probeStatus(),
+        desktopSessionManager.getStatus(),
       ]);
       hostData.tools.codex = {
         installed: codexStatus.installed,
@@ -1654,12 +1674,14 @@ print(json.dumps({
           process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
       );
 
+      const preferredActiveModel = pickPreferredOllamaModel(ollamaStatus.models) || ollamaStatus.modelNames[0];
+
       res.json({
         ok: true,
         svl_report: svlReport,
         host: hostData,
         ai_routing: {
-          primary_model: ollamaStatus.modelNames[0] ? `ollama/${ollamaStatus.modelNames[0]}` : "unverified",
+          primary_model: preferredActiveModel ? `ollama/${preferredActiveModel}` : "unverified",
           available_models: ollamaStatus.modelNames,
           ollama_online: ollamaStatus.reachable,
           ollama_state: ollamaStatus.state,
@@ -1675,6 +1697,7 @@ print(json.dumps({
         ollama_status: ollamaStatus,
         image_status: imageStatus,
         images: imageManager.listHistory(20),
+        desktop_status: desktopStatus,
         app_url:
           process.env.APP_URL ||
           `http://localhost:${PORT}`,
@@ -4535,6 +4558,380 @@ print(json.dumps({"id": row_id, "created_at": now}))`,
     }
   });
 
+  // ==========================================================================
+  // LOCAL AI DESKTOP (X11 / Xvfb / TigerVNC-x11vnc / noVNC / VISUAL LOOP)
+  // & SPHERICAL CONTEXT WORKER + CENTRAL DIAGNOSTICS
+  // ==========================================================================
+  if (fs.existsSync("/usr/share/novnc")) {
+    app.use("/api/desktop/novnc", express.static("/usr/share/novnc"));
+  }
+
+  app.get("/api/desktop/status", async (_req, res) => {
+    try {
+      const status = await desktopSessionManager.getStatus();
+      res.json({ ok: true, status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd odczytu stanu pulpitu.") });
+    }
+  });
+
+  app.get("/api/desktop/windows", async (_req, res) => {
+    try {
+      const windows = await desktopSessionManager.listWindows();
+      res.json({ ok: true, windows });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd odczytu okien X11.") });
+    }
+  });
+
+  app.post("/api/desktop/session", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Wymagana autoryzacja Operatora." });
+    }
+    try {
+      const action = String(req.body?.action || "start");
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "aria";
+      const status =
+        action === "stop"
+          ? await desktopSessionManager.stopIsolatedSession()
+          : await desktopSessionManager.startIsolatedSession(agentId);
+      broadcastSystemEvent("desktop_status", { status });
+      res.json({ ok: true, status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Nie udało się zarządzać sesją pulpitu.") });
+    }
+  });
+
+  app.post("/api/desktop/control", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Wymagana autoryzacja Operatora." });
+    }
+    try {
+      const enabled = Boolean(req.body?.aiControlEnabled);
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "aria";
+      const control = desktopSessionManager.setAiControlEnabled(enabled, agentId);
+      const status = await desktopSessionManager.getStatus();
+      broadcastSystemEvent("desktop_status", { status });
+      res.json({ ok: true, ...control, status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd przełączania sterowania AI.") });
+    }
+  });
+
+  app.post("/api/desktop/screenshot", async (req, res) => {
+    try {
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "aria";
+      const screenshot = await desktopSessionManager.captureScreenshot(agentId);
+      if (req.body?.saveToChat) {
+        const msgText = `Zrzut pulpitu X11 (${screenshot.display} · ${screenshot.width}x${screenshot.height} · sesja ${screenshot.sessionId})`;
+        await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES ('bastilla-main', 'assistant', ?, 'desktop-x11', ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], now))
+conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
+          [agentId, msgText]
+        ).catch(() => {});
+      }
+      res.json({ ok: true, screenshot });
+    } catch (err: any) {
+      res.status(503).json({ ok: false, error: redact(err?.message || "Zrzut ekranu X11 niedostępny.") });
+    }
+  });
+
+  app.post("/api/desktop/action", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Sterowanie GUI wymaga autoryzacji Operatora." });
+    }
+    try {
+      const { action = "", agentId = "aria", x, y, button = "left", doubleClick = false, direction = "down", clicks = 3, text = "", key = "", target = "" } = req.body || {};
+      const safeAgent = AGENTS.includes(agentId) ? String(agentId) : "aria";
+      let result: any;
+      if (action === "mouse_move") {
+        result = await desktopSessionManager.mouseMove(Number(x), Number(y), safeAgent);
+      } else if (action === "mouse_click") {
+        result = await desktopSessionManager.mouseClick(Number(x), Number(y), button, Boolean(doubleClick), safeAgent);
+      } else if (action === "mouse_scroll") {
+        result = await desktopSessionManager.mouseScroll(direction, Number(clicks), safeAgent);
+      } else if (action === "keyboard_type") {
+        result = await desktopSessionManager.keyboardType(String(text), safeAgent);
+      } else if (action === "keyboard_press") {
+        result = await desktopSessionManager.keyboardPress(String(key), safeAgent);
+      } else if (action === "window_focus") {
+        result = await desktopSessionManager.focusWindow(String(target), safeAgent);
+      } else {
+        return res.status(400).json({ ok: false, error: `Nieobsługiwana akcja GUI: ${action}` });
+      }
+      const status = await desktopSessionManager.getStatus();
+      broadcastSystemEvent("desktop_status", { status });
+      res.json({ ok: true, result, status });
+    } catch (err: any) {
+      res.status(400).json({ ok: false, error: redact(err?.message || "Błąd wykonania akcji pulpitu.") });
+    }
+  });
+
+  app.post("/api/desktop/vision-analyze", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Analiza wizualna pulpitu wymaga autoryzacji Operatora." });
+    }
+    try {
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "astyria";
+      const goal = String(req.body?.goal || "Opisz aktualny stan pulpitu Linux, otwarte okna oraz następny bezpieczny krok.").trim();
+      const executeAction = Boolean(req.body?.executeAction);
+
+      const screenshot = await desktopSessionManager.captureScreenshot(agentId);
+      const [windows, ollamaStatus] = await Promise.all([
+        desktopSessionManager.listWindows(),
+        probeOllamaStatus(getOllamaBaseUrl()),
+      ]);
+      const visionOllamaModel = ollamaStatus.models.find((m) => m.multimodal)?.name || null;
+      const geminiClient = getGeminiClient();
+
+      const visionPrompt =
+        `Analizujesz świeży zrzut ekranu sesji X11 (${screenshot.display}, rozdzielczość ${screenshot.width}x${screenshot.height}px, sesja ${screenshot.sessionId}).\n` +
+        `Widoczne okna wmctrl: ${windows.length ? windows.map((w) => `${w.id}:${w.title}`).join(", ") : "brak okien (pusty pulpit Fluxbox)"}.\n` +
+        `Cel Operatora: ${goal}\n` +
+        `Odpowiedz po polsku w krótkich punktach oraz — jeśli potrzebna jest konkretna akcja GUI — podaj na końcu blok JSON:\n` +
+        `{"proposedAction": "none"|"mouse_click"|"keyboard_press", "x": number, "y": number, "key": string, "reason": string}`;
+
+      let analysis = "";
+      let modelUsed = "none";
+      let proposedAction: any = { proposedAction: "none", reason: "Brak modelu multimodalnego do planowania akcji." };
+
+      if (geminiClient) {
+        const out = await runLiveMultimodalModel(
+          [
+            {
+              role: "user",
+              parts: [
+                { inlineData: { mimeType: screenshot.mimeType, data: screenshot.base64 } },
+                { text: visionPrompt },
+              ],
+            },
+          ],
+          undefined,
+          buildAgentSystemInstruction(agentId)
+        );
+        analysis = out.text;
+        modelUsed = `gemini/${out.modelUsed}`;
+      } else if (ollamaStatus.reachable && visionOllamaModel) {
+        const r = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: visionOllamaModel,
+            stream: false,
+            messages: [{ role: "user", content: visionPrompt, images: [screenshot.base64] }],
+          }),
+        });
+        if (!r.ok) {
+          throw new Error(`Ollama Vision HTTP ${r.status}`);
+        }
+        const body: any = await r.json();
+        analysis = String(body?.message?.content || "").trim();
+        modelUsed = `ollama/${visionOllamaModel}`;
+      } else {
+        analysis =
+          `Zrzut ekranu X11 wykonano poprawnie (${screenshot.width}x${screenshot.height}px, ${screenshot.byteSize} B, okna: ${windows.length}). ` +
+          `Analiza semantyczna obrazu wymaga skonfigurowanego GEMINI_API_KEY lub lokalnego modelu multimodalnego Ollama (np. llama3.2-vision:11b / qwen2.5vl). ` +
+          `Wykryte modele Ollama: ${ollamaStatus.modelNames.join(", ") || "brak"}.`;
+      }
+
+      const jsonMatch = analysis.match(/\{[\s\S]*?"proposedAction"[\s\S]*?\}/);
+      if (jsonMatch) {
+        try {
+          proposedAction = JSON.parse(jsonMatch[0]);
+        } catch {}
+      }
+
+      let executedResult: any = null;
+      let verificationScreenshot: any = null;
+      const statusNow = await desktopSessionManager.getStatus();
+      if (executeAction && statusNow.aiControlEnabled && statusNow.sessionIsolated) {
+        if (
+          proposedAction?.proposedAction === "mouse_click" &&
+          typeof proposedAction.x === "number" &&
+          typeof proposedAction.y === "number" &&
+          proposedAction.x >= 0 &&
+          proposedAction.x <= screenshot.width &&
+          proposedAction.y >= 0 &&
+          proposedAction.y <= screenshot.height
+        ) {
+          executedResult = await desktopSessionManager.mouseClick(proposedAction.x, proposedAction.y, "left", false, agentId);
+          verificationScreenshot = await desktopSessionManager.captureScreenshot(agentId);
+        } else if (proposedAction?.proposedAction === "keyboard_press" && typeof proposedAction.key === "string" && proposedAction.key.trim()) {
+          executedResult = await desktopSessionManager.keyboardPress(proposedAction.key, agentId);
+          verificationScreenshot = await desktopSessionManager.captureScreenshot(agentId);
+        }
+      }
+
+      res.json({
+        ok: true,
+        modelUsed,
+        screenshot,
+        windows,
+        analysis,
+        proposedAction,
+        executedResult,
+        verificationScreenshot,
+      });
+    } catch (err: any) {
+      res.status(503).json({ ok: false, error: redact(err?.message || "Błąd analizy wizualnej pulpitu.") });
+    }
+  });
+
+  app.get("/api/system/spherical-context", async (_req, res) => {
+    try {
+      const snapshot = await collectSphericalContext(
+        [
+          {
+            name: "ollama",
+            timeoutMs: 1800,
+            run: async () => {
+              const s = await probeOllamaStatus(getOllamaBaseUrl());
+              return { state: s.state, reachable: s.reachable, models: s.modelNames };
+            },
+          },
+          {
+            name: "desktop_x11",
+            timeoutMs: 1800,
+            run: async () => {
+              const d = await desktopSessionManager.getStatus();
+              return { display: d.display, active: d.x11SessionActive, isolated: d.sessionIsolated, vncRunning: d.vncRunning };
+            },
+          },
+          {
+            name: "sqlite_queue",
+            timeoutMs: 1500,
+            run: async () => ({ tasks: queue.list().slice(0, 10) }),
+          },
+          {
+            name: "mcp",
+            timeoutMs: 1200,
+            run: async () => buildMcpStatusSnapshot(),
+          },
+          {
+            name: "codex_cli",
+            timeoutMs: 1800,
+            run: async () => codexAuth.status(),
+          },
+          {
+            name: "image_engines",
+            timeoutMs: 1800,
+            run: async () => imageManager.probeStatus(),
+          },
+          {
+            name: "git_repo",
+            timeoutMs: 1800,
+            run: async () => {
+              const [branch, head, status] = await Promise.all([
+                runGitSafe(["rev-parse", "--abbrev-ref", "HEAD"]),
+                runGitSafe(["rev-parse", "--short", "HEAD"]),
+                runGitSafe(["status", "--short"]),
+              ]);
+              return {
+                branch: branch.stdout,
+                head: head.stdout,
+                dirtyCount: status.stdout ? status.stdout.split("\n").filter(Boolean).length : 0,
+              };
+            },
+          },
+        ],
+        { concurrencyCap: 3 }
+      );
+      res.json({ ok: true, snapshot });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd workera sferycznego.") });
+    }
+  });
+
+  app.get("/api/diagnostics/logs", async (_req, res) => {
+    try {
+      const desktopStatus = await desktopSessionManager.getStatus();
+      const recentTasks = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+rows = [dict(r) for r in conn.execute("SELECT id, title, assigned_agent, terminal_type, status, output_summary, created_at FROM task_history ORDER BY id DESC LIMIT 20").fetchall()]
+conn.close()
+print(json.dumps({"tasks": rows}))`
+      ).catch(() => ({ tasks: [] }));
+
+      res.json({
+        ok: true,
+        collectedAt: new Date().toISOString(),
+        continuousMissionLogs: continuousMissionState.recentLogs.slice(0, 30),
+        desktopAuditLog: desktopStatus.auditLog,
+        gitSyncEvents: gitAutoSyncState.recentEvents,
+        recentTasks: recentTasks.tasks || [],
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd eksportu logów.") });
+    }
+  });
+
+  app.get("/api/github/details", async (_req, res) => {
+    try {
+      const [branch, head, diffStat, logRes, ghAuth, remoteUrl] = await Promise.all([
+        runGitSafe(["rev-parse", "--abbrev-ref", "HEAD"]),
+        runGitSafe(["rev-parse", "--short", "HEAD"]),
+        runGitSafe(["diff", "--stat"]),
+        runGitSafe(["log", "-n", "10", "--pretty=format:%h|%an|%ar|%s"]),
+        execFileAsync("gh", ["auth", "status"], { cwd: PROJECT_ROOT, timeout: 4000 })
+          .then((o) => ({ ok: true, out: `${o.stdout}\n${o.stderr}`.trim() }))
+          .catch((e: any) => ({ ok: false, out: String(e?.stderr || e?.stdout || e?.message || "Not logged in").trim() })),
+        runGitSafe(["remote", "get-url", "origin"]),
+      ]);
+
+      let issues: any[] = [];
+      let prs: any[] = [];
+      if (ghAuth.ok) {
+        const [issRes, prRes] = await Promise.all([
+          execFileAsync(
+            "gh",
+            ["issue", "list", "--limit", "5", "--json", "number,title,state,url"],
+            { cwd: PROJECT_ROOT, timeout: 3500 }
+          ).catch(() => null),
+          execFileAsync(
+            "gh",
+            ["pr", "list", "--limit", "5", "--json", "number,title,state,url,headRefName"],
+            { cwd: PROJECT_ROOT, timeout: 3500 }
+          ).catch(() => null),
+        ]);
+        if (issRes?.stdout) {
+          try { issues = JSON.parse(issRes.stdout || "[]"); } catch {}
+        }
+        if (prRes?.stdout) {
+          try { prs = JSON.parse(prRes.stdout || "[]"); } catch {}
+        }
+      }
+
+      res.json({
+        ok: true,
+        repo: "Rush47/Bastilla_Ultimate",
+        remoteUrl: remoteUrl.stdout || "https://github.com/Rush47/Bastilla_Ultimate",
+        branch: branch.stdout || "main",
+        head: head.stdout || "",
+        diffStat: diffStat.stdout || "Brak niezapisanych zmian w śledzonych plikach.",
+        commits: (logRes.stdout || "")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => {
+            const [hash, author, date, message] = line.split("|");
+            return { hash, author, date, message };
+          }),
+        ghAuthReady: ghAuth.ok,
+        ghAuthDetail: redact(ghAuth.out),
+        issues,
+        prs,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd odczytu szczegółów GitHub.") });
+    }
+  });
+
   // Explicit API 404 handler to ensure /api routes return JSON and never fallback to HTML
   app.use("/api/*", (_req, res) => {
     res.status(404).json({ ok: false, error: "Ścieżka API nie istnieje" });
@@ -4583,6 +4980,19 @@ print(json.dumps({"id": row_id, "created_at": now}))`,
     startRootEscalationSocket();
   }
   if (process.env.BASTILLA_OLLAMA_BRIDGE === "true") startLocalOllamaDaemon();
+  if (!process.env.NODE_TEST_CONTEXT && process.env.BASTILLA_PROVISION_HOST !== "false") {
+    const endpoint = getOllamaBaseUrl();
+    try {
+      const parsedEndpoint = new URL(endpoint);
+      if (["127.0.0.1", "localhost", "0.0.0.0"].includes(parsedEndpoint.hostname)) {
+        void startOllamaDaemon(endpoint).then((res) => {
+          if (res.started) {
+            console.log(`[Bastilla OS] Native Ollama daemon started at ${res.status.endpoint} (PID ${res.status.daemonPid ?? "?"}).`);
+          }
+        }).catch(() => {});
+      }
+    } catch {}
+  }
   startContinuousAgentMissionDaemon();
   startGitBidirectionalSyncDaemon();
 
@@ -4590,6 +5000,60 @@ print(json.dumps({"id": row_id, "created_at": now}))`,
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : PORT;
     console.log(`[Bastilla OS Ultimate] Server running at http://${HOST}:${port}`);
+  });
+
+  server.on("upgrade", async (req, socket, head) => {
+    const pathname = (req.url || "").split("?")[0];
+    if (pathname !== "/api/desktop/vnc-ws") return;
+
+    const configuredToken = process.env.BASTILLA_API_TOKEN || "";
+    const hostHeader = String(req.headers.host || "").split(":")[0].toLowerCase();
+    const appUrlOrigin = process.env.APP_URL?.replace(/\/$/, "") || "";
+    let appUrlHost = "";
+    try { appUrlHost = appUrlOrigin ? new URL(appUrlOrigin).hostname.toLowerCase() : ""; } catch {}
+    const isLocalOrPreview =
+      ["127.0.0.1", "localhost", "::1", "[::1]"].includes(hostHeader) ||
+      (Boolean(appUrlHost) && hostHeader === appUrlHost) ||
+      /\.run\.app$/i.test(hostHeader);
+
+    if (configuredToken) {
+      const digest = (v: string) => createHash("sha256").update(v).digest();
+      const valid = (v: string) => timingSafeEqual(digest(v), digest(configuredToken));
+      const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+      const rawCookie =
+        req.headers.cookie
+          ?.split(";")
+          .map((x) => x.trim())
+          .find((x) => x.startsWith("bastilla_access="))
+          ?.slice(16) || "";
+      let cookieToken = "";
+      try { cookieToken = decodeURIComponent(rawCookie); } catch {}
+      if ((!bearer || !valid(bearer)) && (!cookieToken || !valid(cookieToken))) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+    } else if (!isLocalOrPreview) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const desktopStatus = await desktopSessionManager.getStatus().catch(() => null);
+    if (!desktopStatus?.vncRunning || !desktopStatus.vncPort) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    bridgeAuthenticatedVncWebSocket(req, socket, head, desktopStatus.vncPort);
+  });
+
+  process.once("SIGTERM", () => {
+    void desktopSessionManager.stopIsolatedSession();
+  });
+  process.once("SIGINT", () => {
+    void desktopSessionManager.stopIsolatedSession();
   });
 }
 

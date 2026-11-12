@@ -34,6 +34,9 @@ import {
   Images,
   Wand2,
   Settings2,
+  Search,
+  FileText,
+  Monitor,
 } from "lucide-react";
 import {
   GenerativeComponentRenderer,
@@ -97,7 +100,10 @@ interface ChatInputBarProps {
       | "continuous_mission"
   ) => void;
   onOpenImageGenModal: (prefill?: string) => void;
+  onCaptureDesktopScreenshot: () => void;
   imagePreviewName: string;
+  attachmentKind: "image" | "video" | "document" | null;
+  attachmentPreviewUrl: string | null;
   onClearImage: () => void;
   sending: boolean;
   generatingImage: boolean;
@@ -113,7 +119,10 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
     onLoadVisionSample,
     onTriggerGenerativeSample,
     onOpenImageGenModal,
+    onCaptureDesktopScreenshot,
     imagePreviewName,
+    attachmentKind,
+    attachmentPreviewUrl,
     onClearImage,
     sending,
     generatingImage,
@@ -258,19 +267,39 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
           </button>
         </div>
 
-        {/* Vision / Edit Image Attached Banner */}
+        {/* Vision / Video / Document Attachment Banner */}
         {imagePreviewName && (
-          <div className="flex items-center justify-between px-2.5 py-1.5 rounded-md bg-violet-950/40 border border-violet-600/60 text-[11px] text-violet-200 font-mono-tabular">
-            <div className="flex items-center gap-1.5 truncate">
-              <Eye className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-              <span className="font-semibold text-cyan-300">OBRAZ ZAŁĄCZONY:</span>
+          <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-violet-950/40 border border-violet-600/60 text-[11px] text-violet-200 font-mono-tabular">
+            <div className="flex items-center gap-2 min-w-0">
+              {attachmentKind === "image" && attachmentPreviewUrl ? (
+                <img
+                  src={attachmentPreviewUrl}
+                  alt={imagePreviewName}
+                  className="w-8 h-8 rounded object-cover border border-cyan-400/50 shrink-0"
+                />
+              ) : attachmentKind === "video" && attachmentPreviewUrl ? (
+                <video
+                  src={attachmentPreviewUrl}
+                  controls
+                  className="w-16 h-10 rounded border border-violet-400/50 shrink-0 bg-black"
+                />
+              ) : (
+                <FileText className="w-4 h-4 text-cyan-400 shrink-0" />
+              )}
+              <span className="font-semibold text-cyan-300 shrink-0">
+                {attachmentKind === "video"
+                  ? "WIDEO:"
+                  : attachmentKind === "document"
+                  ? "DOKUMENT:"
+                  : "OBRAZ:"}
+              </span>
               <span className="truncate">{imagePreviewName}</span>
             </div>
             <button
               type="button"
               onClick={onClearImage}
-              aria-label="Usuń załączony obraz"
-              className="min-h-8 min-w-8 text-rose-400 hover:text-rose-300 ml-2"
+              aria-label="Usuń załącznik"
+              className="min-h-8 min-w-8 text-rose-400 hover:text-rose-300 ml-2 shrink-0"
             >
               ✕
             </button>
@@ -308,18 +337,28 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
               <label
                 htmlFor="vision-upload-micro"
                 className="min-h-10 min-w-10 px-2.5 flex items-center justify-center gap-1.5 rounded-lg bg-[#0b0f18] hover:bg-slate-800 border border-slate-700 text-slate-300 cursor-pointer transition-colors shrink-0 text-xs"
-                title="Wgraj obraz (Vision lub edycja/wariant)"
+                title="Wgraj obraz, wideo lub dokument (Vision / kontekst)"
               >
                 <ImageIcon className="w-4 h-4 text-cyan-400" />
-                <span className="hidden sm:inline text-[11px]">Obraz</span>
+                <span className="hidden sm:inline text-[11px]">Załącznik</span>
                 <input
                   id="vision-upload-micro"
                   type="file"
-                  accept="image/*"
+                  accept="image/*,video/*,.pdf,.txt,.md,.json,.py,.ts,.tsx,.sh,.log,.csv"
                   onChange={handleFileChange}
                   className="hidden"
                 />
               </label>
+
+              <button
+                type="button"
+                onClick={onCaptureDesktopScreenshot}
+                className="min-h-10 px-2.5 rounded-lg bg-[#0b0f18] hover:bg-slate-800 border border-slate-700 text-violet-300 text-xs font-mono-tabular transition-colors shrink-0 flex items-center gap-1"
+                title="Pobierz aktualny zrzut pulpitu X11 i załącz do analizy AI"
+              >
+                <Monitor className="w-3.5 h-3.5" />
+                <span className="hidden md:inline text-[11px]">Zrzut X11</span>
+              </button>
 
               <button
                 type="button"
@@ -400,6 +439,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [enginePreference, setEnginePreference] = useState<OllamaEngineChoice>("auto");
   const [filterByAgent, setFilterByAgent] = useState<boolean>(true);
+  const [searchQuery, setSearchQuery] = useState<string>("");
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [showCanvasDrawer, setShowCanvasDrawer] = useState<boolean>(false);
   const [showMobileTools, setShowMobileTools] = useState<boolean>(false);
@@ -407,6 +447,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [imageBase64, setImageBase64] = useState<string | null>(null);
   const [imageMimeType, setImageMimeType] = useState<string>("image/jpeg");
   const [imagePreviewName, setImagePreviewName] = useState<string>("");
+  const [attachmentKind, setAttachmentKind] = useState<"image" | "video" | "document" | null>(null);
+  const [attachmentPreviewUrl, setAttachmentPreviewUrl] = useState<string | null>(null);
+  const [attachmentTextContext, setAttachmentTextContext] = useState<string>("");
   const [activeArtifact, setActiveArtifact] = useState<{
     title: string;
     code: string;
@@ -509,28 +552,106 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [localMessages.length, selectedAgent, streamingContent]);
 
-  const visibleMessages =
-    !filterByAgent || selectedAgent === "council"
-      ? localMessages
-      : localMessages.filter(
-          (m) =>
-            m.agent_id === selectedAgent ||
-            m.agent_id === "council" ||
-            Boolean(m.engine_used && m.engine_used.includes("@wszyscy")) ||
-            Boolean(m.content && m.content.toLowerCase().includes(`@${selectedAgent}`))
-        );
+  const visibleMessages = localMessages.filter((m) => {
+    const matchesAgent =
+      !filterByAgent ||
+      selectedAgent === "council" ||
+      m.agent_id === selectedAgent ||
+      m.agent_id === "council" ||
+      Boolean(m.engine_used && m.engine_used.includes("@wszyscy")) ||
+      Boolean(m.content && m.content.toLowerCase().includes(`@${selectedAgent}`));
+    if (!matchesAgent) return false;
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      m.content.toLowerCase().includes(q) ||
+      m.agent_id.toLowerCase().includes(q) ||
+      (m.engine_used || "").toLowerCase().includes(q)
+    );
+  });
+
+  const handleClearAttachment = useCallback(() => {
+    if (attachmentPreviewUrl && attachmentPreviewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(attachmentPreviewUrl);
+    }
+    setImageBase64(null);
+    setImagePreviewName("");
+    setAttachmentKind(null);
+    setAttachmentPreviewUrl(null);
+    setAttachmentTextContext("");
+  }, [attachmentPreviewUrl]);
 
   const handleProcessImageFile = useCallback((file: File) => {
+    if (attachmentPreviewUrl && attachmentPreviewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(attachmentPreviewUrl);
+    }
     setImagePreviewName(file.name);
-    setImageMimeType(file.type || "image/jpeg");
+    setImageMimeType(file.type || "application/octet-stream");
+    setAttachmentTextContext("");
+
+    if (file.type.startsWith("video/")) {
+      setAttachmentKind("video");
+      setAttachmentPreviewUrl(URL.createObjectURL(file));
+      setImageBase64(null);
+      setAttachmentTextContext(`[Załącznik wideo: ${file.name}, ${Math.round(file.size / 1024)} KB, ${file.type}]`);
+      return;
+    }
+
+    const isTextLike =
+      file.type.startsWith("text/") ||
+      /\.(txt|md|json|py|ts|tsx|js|sh|log|csv|yml|yaml|toml)$/i.test(file.name);
+    if (isTextLike || file.type === "application/pdf") {
+      setAttachmentKind("document");
+      setAttachmentPreviewUrl(null);
+      setImageBase64(null);
+      if (isTextLike) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const content = String(reader.result || "").slice(0, 16000);
+          setAttachmentTextContext(`\n\n--- Załączony dokument: ${file.name} ---\n\`\`\`\n${content}\n\`\`\``);
+        };
+        reader.readAsText(file);
+      } else {
+        setAttachmentTextContext(`\n\n[Załączony plik PDF/binarny: ${file.name}, ${Math.round(file.size / 1024)} KB]`);
+      }
+      return;
+    }
+
+    setAttachmentKind("image");
     const reader = new FileReader();
     reader.onload = () => {
       const result = String(reader.result || "");
       const base64 = result.includes(",") ? result.split(",")[1] : result;
+      setAttachmentPreviewUrl(result);
       setImageBase64(base64);
     };
     reader.readAsDataURL(file);
-  }, []);
+  }, [attachmentPreviewUrl]);
+
+  const handleCaptureDesktopScreenshot = useCallback(async () => {
+    setErrorMsg(null);
+    setStatusNotice(null);
+    try {
+      const data = await apiFetchJson<{
+        ok: boolean;
+        screenshot?: { base64: string; mimeType: string; width: number; height: number; display: string };
+        error?: string;
+      }>("/api/desktop/screenshot", {
+        method: "POST",
+        body: JSON.stringify({ agentId: selectedAgent === "council" ? "astyria" : selectedAgent }),
+      });
+      if (data.ok && data.screenshot) {
+        setImageBase64(data.screenshot.base64);
+        setImageMimeType(data.screenshot.mimeType);
+        setAttachmentKind("image");
+        setAttachmentPreviewUrl(`data:${data.screenshot.mimeType};base64,${data.screenshot.base64}`);
+        setImagePreviewName(`desktop_${data.screenshot.display}_${data.screenshot.width}x${data.screenshot.height}.png`);
+        setStatusNotice(`Przechwycono świeży zrzut X11 (${data.screenshot.width}x${data.screenshot.height}).`);
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Najpierw uruchom sesję pulpitu X11 w zakładce Pulpit Violet.");
+    }
+  }, [selectedAgent]);
 
   const handleLoadVisionSample = useCallback(() => {
     const canvas = document.createElement("canvas");
@@ -551,6 +672,8 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     const dataUrl = canvas.toDataURL("image/jpeg");
     setImageBase64(dataUrl.split(",")[1]);
     setImageMimeType("image/jpeg");
+    setAttachmentKind("image");
+    setAttachmentPreviewUrl(dataUrl);
     setImagePreviewName("real_vision_test_pattern.jpg");
     setStatusNotice("Załadowano obraz testowy Real Vision.");
   }, []);
@@ -612,7 +735,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const sendDirectMessage = useCallback(
     async (textToSend: string) => {
       const trimmed = textToSend.trim();
-      if (!trimmed && !imageBase64) return;
+      if (!trimmed && !imageBase64 && !attachmentTextContext) return;
 
       setErrorMsg(null);
       setStatusNotice(null);
@@ -631,14 +754,14 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
       }
 
       const effectivePrompt =
-        trimmed || "Przeanalizuj ten obraz w trybie Real Vision i opisz co przedstawia.";
+        `${trimmed || "Przeanalizuj załącznik."}${attachmentTextContext ? attachmentTextContext : ""}`;
       const optimisticUserMsg: ChatMessageRecord = {
         id: Date.now(),
         session_id: "bastilla-main",
         sender_role: "user",
         agent_id: selectedAgent,
         engine_used: "Operator",
-        content: trimmed || "[Przesłano obraz do analizy Real Vision]",
+        content: trimmed || `[Załączono: ${imagePreviewName || "plik"}]`,
         created_at: new Date().toISOString(),
       };
 
@@ -742,8 +865,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           }
         }
 
-        setImageBase64(null);
-        setImagePreviewName("");
+        handleClearAttachment();
 
         const finalText = (
           finalDonePayload?.assistantMessageRecord?.content ??
@@ -825,6 +947,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     [
       imageBase64,
       imageMimeType,
+      imagePreviewName,
+      attachmentTextContext,
+      handleClearAttachment,
       selectedAgent,
       enginePreference,
       onRefresh,
@@ -1263,6 +1388,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             <button
               type="button"
               onClick={() => setIsFullscreen((v) => !v)}
+              title={isFullscreen ? "Wyłącz pełny ekran" : "Włącz pełny ekran"}
               aria-label={isFullscreen ? "Wyłącz pełny ekran" : "Włącz pełny ekran"}
               className="min-h-9 sm:min-h-7 px-2.5 rounded-md bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-semibold flex items-center gap-1 whitespace-nowrap"
             >
@@ -1350,6 +1476,17 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
+            <label className="relative flex items-center">
+              <Search className="w-3 h-3 text-slate-400 absolute left-2 pointer-events-none" />
+              <input
+                type="search"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Szukaj w rozmowach..."
+                aria-label="Szukaj w historii rozmów"
+                className="min-h-8 sm:min-h-6 w-32 sm:w-44 pl-6 pr-2 rounded bg-[#07090e] border border-slate-800 focus:border-violet-500 text-[11px] text-white placeholder-slate-500 focus:outline-none"
+              />
+            </label>
             <button
               type="button"
               onClick={() => setFilterByAgent((v) => !v)}
@@ -1821,11 +1958,11 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               if (prefill) setImagePromptInput(prefill);
               setShowImageGenPanel(true);
             }}
+            onCaptureDesktopScreenshot={() => void handleCaptureDesktopScreenshot()}
             imagePreviewName={imagePreviewName}
-            onClearImage={() => {
-              setImageBase64(null);
-              setImagePreviewName("");
-            }}
+            attachmentKind={attachmentKind}
+            attachmentPreviewUrl={attachmentPreviewUrl}
+            onClearImage={handleClearAttachment}
             sending={sending}
             generatingImage={generatingImage}
             selectedAgentName={AGENT_LABELS[selectedAgent].name}

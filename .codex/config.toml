@@ -1,0 +1,17 @@
+# Bastilla Ultimate: local MCP over stdio, no Cloud Run dependency.
+# Codex CLI starts this process in the repository working directory.
+[mcp_servers.bastilla_local]
+command = "node"
+args = ["scripts/bastilla-mcp-stdio.mjs"]
+enabled = true
+startup_timeout_sec = 15
+tool_timeout_sec = 30
+
+# Optional local GUI inspection. Requires an existing X11 session and ImageMagick.
+# This bridge is read-only: no keyboard, mouse or shell execution tools.
+[mcp_servers.bastilla_desktop]
+command = "node"
+args = ["scripts/desktop-bridge.mjs"]
+enabled = true
+startup_timeout_sec = 15
+tool_timeout_sec = 15

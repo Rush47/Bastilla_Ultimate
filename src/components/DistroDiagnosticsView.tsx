@@ -1,14 +1,24 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 import { CodexAuthPanel } from "./CodexAuthPanel";
-import type { SystemOverviewResponse } from "../types/bastilla";
+import type {
+  SystemOverviewResponse,
+  SphericalContextSnapshot,
+} from "../types/bastilla";
 import {
   GitBranch,
-  ShieldAlert,
-  Terminal,
-  Cloud,
-  Monitor,
+  Download,
+  Activity,
   RefreshCw,
 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from "recharts";
 import {
   apiFetchJson,
   getExternalBackendUrl,
@@ -48,6 +58,11 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   const [biSync, setBiSync] = useState<any>(null);
   const [stageAndCommitOnSync, setStageAndCommitOnSync] = useState<boolean>(true);
   const [togglingAutoSync, setTogglingAutoSync] = useState<boolean>(false);
+  const [spherical, setSpherical] = useState<SphericalContextSnapshot | null>(null);
+  const [probingSpherical, setProbingSpherical] = useState<boolean>(false);
+  const [ghDetails, setGhDetails] = useState<any>(null);
+  const [diagLogs, setDiagLogs] = useState<any>(null);
+  const [loadingLogs, setLoadingLogs] = useState<boolean>(false);
 
   const fetchGitStatus = async () => {
     try {
@@ -190,12 +205,59 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
     onRefresh();
   };
 
+  const fetchSphericalContext = async () => {
+    setProbingSpherical(true);
+    try {
+      const data = await apiFetchJson<{ ok: boolean; snapshot?: SphericalContextSnapshot }>(
+        "/api/system/spherical-context",
+        { timeoutMs: 8000 }
+      );
+      if (data.ok && data.snapshot) {
+        setSpherical(data.snapshot);
+      }
+    } catch {} finally {
+      setProbingSpherical(false);
+    }
+  };
+
+  const fetchGithubDetails = async () => {
+    try {
+      const data = await apiFetchJson<any>("/api/github/details");
+      if (data.ok) setGhDetails(data);
+    } catch {}
+  };
+
+  const fetchAndDownloadLogs = async (download = false) => {
+    setLoadingLogs(true);
+    try {
+      const data = await apiFetchJson<any>("/api/diagnostics/logs");
+      if (data.ok) {
+        setDiagLogs(data);
+        if (download) {
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `bastilla-diagnostics-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+        }
+      }
+    } catch {} finally {
+      setLoadingLogs(false);
+    }
+  };
+
   useEffect(() => {
     void fetchGitStatus();
     void fetchMcpStatus();
+    void fetchGithubDetails();
+    void fetchSphericalContext();
     const timer = setInterval(() => {
       void fetchGitStatus();
-    }, 8000);
+    }, 10000);
     return () => clearInterval(timer);
   }, []);
 
@@ -272,8 +334,202 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
   const host = overview?.host;
   const tools = host?.tools || {};
 
+  const parseKbToMb = (val?: string): number => {
+    if (!val) return 0;
+    const m = val.match(/(\d+)/);
+    return m ? Math.round(parseInt(m[1], 10) / 1024) : 0;
+  };
+
+  const ramTotalMb = parseKbToMb(host?.meminfo?.total);
+  const ramAvailMb = parseKbToMb(host?.meminfo?.available);
+  const ramUsedMb = Math.max(0, ramTotalMb - ramAvailMb);
+
+  const chartData = useMemo(() => {
+    if (spherical?.streams) {
+      return Object.values(spherical.streams).map((s) => ({
+        name: s.stream,
+        latencyMs: s.latencyMs,
+      }));
+    }
+    return [
+      { name: "RAM Użyta (MB)", latencyMs: ramUsedMb },
+      { name: "RAM Wolna (MB)", latencyMs: ramAvailMb },
+    ];
+  }, [spherical, ramUsedMb, ramAvailMb]);
+
+  const statusMatrix = useMemo(() => {
+    const runningAgentsCount = (host?.agents_live || []).filter((a) => a.running).length;
+    const d = overview?.desktop_status;
+    return [
+      {
+        name: "Backend Express",
+        status: overview?.ok ? "ONLINE" : "DEGRADED",
+        detail: `Uptime ${Math.round((host?.uptime_sec || 0) / 60)} min`,
+      },
+      {
+        name: "Baza SQLite",
+        status: overview?.svl_report?.Database_Integration ? "ONLINE" : "DEGRADED",
+        detail: `${overview?.svl_report?.Database_Integration?.total_records ?? 0} rekordów`,
+      },
+      {
+        name: "Ollama Daemon",
+        status: overview?.ollama_status?.state || (overview?.ai_routing?.ollama_online ? "ONLINE" : "OFFLINE"),
+        detail: `${overview?.ai_routing?.available_models?.length || 0} modeli`,
+      },
+      {
+        name: "Gemini API",
+        status: overview?.ai_routing?.gemini_configured ? "READY" : "BRAK KLUCZA",
+        detail: overview?.ai_routing?.fallback_model || "gemini-3.8-flash",
+      },
+      {
+        name: "MCP Serwer",
+        status: mcpStatus?.ok ? (mcpStatus.configured ? "ONLINE" : "READ-ONLY / BRAK TOKENU") : "UNVERIFIED",
+        detail: `${mcpStatus?.tools?.length || 0} narzędzi`,
+      },
+      {
+        name: "Codex CLI",
+        status: tools.codex?.installed ? (tools.codex.auth_ready ? "ONLINE" : "WYMAGA LOGOWANIA") : "OFFLINE",
+        detail: tools.codex?.version || "brak wersji",
+      },
+      {
+        name: "4 Agenci Linux",
+        status: runningAgentsCount === 4 ? "ONLINE (4/4)" : runningAgentsCount > 0 ? `DEGRADED (${runningAgentsCount}/4)` : "OFFLINE (0/4)",
+        detail: "Aria, Alex, Astyria, Aurelius",
+      },
+      {
+        name: "Pulpit AI (X11/noVNC)",
+        status: d?.sessionIsolated ? (d.vncRunning ? "ONLINE" : "X11 BEZ VNC") : "GOTOWY (WYŁ.)",
+        detail: d?.display || "brak DISPLAY",
+      },
+      {
+        name: "GitHub Repo",
+        status: ghDetails?.ghAuthReady ? "AUTH OK" : "FETCH TYLKO (BRAK GH AUTH)",
+        detail: ghDetails?.branch || gitInfo?.branch || "main",
+      },
+    ];
+  }, [overview, host, mcpStatus, tools, ghDetails, gitInfo]);
+
   return (
-    <div className="min-h-[calc(100vh-64px)] p-6 bg-[#07090e] space-y-6">
+    <div className="min-h-[calc(100vh-64px)] p-4 sm:p-6 bg-[#07090e] space-y-6">
+      {/* Section 0: Unified Central Diagnostics Matrix & Spherical Worker Chart */}
+      <section className="bg-[#0c1018] border border-slate-800 rounded-xl p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="font-display text-xl font-bold text-white flex items-center gap-2">
+              <Activity className="w-5 h-5 text-violet-400" />
+              00. Centralny Panel Diagnostyki Systemu Bastilla Ultimate
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Rzeczywista matryca usług, Worker Sferyczny (kolektor wielostrumieniowy), telemetria RAM/CPU oraz eksport zanonimizowanych logów.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void fetchSphericalContext()}
+              disabled={probingSpherical}
+              className="min-h-9 px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-xs font-semibold text-white flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${probingSpherical ? "animate-spin" : ""}`} />
+              {probingSpherical ? "Sondowanie..." : "Uruchom Worker Sferyczny"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void fetchAndDownloadLogs(true)}
+              disabled={loadingLogs}
+              className="min-h-9 px-3 py-1.5 rounded-lg bg-[#111723] hover:bg-slate-800 border border-slate-700 text-xs font-semibold text-cyan-300 flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <Download className="w-3.5 h-3.5" />
+              {loadingLogs ? "Eksport..." : "Eksportuj logi (JSON)"}
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 text-xs font-mono-tabular">
+          {statusMatrix.map((item) => {
+            const isGood = /ONLINE|READY|AUTH OK/.test(item.status);
+            const isWarn = /DEGRADED|BRAK|WYMAGA|FETCH|READ-ONLY|GOTOWY/.test(item.status);
+            return (
+              <div key={item.name} className="p-3 rounded-lg bg-[#111723] border border-slate-800 flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-white font-semibold truncate">{item.name}</div>
+                  <div className="text-[11px] text-slate-400 truncate">{item.detail}</div>
+                </div>
+                <span
+                  className={`text-[11px] font-semibold shrink-0 ${
+                    isGood ? "text-emerald-400" : isWarn ? "text-amber-300" : "text-rose-400"
+                  }`}
+                >
+                  {item.status}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+          <div className="lg:col-span-7 p-4 rounded-lg bg-[#111723] border border-slate-800">
+            <div className="flex items-center justify-between text-xs mb-2">
+              <span className="font-semibold text-white">
+                {spherical ? "Opóźnienia strumieni Workera Sferycznego (ms)" : "Alokacja pamięci RAM hosta (MB)"}
+              </span>
+              {spherical && (
+                <span className="font-mono-tabular text-[11px] text-slate-400">
+                  Współbieżność: {spherical.concurrencyCap} · Wolny RAM: {spherical.memAvailableMb} MB
+                </span>
+              )}
+            </div>
+            <div className="h-44 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="name" tick={{ fill: "#94a3b8", fontSize: 10 }} />
+                  <YAxis tick={{ fill: "#94a3b8", fontSize: 10 }} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "#07090e",
+                      borderColor: "#334155",
+                      fontSize: "11px",
+                      color: "#f8fafc",
+                    }}
+                  />
+                  <Bar dataKey="latencyMs" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="lg:col-span-5 p-4 rounded-lg bg-[#111723] border border-slate-800 space-y-2 text-xs font-mono-tabular">
+            <div className="font-semibold text-white font-sans">
+              Status GitHub &amp; Logi Diagnostyczne
+            </div>
+            <div className="text-[11px] text-slate-300">
+              CLI gh auth:{" "}
+              <span className={ghDetails?.ghAuthReady ? "text-emerald-400" : "text-amber-300"}>
+                {ghDetails?.ghAuthReady ? "ZALOGOWANO" : "NIEZALOGOWANO (tylko odczyt/fetch)"}
+              </span>
+            </div>
+            <div className="text-[11px] text-slate-400 whitespace-pre-wrap max-h-20 overflow-y-auto bg-[#07090e] p-2 rounded border border-slate-800">
+              {ghDetails?.diffStat || "Ładowanie diff..."}
+            </div>
+            {diagLogs ? (
+              <div className="text-[11px] text-cyan-300">
+                Zanonimizowane logi gotowe: {diagLogs.continuousMissionLogs?.length || 0} misji ·{" "}
+                {diagLogs.desktopAuditLog?.length || 0} GUI · {diagLogs.recentTasks?.length || 0} zadań.
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void fetchAndDownloadLogs(false)}
+                className="text-[11px] text-violet-300 hover:text-violet-200 underline"
+              >
+                Wczytaj podgląd logów systemowych
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
+
       {/* Section 1: Honest Verification & External Credential Matrix */}
       <section className="bg-[#0c1018] border border-slate-800 rounded-xl p-6">
         <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
