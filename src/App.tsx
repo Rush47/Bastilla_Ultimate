@@ -51,6 +51,9 @@ export default function App() {
       memoryFreedMb: number;
       repairedMessages: number;
       dbIntegrityChecks: number;
+      innovationsAdded?: number;
+      linuxAdaptations?: number;
+      backendUpgrades?: number;
       operator: string;
       version: string;
     };
@@ -156,12 +159,16 @@ export default function App() {
     } catch {}
   };
 
-  const triggerMissionCycle = async () => {
+  const triggerMissionCycle = async (aiGenerate = true) => {
     setTriggeringCycle(true);
     try {
       const data = await apiFetchJson<{ ok: boolean; mission: any }>(
-        "/api/missions/continuous/trigger",
-        { method: "POST", body: "{}" }
+        aiGenerate ? "/api/missions/continuous/innovate" : "/api/missions/continuous/trigger",
+        {
+          method: "POST",
+          body: JSON.stringify({ aiGenerate }),
+          timeoutMs: 35000,
+        }
       );
       if (data.ok) {
         setContinuousMission(data.mission);
@@ -352,19 +359,21 @@ export default function App() {
             />
           </span>
           <span className="font-bold text-white uppercase text-[11px] tracking-wide shrink-0 flex items-center gap-1.5">
-            {continuousMission?.active ? "KONTROLA SQLITE AKTYWNA" : "KONTROLA SQLITE WSTRZYMANA"}
+            {continuousMission?.active
+              ? "MISJA CIĄGŁA AI: ROZWÓJ LINUX & BACKEND"
+              : "MISJA CIĄGŁA AI WSTRZYMANA"}
           </span>
           <span className="px-1.5 py-0.5 rounded bg-violet-950/80 border border-violet-700/50 text-violet-300 text-[10px] shrink-0 font-bold">
-            Cykl #{continuousMission?.cycle ?? 0}
+            Cykl #{continuousMission?.cycle ?? 0} · Nowości: +{continuousMission?.stats?.innovationsAdded ?? 0}
           </span>
           <span className="text-slate-400 hidden md:inline truncate max-w-sm lg:max-w-xl text-[11px]">
-            {syncNotice || continuousMission?.lastAction || "Kontrola SQLite wykonywana przez serwer"}
+            {syncNotice || continuousMission?.lastAction || "Ciągłe dostosowywanie systemu Linux i backendu SQLite"}
           </span>
         </div>
 
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 flex-wrap">
           <span className="text-[10px] text-slate-400 hidden xl:inline">
-            RAM zwolniony: <strong className="text-cyan-300">+{continuousMission?.stats?.memoryFreedMb || 0} MB</strong>
+            Linux: <strong className="text-emerald-300">+{continuousMission?.stats?.linuxAdaptations || 0}</strong> · Backend: <strong className="text-cyan-300">+{continuousMission?.stats?.backendUpgrades || 0}</strong>
           </span>
           <button
             type="button"
@@ -376,11 +385,12 @@ export default function App() {
           </button>
           <button
             type="button"
-            onClick={triggerMissionCycle}
+            onClick={() => void triggerMissionCycle(true)}
             disabled={triggeringCycle}
             className="min-h-9 sm:min-h-7 px-2 sm:px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap"
+            title="Wygeneruj i wdróż nową innowację AI dla Linuxa i backendu"
           >
-            <span>{triggeringCycle ? "Wykonywanie..." : "Wymuś cykl"}</span>
+            <span>{triggeringCycle ? "Wdrażanie nowości AI..." : "Wdróż Nowość AI"}</span>
           </button>
           <button
             type="button"
@@ -391,7 +401,7 @@ export default function App() {
                 : "bg-emerald-600 hover:bg-emerald-500 text-white"
             }`}
           >
-            {continuousMission?.active ? "Wstrzymaj" : "Wznów kontrolę"}
+            {continuousMission?.active ? "Wstrzymaj" : "Wznów misję"}
           </button>
         </div>
       </div>
