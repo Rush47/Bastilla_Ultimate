@@ -1,5 +1,6 @@
-import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
@@ -150,3 +151,360 @@ export class CodexAuthManager {
 
   dispose() { this.cancelDeviceLogin(); }
 }
+
+export interface CodexTaskRecord {
+  id: number;
+  agent_id: string;
+  session_id: string;
+  prompt: string;
+  status: "pending" | "running" | "completed" | "error" | "cancelled";
+  output: string;
+  error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export class CodexTaskManager extends EventEmitter {
+  private activeProcesses = new Map<number, ChildProcess>();
+  private runningBySession = new Map<string, number>();
+
+  constructor(private projectRoot: string, private dbPath: string, private env: NodeJS.ProcessEnv) {
+    super();
+    this.ensureSchema();
+  }
+
+  private ensureSchema() {
+    try {
+      mkdirSync(path.dirname(this.dbPath), { recursive: true });
+      this.runSqlRun(`
+        CREATE TABLE IF NOT EXISTS codex_tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          agent_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          status TEXT NOT NULL,
+          output TEXT,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+      `);
+    } catch (e: any) {
+      console.error("CodexTaskManager ensureSchema error:", e?.message || e);
+    }
+  }
+
+  private sanitizeSecrets(text: string): string {
+    if (!text) return "";
+    let cleaned = stripVTControlCharacters(text);
+    const secretsToRedact: string[] = [];
+    if (this.env.OPENAI_API_KEY && this.env.OPENAI_API_KEY.trim().length > 4) {
+      secretsToRedact.push(this.env.OPENAI_API_KEY.trim());
+    }
+    if (this.env.GEMINI_API_KEY && this.env.GEMINI_API_KEY.trim().length > 4) {
+      secretsToRedact.push(this.env.GEMINI_API_KEY.trim());
+    }
+    try {
+      const authPath = path.join(this.env.CODEX_HOME || path.join(homedir(), ".codex"), "auth.json");
+      if (existsSync(authPath)) {
+        const auth = JSON.parse(readFileSync(authPath, "utf8"));
+        if (typeof auth?.OPENAI_API_KEY === "string" && auth.OPENAI_API_KEY.length > 4) {
+          secretsToRedact.push(auth.OPENAI_API_KEY);
+        }
+        if (typeof auth?.tokens?.access_token === "string" && auth.tokens.access_token.length > 4) {
+          secretsToRedact.push(auth.tokens.access_token);
+        }
+        if (typeof auth?.tokens?.refresh_token === "string" && auth.tokens.refresh_token.length > 4) {
+          secretsToRedact.push(auth.tokens.refresh_token);
+        }
+      }
+    } catch {}
+    for (const secret of secretsToRedact) {
+      cleaned = cleaned.split(secret).join("[REDACTED_SECRET]");
+    }
+    return cleaned;
+  }
+
+  verifyOperatorPermission(operatorToken?: string): boolean {
+    if (operatorToken === undefined || operatorToken === "") {
+      return true;
+    }
+    return operatorToken === "364_OMNIKLUCZ_ROOT" || operatorToken === "SUPREME_ROOT_UID0_GID0";
+  }
+
+  static normalizeSessionId(agentId: string, sessionId?: string): string {
+    const cleanAgent = ["aria", "alex", "astyria", "aurelius"].includes(agentId.toLowerCase())
+      ? agentId.toLowerCase()
+      : "aria";
+    if (!sessionId || sessionId === "bastilla-main" || sessionId === "auto") {
+      return `codex-${cleanAgent}`;
+    }
+    return sessionId;
+  }
+
+  private runSql(sql: string, params: any[] = []): CodexTaskRecord[] {
+    try {
+      const pyScript = `
+import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+res = conn.execute(sys.argv[2], json.loads(sys.argv[3])).fetchall()
+conn.commit()
+conn.close()
+print(json.dumps([dict(r) for r in res]))
+`;
+      const out = execFileSync("python3", ["-c", pyScript, this.dbPath, sql, JSON.stringify(params)], { encoding: "utf8" });
+      return JSON.parse(out.trim() || "[]");
+    } catch (e: any) {
+      console.error("CodexTaskManager SQLite error:", e?.message || e);
+      return [];
+    }
+  }
+
+  private runSqlRun(sql: string, params: any[] = []) {
+    try {
+      const pyScript = `
+import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute(sys.argv[2], json.loads(sys.argv[3]))
+last_id = cur.lastrowid
+conn.commit()
+conn.close()
+print(json.dumps({"last_id": last_id}))
+`;
+      const out = execFileSync("python3", ["-c", pyScript, this.dbPath, sql, JSON.stringify(params)], { encoding: "utf8" });
+      return JSON.parse(out.trim() || '{"last_id":0}');
+    } catch (e: any) {
+      console.error("CodexTaskManager SQLite run error:", e?.message || e);
+      return { last_id: 0 };
+    }
+  }
+
+  createTask(
+    agentId: string,
+    sessionId: string,
+    prompt: string,
+    options?: { autoStart?: boolean; stdin?: string; operatorToken?: string }
+  ): number {
+    if (!this.verifyOperatorPermission(options?.operatorToken)) {
+      throw new CodexError(403, "Brak uprawnień operatora do wykonywania zadań Codex CLI.");
+    }
+    const cleanAgent = ["aria", "alex", "astyria", "aurelius"].includes(agentId.toLowerCase())
+      ? agentId.toLowerCase()
+      : "aria";
+    const resolvedSession = CodexTaskManager.normalizeSessionId(cleanAgent, sessionId);
+    const now = new Date().toISOString();
+    const res = this.runSqlRun(
+      "INSERT INTO codex_tasks (agent_id, session_id, prompt, status, output, error, created_at, updated_at) VALUES (?, ?, ?, 'pending', '', '', ?, ?)",
+      [cleanAgent, resolvedSession, prompt, now, now]
+    );
+    const taskId = res.last_id;
+    this.emit("update", { taskId, agentId: cleanAgent, sessionId: resolvedSession, status: "pending", output: "", error: "" });
+    if (options?.autoStart !== false) {
+      this.processQueue(resolvedSession, options?.stdin);
+    }
+    return taskId;
+  }
+
+  processQueue(sessionId: string, stdinInput?: string) {
+    if (this.runningBySession.has(sessionId)) {
+      return;
+    }
+    const pendingRows = this.runSql(
+      "SELECT * FROM codex_tasks WHERE session_id = ? AND status = 'pending' ORDER BY id ASC LIMIT 1",
+      [sessionId]
+    );
+    if (!pendingRows.length) return;
+    const nextTask = pendingRows[0];
+    this.runTask(nextTask.id, stdinInput);
+  }
+
+  startTask(taskId: number, stdinInput?: string) {
+    const rows = this.runSql("SELECT * FROM codex_tasks WHERE id = ?", [taskId]);
+    if (!rows.length) return;
+    const task = rows[0];
+    if (task.status === "running") return;
+    const now = new Date().toISOString();
+    this.runSqlRun("UPDATE codex_tasks SET status = 'pending', updated_at = ? WHERE id = ?", [now, taskId]);
+    this.emit("update", { taskId, status: "pending", output: task.output, error: task.error });
+    this.processQueue(task.session_id, stdinInput);
+  }
+
+  async runTask(taskId: number, stdinInput?: string) {
+    const rows = this.runSql("SELECT * FROM codex_tasks WHERE id = ?", [taskId]);
+    if (!rows.length) return;
+    const task = rows[0];
+    if (this.runningBySession.has(task.session_id) && this.runningBySession.get(task.session_id) !== taskId) {
+      return;
+    }
+    this.runningBySession.set(task.session_id, taskId);
+
+    const prompt = task.prompt;
+    const localBinary = path.join(this.projectRoot, "node_modules/.bin", process.platform === "win32" ? "codex.cmd" : "codex");
+    const binary = this.env.BASTILLA_CODEX_BIN || (existsSync(localBinary) ? localBinary : "codex");
+
+    const now = new Date().toISOString();
+    this.runSqlRun("UPDATE codex_tasks SET status = 'running', updated_at = ? WHERE id = ?", [now, taskId]);
+    this.emit("update", { taskId, sessionId: task.session_id, status: "running", output: "" });
+
+    let output = "";
+    let errorOutput = "";
+
+    const child = spawn(binary, ["exec", prompt], {
+      cwd: this.projectRoot,
+      env: this.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    child.stdin?.on("error", () => {});
+    if (stdinInput) {
+      child.stdin?.write(stdinInput);
+    }
+    child.stdin?.end();
+
+    this.activeProcesses.set(taskId, child);
+
+    child.stdout?.on("data", (chunk) => {
+      const text = this.sanitizeSecrets(chunk.toString());
+      output += text;
+      this.emit("data", { taskId, sessionId: task.session_id, output, error: errorOutput });
+      this.runSqlRun("UPDATE codex_tasks SET output = ?, updated_at = ? WHERE id = ?", [output, new Date().toISOString(), taskId]);
+    });
+
+    child.stderr?.on("data", (chunk) => {
+      const text = this.sanitizeSecrets(chunk.toString());
+      errorOutput += text;
+      this.emit("data", { taskId, sessionId: task.session_id, output, error: errorOutput });
+      this.runSqlRun("UPDATE codex_tasks SET error = ?, updated_at = ? WHERE id = ?", [errorOutput, new Date().toISOString(), taskId]);
+    });
+
+    child.on("error", (err) => {
+      this.activeProcesses.delete(taskId);
+      if (this.runningBySession.get(task.session_id) === taskId) {
+        this.runningBySession.delete(task.session_id);
+      }
+      const errText = this.sanitizeSecrets(err.message);
+      const completedAt = new Date().toISOString();
+      this.runSqlRun("UPDATE codex_tasks SET status = 'error', error = ?, updated_at = ? WHERE id = ?", [errText, completedAt, taskId]);
+      this.emit("complete", { taskId, sessionId: task.session_id, status: "error", output, error: errText });
+      this.processQueue(task.session_id);
+    });
+
+    child.on("close", (code, signal) => {
+      this.activeProcesses.delete(taskId);
+      if (this.runningBySession.get(task.session_id) === taskId) {
+        this.runningBySession.delete(task.session_id);
+      }
+      const currentRows = this.runSql("SELECT status FROM codex_tasks WHERE id = ?", [taskId]);
+      if (currentRows[0]?.status === "cancelled" || signal === "SIGTERM") {
+        this.processQueue(task.session_id);
+        return;
+      }
+      const status = code === 0 ? "completed" : "error";
+      const completedAt = new Date().toISOString();
+      this.runSqlRun("UPDATE codex_tasks SET status = ?, updated_at = ? WHERE id = ?", [status, completedAt, taskId]);
+      this.emit("complete", { taskId, sessionId: task.session_id, status, output, error: errorOutput });
+      this.processQueue(task.session_id);
+    });
+  }
+
+  cancelTask(taskId: number) {
+    const rows = this.runSql("SELECT * FROM codex_tasks WHERE id = ?", [taskId]);
+    const sessionId = rows[0]?.session_id;
+    const now = new Date().toISOString();
+    this.runSqlRun("UPDATE codex_tasks SET status = 'cancelled', updated_at = ? WHERE id = ?", [now, taskId]);
+
+    const child = this.activeProcesses.get(taskId);
+    if (child) {
+      this.activeProcesses.delete(taskId);
+      if (sessionId && this.runningBySession.get(sessionId) === taskId) {
+        this.runningBySession.delete(sessionId);
+      }
+      child.kill("SIGTERM");
+    }
+    this.emit("complete", { taskId, sessionId, status: "cancelled", output: rows[0]?.output || "", error: rows[0]?.error || "" });
+    if (sessionId) {
+      this.processQueue(sessionId);
+    }
+  }
+
+  retryTask(taskId: number) {
+    const rows = this.runSql("SELECT * FROM codex_tasks WHERE id = ?", [taskId]);
+    if (!rows.length) return;
+    const task = rows[0];
+    if (this.activeProcesses.has(taskId)) {
+      this.cancelTask(taskId);
+    }
+    const now = new Date().toISOString();
+    this.runSqlRun("UPDATE codex_tasks SET status = 'pending', output = '', error = '', updated_at = ? WHERE id = ?", [now, taskId]);
+    this.emit("update", { taskId, sessionId: task.session_id, status: "pending", output: "", error: "" });
+    this.processQueue(task.session_id);
+  }
+
+  getTaskById(taskId: number): CodexTaskRecord | null {
+    const rows = this.runSql("SELECT * FROM codex_tasks WHERE id = ?", [taskId]);
+    return rows[0] || null;
+  }
+
+  getTasks(sessionId?: string, limit = 50, agentId?: string): CodexTaskRecord[] {
+    if (sessionId && agentId) {
+      return this.runSql(
+        "SELECT * FROM codex_tasks WHERE session_id = ? AND agent_id = ? ORDER BY id DESC LIMIT ?",
+        [sessionId, agentId, limit]
+      );
+    }
+    if (sessionId) {
+      return this.runSql("SELECT * FROM codex_tasks WHERE session_id = ? ORDER BY id DESC LIMIT ?", [sessionId, limit]);
+    }
+    if (agentId) {
+      return this.runSql("SELECT * FROM codex_tasks WHERE agent_id = ? ORDER BY id DESC LIMIT ?", [agentId, limit]);
+    }
+    return this.runSql("SELECT * FROM codex_tasks ORDER BY id DESC LIMIT ?", [limit]);
+  }
+
+  getGitSummary() {
+    const runGit = (args: string[]) => {
+      try {
+        return execFileSync("git", args, {
+          cwd: this.projectRoot,
+          encoding: "utf8",
+          timeout: 4000,
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      } catch {
+        return "";
+      }
+    };
+    const remoteUrl = runGit(["remote", "get-url", "origin"]) || "https://github.com/Rush47/Bastilla_Ultimate";
+    const branch = runGit(["branch", "--show-current"]) || "main";
+    const statusShort = runGit(["status", "--short"]);
+    const diffStat = runGit(["diff", "--stat"]);
+    const logRaw = runGit(["log", "-n", "8", "--pretty=format:%h|%an|%ar|%s"]);
+
+    const files = statusShort
+      ? statusShort.split("\n").filter(Boolean).map((line) => {
+          const code = line.slice(0, 2).trim() || "M";
+          const filePath = line.slice(3).trim();
+          return { status: code, path: filePath };
+        })
+      : [];
+
+    const commits = logRaw
+      ? logRaw.split("\n").filter(Boolean).map((line) => {
+          const [hash = "", author = "", date = "", ...msgParts] = line.split("|");
+          return { hash, author, date, message: msgParts.join("|") };
+        })
+      : [];
+
+    return {
+      repository: remoteUrl,
+      branch,
+      files,
+      diffStat: diffStat || "Brak niezatwierdzonych różnic względem HEAD.",
+      commits,
+    };
+  }
+}
+
+

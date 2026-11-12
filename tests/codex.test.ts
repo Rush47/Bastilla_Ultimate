@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { copyFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { CodexAuthManager, CodexError, parseDevicePrompt } from "../server/codex";
+import { CodexAuthManager, CodexError, CodexTaskManager, parseDevicePrompt } from "../server/codex";
 
 const projectRoot = path.resolve(import.meta.dirname, "..");
 function setup(extra: NodeJS.ProcessEnv = {}) {
@@ -132,3 +132,110 @@ test("completed device login is confirmed by a separate CLI status call", async 
     assert.equal(JSON.stringify(status).includes("synthetic-oauth-token"), false);
   } finally { f.cleanup(); }
 });
+
+test("CodexTaskManager isolates agent sessions, runs codex exec, streams events, and redacts secrets", async () => {
+  const secretKey = "sk-test-secret-do-not-expose-999";
+  const f = setup({ OPENAI_API_KEY: secretKey, TEST_CODEX_EXEC_SLEEP_MS: "40" });
+  try {
+    const dbPath = path.join(f.home, "bastilla_test.db");
+    const binary = path.join(f.home, "codex test.mjs");
+    const tasks = new CodexTaskManager(projectRoot, dbPath, {
+      ...process.env,
+      CODEX_HOME: f.home,
+      BASTILLA_CODEX_BIN: binary,
+      OPENAI_API_KEY: secretKey,
+      TEST_CODEX_EXEC_SLEEP_MS: "40",
+    });
+
+    // Reject unauthorized token
+    assert.throws(
+      () => tasks.createTask("aria", "codex-aria", "git status", { operatorToken: "INVALID_TOKEN" }),
+      (err: any) => err instanceof CodexError && err.status === 403
+    );
+
+    const events: string[] = [];
+    tasks.on("data", (d) => events.push(`data:${d.taskId}`));
+    tasks.on("complete", (c) => events.push(`complete:${c.taskId}:${c.status}`));
+
+    // Enqueue two tasks in codex-aria (sequential queue) and one in codex-alex (isolated session)
+    const id1 = tasks.createTask("aria", "auto", `Sprawdź status ${secretKey}`, { operatorToken: "364_OMNIKLUCZ_ROOT" });
+    const id2 = tasks.createTask("aria", "codex-aria", "Drugi krok w kolejce Aria");
+    const idAlex = tasks.createTask("alex", "codex-alex", "Zadanie w osobnej sesji Alex");
+
+    // Immediately after creation, id2 should still be pending while id1 is running
+    const initialAria = tasks.getTasks("codex-aria");
+    assert.equal(initialAria.length, 2);
+    const t2Initial = tasks.getTaskById(id2);
+    assert.equal(t2Initial?.status, "pending");
+
+    await until(async () => tasks.getTaskById(id2)?.status === "completed" && tasks.getTaskById(idAlex)?.status === "completed");
+
+    const t1Final = tasks.getTaskById(id1);
+    const t2Final = tasks.getTaskById(id2);
+    const tAlexFinal = tasks.getTaskById(idAlex);
+
+    assert.equal(t1Final?.status, "completed");
+    assert.equal(t1Final?.session_id, "codex-aria");
+    assert.equal(t1Final?.output.includes(secretKey), false, "Secret key must be redacted from output");
+    assert.equal(t1Final?.output.includes("[REDACTED_SECRET]"), true);
+
+    assert.equal(t2Final?.status, "completed");
+    assert.equal(tAlexFinal?.status, "completed");
+    assert.equal(tAlexFinal?.session_id, "codex-alex");
+
+    // Verify codex exec was used (never interactive codex without exec)
+    const cliCalls = readFileSync(path.join(f.home, "calls.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    for (const call of cliCalls) {
+      assert.equal(call[0], "exec");
+    }
+
+    assert.equal(events.some((e) => e.startsWith(`data:${id1}`)), true);
+    assert.equal(events.includes(`complete:${id1}:completed`), true);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("CodexTaskManager supports cancellation, retry, error handling, and GitHub git summary", async () => {
+  const f = setup({ TEST_CODEX_EXEC_SLEEP_MS: "250" });
+  try {
+    const dbPath = path.join(f.home, "bastilla_cancel.db");
+    const binary = path.join(f.home, "codex test.mjs");
+    const tasks = new CodexTaskManager(projectRoot, dbPath, {
+      ...process.env,
+      CODEX_HOME: f.home,
+      BASTILLA_CODEX_BIN: binary,
+      TEST_CODEX_EXEC_SLEEP_MS: "250",
+    });
+
+    // 1. Test cancelTask on a running task in codex-astyria
+    const cancelId = tasks.createTask("astyria", "codex-astyria", "Dlugie zadanie do anulowania");
+    await until(async () => tasks.getTaskById(cancelId)?.status === "running");
+    tasks.cancelTask(cancelId);
+    assert.equal(tasks.getTaskById(cancelId)?.status, "cancelled");
+
+    // 2. Test error status when codex exec fails in codex-aurelius
+    const failId = tasks.createTask("aurelius", "codex-aurelius", "FAIL_TASK test bledu");
+    await until(async () => tasks.getTaskById(failId)?.status === "error");
+    assert.equal(tasks.getTaskById(failId)?.status, "error");
+    assert.match(tasks.getTaskById(failId)?.error || "", /Błąd wykonania zadania/);
+
+    // 3. Test retryTask on the cancelled task
+    tasks.retryTask(cancelId);
+    await until(async () => tasks.getTaskById(cancelId)?.status === "completed");
+    assert.equal(tasks.getTaskById(cancelId)?.status, "completed");
+
+    // 4. Test Git summary
+    const gitSummary = tasks.getGitSummary();
+    assert.equal(typeof gitSummary.repository, "string");
+    assert.equal(typeof gitSummary.branch, "string");
+    assert.equal(Array.isArray(gitSummary.files), true);
+    assert.equal(Array.isArray(gitSummary.commits), true);
+  } finally {
+    f.cleanup();
+  }
+});
+

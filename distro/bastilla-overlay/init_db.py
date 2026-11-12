@@ -109,6 +109,18 @@ CREATE TABLE IF NOT EXISTS hypercomm_relays (
   status TEXT NOT NULL,
   last_packet TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS codex_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  output TEXT DEFAULT '',
+  error TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """)
 
 # Migrate existing databases without replacing user data.

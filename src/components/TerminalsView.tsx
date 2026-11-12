@@ -1,4 +1,5 @@
 import { CodexAuthPanel } from "./CodexAuthPanel";
+import { CodexTasksPanel } from "./CodexTasksPanel";
 import React, { useState } from "react";
 import type { AgentId } from "../types/bastilla";
 import { Play, Sparkles, Terminal, CheckCircle2, ShieldCheck } from "lucide-react";
@@ -308,6 +309,7 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
       </div>
 
       <CodexAuthPanel />
+      <CodexTasksPanel selectedAgent={agentUser} />
 
       {/* Main Terminal Console & Direct Commands */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 flex-1">

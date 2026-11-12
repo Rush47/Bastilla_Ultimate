@@ -48,6 +48,30 @@ if (args[0] === "--version") {
       clearInterval(interval);
     }, 200);
   }
+} else if (args[0] === "exec") {
+  const promptArgs = args.slice(1).join(" ").trim();
+  let stdinText = "";
+  if (!process.stdin.isTTY) {
+    process.stdin.setEncoding("utf8");
+    for await (const chunk of process.stdin) {
+      stdinText += chunk;
+    }
+  }
+  const taskPrompt = promptArgs || stdinText.trim();
+  if (!taskPrompt) {
+    console.error("Error: missing prompt for codex exec");
+    process.exit(1);
+  }
+  const sleepMs = Number(process.env.TEST_CODEX_EXEC_SLEEP_MS || 30);
+  process.stdout.write(`[codex exec] Rozpoczynanie zadania: ${taskPrompt}\n`);
+  await new Promise((r) => setTimeout(r, sleepMs));
+  if (/FAIL_TASK/i.test(taskPrompt)) {
+    process.stderr.write(`[codex exec] Błąd wykonania zadania: ${taskPrompt}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`[codex exec] Zakończono pomyślnie: ${taskPrompt}\n`);
+  process.exit(0);
 } else {
   process.exitCode = 2;
 }
+

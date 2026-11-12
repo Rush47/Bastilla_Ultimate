@@ -1580,28 +1580,15 @@ export function extractGenerativeUI(
   // 7.4 Dalle / Qwen Image Action JSON Parser (e.g. "action": "dalle.text2im")
   const dalleJsonRegex = /```(?:json)?\s*\n([\s\S]*?"action"\s*:\s*"dalle\.text2im"[\s\S]*?)`{2,4}/gi;
   workingText = workingText.replace(dalleJsonRegex, (_, jsonContent) => {
-    let promptText = "Futurystyczny pejzaż z elementami natury";
-    const promptMatch = jsonContent.match(/"prompt"\s*:\s*"([^"]+)"/i) || jsonContent.match(/"action_input"\s*:\s*"([^"]+)"/i);
-    if (promptMatch && promptMatch[1]) {
-      promptText = promptMatch[1].replace(/\\"/g, '"');
-    } else {
-      try {
-        let cleaned = jsonContent.trim().replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-        const parsed = JSON.parse(cleaned);
-        if (parsed.action_input) {
-          const inputObj = typeof parsed.action_input === "string" ? JSON.parse(parsed.action_input.replace(/\\"/g, '"')) : parsed.action_input;
-          if (inputObj.prompt) promptText = inputObj.prompt;
-        }
-      } catch {}
-    }
-    const unsplashUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop";
+    const promptText = extractPromptFromDalleJson(jsonContent);
+    const imageUrl = getUniqueImageForPrompt(promptText);
 
     return addComp({
       id: `img-gen-${Math.random().toString(36).substring(2, 9)}`,
       type: "image_viewer",
       props: {
         title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
-        url: unsplashUrl,
+        url: imageUrl,
         caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
       },
     });
@@ -1610,26 +1597,14 @@ export function extractGenerativeUI(
   // Also catch raw or escaped JSON objects with "action": "dalle.text2im" without markdown fences
   const rawDalleRegex = /\{\s*"action"\s*:\s*"dalle\.text2im"[\s\S]*?\}/gi;
   workingText = workingText.replace(rawDalleRegex, (fullMatch) => {
-    let promptText = "Futurystyczna wizualizacja jądra Bastilla OS";
-    const promptMatch = fullMatch.match(/"prompt"\s*:\s*"([^"]+)"/i) || fullMatch.match(/"action_input"\s*:\s*"([^"]+)"/i);
-    if (promptMatch && promptMatch[1]) {
-      promptText = promptMatch[1].replace(/\\"/g, '"');
-    } else {
-      try {
-        let cleaned = fullMatch.trim().replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-        const parsed = JSON.parse(cleaned);
-        if (parsed.action_input) {
-          const inputObj = typeof parsed.action_input === "string" ? JSON.parse(parsed.action_input.replace(/\\"/g, '"')) : parsed.action_input;
-          if (inputObj.prompt) promptText = inputObj.prompt;
-        }
-      } catch {}
-    }
+    const promptText = extractPromptFromDalleJson(fullMatch);
+    const imageUrl = getUniqueImageForPrompt(promptText);
     return addComp({
       id: `img-gen-raw-${Math.random().toString(36).substring(2, 9)}`,
       type: "image_viewer",
       props: {
         title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
-        url: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop",
+        url: imageUrl,
         caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
       },
     });
@@ -2061,4 +2036,63 @@ export function extractGenerativeUI(
 
   return { cleanText, components: orderedComponents, segments };
 }
+
+function getUniqueImageForPrompt(prompt: string): string {
+  const photos = [
+    "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop", // futuristic city / nature
+    "https://images.unsplash.com/photo-1506744038136-46273834b3fb?q=80&w=1000&auto=format&fit=crop", // serene landscape / waterfall
+    "https://images.unsplash.com/photo-1519501025264-65ba15a82390?q=80&w=1000&auto=format&fit=crop", // cyberpunk neon city
+    "https://images.unsplash.com/photo-1451187580459-43490279c0fa?q=80&w=1000&auto=format&fit=crop", // deep space galaxy nebula
+    "https://images.unsplash.com/photo-1534447677768-be436bb09401?q=80&w=1000&auto=format&fit=crop", // surreal cosmic abstract
+    "https://images.unsplash.com/photo-1550684848-fac1c5b4e853?q=80&w=1000&auto=format&fit=crop", // glowing neon digital portal
+    "https://images.unsplash.com/photo-1634017839464-5c339ebe3cb4?q=80&w=1000&auto=format&fit=crop", // quantum crystal abstract
+    "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?q=80&w=1000&auto=format&fit=crop", // majestic mountain range sunset
+    "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?q=80&w=1000&auto=format&fit=crop", // bio-architecture organic building
+    "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?q=80&w=1000&auto=format&fit=crop", // tropical beach paradise
+    "https://images.unsplash.com/photo-1518770660439-4636190af475?q=80&w=1000&auto=format&fit=crop", // microchip / quantum circuit
+    "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?q=80&w=1000&auto=format&fit=crop", // abstract gradient colorful art
+  ];
+  let hash = 0;
+  for (let i = 0; i < prompt.length; i++) {
+    hash = (hash << 5) - hash + prompt.charCodeAt(i);
+    hash |= 0;
+  }
+  const index = Math.abs(hash) % photos.length;
+  return photos[index];
+}
+
+function extractPromptFromDalleJson(content: string): string {
+  const m1 = content.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
+  if (m1 && m1[1]) return m1[1].replace(/\\"/g, '"');
+
+  const m2 = content.match(/["']action_input["']\s*:\s*["']([^"']+)["']/i);
+  if (m2 && m2[1]) {
+    const inner = m2[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    const m3 = inner.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
+    if (m3 && m3[1]) return m3[1].replace(/\\"/g, '"');
+    return inner;
+  }
+
+  try {
+    const cleaned = content.trim().replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    const parsed = JSON.parse(cleaned);
+    if (parsed.action_input) {
+      if (typeof parsed.action_input === "object" && parsed.action_input.prompt) {
+        return String(parsed.action_input.prompt);
+      }
+      if (typeof parsed.action_input === "string") {
+        try {
+          const innerObj = JSON.parse(parsed.action_input.replace(/\\"/g, '"'));
+          if (innerObj.prompt) return String(innerObj.prompt);
+        } catch {
+          const m = parsed.action_input.match(/["']prompt["']\s*:\s*["']([^"']+)["']/i);
+          if (m && m[1]) return m[1];
+        }
+      }
+    }
+  } catch {}
+
+  return "Futurystyczny pejzaż z elementami natury";
+}
+
 
