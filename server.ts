@@ -397,6 +397,21 @@ async function startServer() {
   // Tool calls additionally require a matching operator token; cookies alone
   // are intentionally insufficient for invoking tools.
   const mcp = new MCPServerManager(PROJECT_ROOT, DB_PATH);
+  // Non-secret diagnostic metadata. API security middleware still applies.
+  // Do not advertise an MCP connection until a client has actually called it.
+  app.get("/api/mcp/status", (_req, res) => {
+    res.json({
+      ok: true,
+      configured: Boolean(process.env.BASTILLA_API_TOKEN),
+      transport: "http-jsonrpc-subset",
+      endpoint: "/api/mcp",
+      tools: mcp.listTools().tools.map(tool => tool.name),
+      clientConnected: false,
+      codexLoginVerified: false,
+      deployment: process.env.NODE_ENV === "production" ? "production" : "development",
+      warning: "Endpoint availability does not prove that AI Studio or Codex can connect.",
+    });
+  });
   app.post("/api/mcp", (req, res) => {
     const message = req.body;
     if (!message || message.jsonrpc !== "2.0" || typeof message.method !== "string") {
