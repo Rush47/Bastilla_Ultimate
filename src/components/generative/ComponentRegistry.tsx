@@ -1580,61 +1580,59 @@ export function extractGenerativeUI(
   // 7.4 Dalle / Qwen Image Action JSON Parser (e.g. "action": "dalle.text2im")
   const dalleJsonRegex = /```(?:json)?\s*\n([\s\S]*?"action"\s*:\s*"dalle\.text2im"[\s\S]*?)`{2,4}/gi;
   workingText = workingText.replace(dalleJsonRegex, (_, jsonContent) => {
-    try {
-      let cleaned = jsonContent.trim();
-      // Unescape escaped quotes if present in model output
-      cleaned = cleaned.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      const parsed = JSON.parse(cleaned);
-      let promptText = "Futurystyczny pejzaż z elementami natury";
-      if (parsed.action_input) {
-        try {
+    let promptText = "Futurystyczny pejzaż z elementami natury";
+    const promptMatch = jsonContent.match(/"prompt"\s*:\s*"([^"]+)"/i) || jsonContent.match(/"action_input"\s*:\s*"([^"]+)"/i);
+    if (promptMatch && promptMatch[1]) {
+      promptText = promptMatch[1].replace(/\\"/g, '"');
+    } else {
+      try {
+        let cleaned = jsonContent.trim().replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        const parsed = JSON.parse(cleaned);
+        if (parsed.action_input) {
           const inputObj = typeof parsed.action_input === "string" ? JSON.parse(parsed.action_input.replace(/\\"/g, '"')) : parsed.action_input;
           if (inputObj.prompt) promptText = inputObj.prompt;
-        } catch {
-          promptText = String(parsed.action_input);
         }
-      }
-      const unsplashUrl = `https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop`;
+      } catch {}
+    }
+    const unsplashUrl = "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop";
 
-      return addComp({
-        id: `img-gen-${Math.random().toString(36).substring(2, 9)}`,
-        type: "image_viewer",
-        props: {
-          title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
-          url: unsplashUrl,
-          caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
-        },
-      });
-    } catch {}
-    return "";
+    return addComp({
+      id: `img-gen-${Math.random().toString(36).substring(2, 9)}`,
+      type: "image_viewer",
+      props: {
+        title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
+        url: unsplashUrl,
+        caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
+      },
+    });
   });
 
   // Also catch raw or escaped JSON objects with "action": "dalle.text2im" without markdown fences
   const rawDalleRegex = /\{\s*"action"\s*:\s*"dalle\.text2im"[\s\S]*?\}/gi;
   workingText = workingText.replace(rawDalleRegex, (fullMatch) => {
-    try {
-      let cleaned = fullMatch.trim().replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      const parsed = JSON.parse(cleaned);
-      let promptText = "Futurystyczna wizualizacja jądra Bastilla OS";
-      if (parsed.action_input) {
-        try {
+    let promptText = "Futurystyczna wizualizacja jądra Bastilla OS";
+    const promptMatch = fullMatch.match(/"prompt"\s*:\s*"([^"]+)"/i) || fullMatch.match(/"action_input"\s*:\s*"([^"]+)"/i);
+    if (promptMatch && promptMatch[1]) {
+      promptText = promptMatch[1].replace(/\\"/g, '"');
+    } else {
+      try {
+        let cleaned = fullMatch.trim().replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        const parsed = JSON.parse(cleaned);
+        if (parsed.action_input) {
           const inputObj = typeof parsed.action_input === "string" ? JSON.parse(parsed.action_input.replace(/\\"/g, '"')) : parsed.action_input;
           if (inputObj.prompt) promptText = inputObj.prompt;
-        } catch {
-          promptText = String(parsed.action_input);
         }
-      }
-      return addComp({
-        id: `img-gen-raw-${Math.random().toString(36).substring(2, 9)}`,
-        type: "image_viewer",
-        props: {
-          title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
-          url: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop",
-          caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
-        },
-      });
-    } catch {}
-    return fullMatch;
+      } catch {}
+    }
+    return addComp({
+      id: `img-gen-raw-${Math.random().toString(36).substring(2, 9)}`,
+      type: "image_viewer",
+      props: {
+        title: "Wygenerowany Obraz (Qwen-Image-2.1 Uncensored)",
+        url: "https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop",
+        caption: `Prompt: "${promptText}" (Model: FelyaHuhing/qwen-image-21-uncensored)`,
+      },
+    });
   });
 
   // 7.5 Image Viewer: ```image or ```img or ```image_viewer

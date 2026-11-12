@@ -2168,6 +2168,11 @@ print(json.dumps({"updated": True, "agent": sys.argv[2], "avatar": sys.argv[3]})
     }
   });
 
+  // Explicit API 404 handler to ensure /api routes return JSON and never fallback to HTML
+  app.use("/api/*", (_req, res) => {
+    res.status(404).json({ ok: false, error: "Ścieżka API nie istnieje" });
+  });
+
   // Mount Vite middleware in development or static dist in production
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

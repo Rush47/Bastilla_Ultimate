@@ -40,9 +40,12 @@ export default function App() {
   const fetchOverview = useCallback(async () => {
     try {
       const res = await fetch("/api/system/overview");
-      const data = await res.json();
-      if (data.ok) {
-        setOverview(data);
+      const contentType = res.headers.get("content-type") || "";
+      if (res.ok && contentType.includes("application/json")) {
+        const data = await res.json();
+        if (data.ok) {
+          setOverview(data);
+        }
       }
     } catch (e) {
       console.error("Failed to fetch Bastilla OS overview:", e);
@@ -54,9 +57,12 @@ export default function App() {
   const fetchContinuousMission = useCallback(async () => {
     try {
       const res = await fetch("/api/missions/continuous/status");
-      const data = await res.json();
-      if (data.ok) {
-        setContinuousMission(data.mission);
+      const contentType = res.headers.get("content-type") || "";
+      if (res.ok && contentType.includes("application/json")) {
+        const data = await res.json();
+        if (data.ok) {
+          setContinuousMission(data.mission);
+        }
       }
     } catch {}
   }, []);
@@ -76,8 +82,11 @@ export default function App() {
   const toggleMission = async () => {
     try {
       const res = await fetch("/api/missions/continuous/toggle", { method: "POST" });
-      const data = await res.json();
-      if (data.ok) setContinuousMission(data.mission);
+      const contentType = res.headers.get("content-type") || "";
+      if (res.ok && contentType.includes("application/json")) {
+        const data = await res.json();
+        if (data.ok) setContinuousMission(data.mission);
+      }
     } catch {}
   };
 
@@ -85,10 +94,13 @@ export default function App() {
     setTriggeringCycle(true);
     try {
       const res = await fetch("/api/missions/continuous/trigger", { method: "POST" });
-      const data = await res.json();
-      if (data.ok) {
-        setContinuousMission(data.mission);
-        fetchOverview();
+      const contentType = res.headers.get("content-type") || "";
+      if (res.ok && contentType.includes("application/json")) {
+        const data = await res.json();
+        if (data.ok) {
+          setContinuousMission(data.mission);
+          fetchOverview();
+        }
       }
     } finally {
       setTriggeringCycle(false);
