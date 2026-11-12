@@ -51,3 +51,47 @@ test("MCP agent memory does not follow symlinks or read global fallback", () => 
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("MCP stdio bridge handles initialize, notifications, ping, tools/list, and authenticated tools/call", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const root = path.resolve(import.meta.dirname, "..");
+  const inputLines = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "codex-cli", version: "0.120.0" } } }),
+    JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "git_status", arguments: {} } }),
+  ].join("\n") + "\n";
+
+  // 1. Without BASTILLA_API_TOKEN: tools/call returns isError: true
+  const outUnauth = execFileSync(process.execPath, ["--import", "tsx", path.join(root, "server/mcp-stdio.ts")], {
+    cwd: root,
+    input: inputLines,
+    env: { ...process.env, BASTILLA_API_TOKEN: "" },
+    encoding: "utf8",
+  }).trim().split("\n").map(line => JSON.parse(line));
+
+  assert.equal(outUnauth.length, 4); // notification produces no reply
+  assert.equal(outUnauth[0].id, 1);
+  assert.equal(outUnauth[0].result.protocolVersion, "2025-03-26");
+  assert.equal(outUnauth[1].id, 2);
+  assert.deepEqual(outUnauth[1].result, {});
+  assert.equal(outUnauth[2].id, 3);
+  assert.deepEqual(outUnauth[2].result.tools.map((t: any) => t.name).sort(), ["agent_memory_read", "git_status"]);
+  assert.equal(outUnauth[3].id, 4);
+  assert.equal(outUnauth[3].result.isError, true);
+
+  // 2. With BASTILLA_API_TOKEN: tools/call succeeds
+  const outAuth = execFileSync(process.execPath, ["--import", "tsx", path.join(root, "server/mcp-stdio.ts")], {
+    cwd: root,
+    input: inputLines,
+    env: { ...process.env, BASTILLA_API_TOKEN: "stdio-test-operator-token-secret" },
+    encoding: "utf8",
+  }).trim().split("\n").map(line => JSON.parse(line));
+
+  assert.equal(outAuth[3].id, 4);
+  assert.equal(outAuth[3].result.isError, undefined);
+  const parsedToolResult = JSON.parse(outAuth[3].result.content[0].text);
+  assert.equal(parsedToolResult.ok, true);
+  assert.equal(typeof parsedToolResult.branch, "string");
+});

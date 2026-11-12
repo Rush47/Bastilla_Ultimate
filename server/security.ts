@@ -25,9 +25,35 @@ export function installApiSecurity(app: Express) {
     const json = res.json.bind(res);
     res.json = (value) => value === undefined ? json(value) : json(JSON.parse(redact(JSON.stringify(value))));
     // JSON-only writes and same-origin cookies prevent cross-site command execution.
-    if (req.headers.origin && req.headers.origin !== `${req.protocol}://${req.get("host")}` &&
-        req.headers.origin !== process.env.APP_URL?.replace(/\/$/, "")) {
-      return res.status(403).json({ ok: false, error: "Niedozwolone źródło żądania." });
+    const origin = req.headers.origin;
+    const forwardedHost = (req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].trim();
+    const appUrlOrigin = process.env.APP_URL?.replace(/\/$/, "") || "";
+    const allowedOrigins = (process.env.BASTILLA_ALLOWED_ORIGINS || "")
+      .split(",")
+      .map(s => s.trim().replace(/\/$/, ""))
+      .filter(Boolean);
+
+    if (origin) {
+      let originHost = "";
+      try { originHost = new URL(origin).host; } catch {}
+      const sameHost = Boolean(originHost && forwardedHost && originHost === forwardedHost);
+      const explicitlyAllowed =
+        (Boolean(appUrlOrigin) && origin === appUrlOrigin) ||
+        allowedOrigins.includes(origin);
+
+      if (!sameHost && !explicitlyAllowed) {
+        return res.status(403).json({ ok: false, error: "Niedozwolone źródło żądania." });
+      }
+      if (explicitlyAllowed || sameHost) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+        res.setHeader("Vary", "Origin");
+      }
+    }
+    if (req.method === "OPTIONS") {
+      return res.status(204).end();
     }
     if (!["GET", "HEAD"].includes(req.method) && !req.is("application/json")) {
       return res.status(415).json({ ok: false, error: "Wymagany Content-Type: application/json." });
@@ -40,13 +66,21 @@ export function installApiSecurity(app: Express) {
       });
       return res.json({ ok: true });
     }
+    const appUrlHostname = (() => {
+      try { return appUrlOrigin ? new URL(appUrlOrigin).hostname : ""; } catch { return ""; }
+    })();
+    const isLocalOrPreviewHost =
+      ["127.0.0.1", "localhost", "::1", "[::1]"].includes(req.hostname) ||
+      (Boolean(appUrlHostname) && req.hostname === appUrlHostname) ||
+      /\.run\.app$/i.test(req.hostname);
+
     if (token) {
       const bearer = req.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
       const cookie = req.headers.cookie?.split(";").map(x => x.trim()).find(x => x.startsWith("bastilla_access="))?.slice(16) || "";
       let decoded = "";
       try { decoded = decodeURIComponent(cookie); } catch {}
       if (!valid(bearer) && !valid(decoded)) return res.status(401).json({ ok: false, error: "Nieautoryzowane." });
-    } else if (!["127.0.0.1", "localhost", "::1", "[::1]"].includes(req.hostname)) {
+    } else if (!isLocalOrPreviewHost) {
       return res.status(403).json({ ok: false, error: "Dostęp zdalny wymaga BASTILLA_API_TOKEN." });
     }
     next();

@@ -104,6 +104,8 @@ export function CodexTasksPanel({
     }
   });
   const [streamingOutput, setStreamingOutput] = useState<string>("");
+  const [codexStatus, setCodexStatus] = useState<{ installed: boolean; auth_ready: boolean; login_status: string; message: string } | null>(null);
+  const [dispatchError, setDispatchError] = useState<string>("");
 
   const selectLogTask = useCallback((taskId: number | null) => {
     setActiveLogTaskId(taskId);
@@ -112,6 +114,23 @@ export function CodexTasksPanel({
         localStorage.setItem(STORAGE_TASK_KEY, String(taskId));
       } else {
         localStorage.removeItem(STORAGE_TASK_KEY);
+      }
+    } catch {}
+  }, []);
+
+  const fetchCodexStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/codex/status");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok) {
+          setCodexStatus({
+            installed: Boolean(data.installed),
+            auth_ready: Boolean(data.auth_ready),
+            login_status: String(data.login_status || "unavailable"),
+            message: String(data.message || ""),
+          });
+        }
       }
     } catch {}
   }, []);
@@ -157,16 +176,19 @@ export function CodexTasksPanel({
   }, []);
 
   useEffect(() => {
+    fetchCodexStatus();
     fetchTasks();
     fetchGitSummary();
     const interval = setInterval(() => {
       fetchTasks();
+      fetchCodexStatus();
       if (activeTab === "git") fetchGitSummary();
     }, 3000);
 
     // Reconnect immediately when tab/browser regains visibility on Android/desktop
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
+        fetchCodexStatus();
         fetchTasks();
         fetchGitSummary();
       }
@@ -176,7 +198,7 @@ export function CodexTasksPanel({
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [fetchTasks, fetchGitSummary, activeTab]);
+  }, [fetchCodexStatus, fetchTasks, fetchGitSummary, activeTab]);
 
   // SSE for active streaming task with automatic reconnect on transient disconnects
   useEffect(() => {
@@ -249,12 +271,12 @@ export function CodexTasksPanel({
   const dispatchTask = async (taskPrompt: string, autoStart = true) => {
     if (!taskPrompt.trim() || submitting) return;
     setSubmitting(true);
+    setDispatchError("");
     try {
       const res = await fetch("/api/codex/tasks", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-Bastilla-Token": "364_OMNIKLUCZ_ROOT",
         },
         body: JSON.stringify({
           agentId: activeAgent,
@@ -265,13 +287,19 @@ export function CodexTasksPanel({
         }),
       });
       const data = await res.json();
-      if (data.ok && data.taskId) {
+      if (!res.ok || !data.ok) {
+        setDispatchError(data.error || `Błąd serwera (${res.status}) podczas zlecania zadania.`);
+        return;
+      }
+      if (data.taskId) {
         setPrompt("");
         setStdinInput("");
         selectLogTask(data.taskId);
         setActiveTab("queue");
         fetchTasks();
       }
+    } catch (err: any) {
+      setDispatchError(err?.message || "Nie udało się połączyć z backendem.");
     } finally {
       setSubmitting(false);
     }
@@ -283,18 +311,30 @@ export function CodexTasksPanel({
   };
 
   const handleStart = async (taskId: number) => {
-    await fetch(`/api/codex/tasks/${taskId}/start`, { method: "POST" });
+    await fetch(`/api/codex/tasks/${taskId}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
     selectLogTask(taskId);
     fetchTasks();
   };
 
   const handleCancel = async (taskId: number) => {
-    await fetch(`/api/codex/tasks/${taskId}/cancel`, { method: "POST" });
+    await fetch(`/api/codex/tasks/${taskId}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
     fetchTasks();
   };
 
   const handleRetry = async (taskId: number) => {
-    await fetch(`/api/codex/tasks/${taskId}/retry`, { method: "POST" });
+    await fetch(`/api/codex/tasks/${taskId}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
     selectLogTask(taskId);
     fetchTasks();
   };
@@ -347,11 +387,16 @@ export function CodexTasksPanel({
               Mobilny Panel Sterowania Codex CLI (`codex exec`)
             </h3>
             <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-400 mt-0.5">
-              <span className="text-emerald-400 flex items-center gap-1">
-                <ShieldCheck className="w-3 h-3" /> Autoryzacja ROOT · Sesja: {sessionId}
+              <span className={codexStatus?.auth_ready ? "text-emerald-400 flex items-center gap-1" : "text-amber-300 flex items-center gap-1"}>
+                <ShieldCheck className="w-3 h-3" />
+                {codexStatus === null
+                  ? "Codex CLI: sprawdzanie statusu..."
+                  : codexStatus.auth_ready
+                  ? `Codex CLI: Zalogowano · Sesja: ${sessionId}`
+                  : `Codex CLI: Niezalogowano (${codexStatus.login_status}) · Sesja: ${sessionId}`}
               </span>
               <span className={sseConnected ? "text-cyan-400" : "text-slate-500"}>
-                · SSE: {sseConnected ? "Połączono (Auto-Reconnect)" : "Gotowy"}
+                · SSE: {sseConnected ? "Strumień aktywny" : "Brak aktywnego strumienia"}
               </span>
             </div>
           </div>
@@ -469,6 +514,11 @@ export function CodexTasksPanel({
             placeholder="Opcjonalne dane wejściowe przekazywane przez standardowe wejście (stdin) do procesu codex exec..."
             className="w-full p-2 rounded-lg bg-[#07090e] border border-slate-700 text-[11px] text-slate-200 focus:outline-none focus:border-violet-500"
           />
+        )}
+        {dispatchError && (
+          <div role="alert" className="p-2 rounded bg-rose-950/40 border border-rose-500/40 text-rose-300 text-[11px]">
+            {dispatchError}
+          </div>
         )}
       </form>
 

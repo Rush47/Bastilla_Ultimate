@@ -26,6 +26,25 @@ test("API requires authorization, supports an HttpOnly browser cookie, and rejec
     assert.equal((await fetch(url + "/api/test", { headers: { Cookie: cookie.split(";")[0] } })).status, 200);
     assert.equal(JSON.stringify(await login.json()).includes(process.env.BASTILLA_API_TOKEN), false);
     assert.equal(redact(`ghp_0123456789abcdef Bearer abc.def ${process.env.BASTILLA_API_TOKEN}`).includes("0123456789abcdef"), false);
+    // Same-host HTTPS origin behind reverse proxy (x-forwarded-host) is permitted with valid auth
+    const proxyRes = await fetch(url + "/api/test", {
+      headers: {
+        Origin: "https://preview.run.app",
+        "X-Forwarded-Host": "preview.run.app",
+        Authorization: `Bearer ${process.env.BASTILLA_API_TOKEN}`,
+      },
+    });
+    assert.equal(proxyRes.status, 200);
+    assert.equal(proxyRes.headers.get("access-control-allow-origin"), "https://preview.run.app");
+    // OPTIONS preflight from allowed same-host returns 204
+    const preflight = await fetch(url + "/api/test", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://preview.run.app",
+        "X-Forwarded-Host": "preview.run.app",
+      },
+    });
+    assert.equal(preflight.status, 204);
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
     if (previous === undefined) delete process.env.BASTILLA_API_TOKEN; else process.env.BASTILLA_API_TOKEN = previous;

@@ -561,7 +561,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
       const res = await fetch("/api/system/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: "364_OMNIKLUCZ_ROOT" }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (!res.ok) setErrorMsg(data.error || "Nie można zmienić uprawnień przez panel.");
