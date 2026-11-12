@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 export interface MCPToolDefinition {
@@ -69,18 +69,19 @@ export class MCPServerManager {
       if (!["aria", "alex", "astyria", "aurelius"].includes(agentId)) {
         throw new Error("Invalid agent identifier.");
       }
-      const memPath = path.join(this.projectRoot, `home/${agentId}/memory.json`);
-      let memData = {};
+      const memPath = path.join(this.projectRoot, "home", agentId, "memory.json");
+      let memData: unknown = {};
       if (existsSync(memPath)) {
+        // Never follow symlinks or silently read a global file that may
+        // contain unrelated agents' data or credentials.
+        const info = lstatSync(memPath);
+        if (!info.isFile() || info.size > 64 * 1024) {
+          throw new Error("Agent memory must be a regular file of at most 64 KiB.");
+        }
         try {
           memData = JSON.parse(readFileSync(memPath, "utf8"));
-        } catch {}
-      } else {
-        const globalMem = path.join(this.projectRoot, "memory.json");
-        if (existsSync(globalMem)) {
-          try {
-            memData = JSON.parse(readFileSync(globalMem, "utf8"));
-          } catch {}
+        } catch {
+          throw new Error("Agent memory is not valid JSON.");
         }
       }
       return { ok: true, agentId, memory: memData };
