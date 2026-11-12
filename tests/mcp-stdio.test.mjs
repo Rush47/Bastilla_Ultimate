@@ -48,7 +48,12 @@ test('local Bastilla MCP initializes and exposes safe tools', async (t) => {
   assert.equal(init.result.protocolVersion, '2025-03-26');
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
   const list = await request('tools/list');
-  assert.deepEqual(list.result.tools.map(tool => tool.name).sort(), ['agent_memory_read', 'git_status']);
+  assert.deepEqual(list.result.tools.map(tool => tool.name).sort(), ['agent_memory_read', 'agent_runtime_status', 'git_status']);
+  const runtime = await request('tools/call', { name: 'agent_runtime_status', arguments: {} });
+  assert.equal(runtime.result.isError, undefined);
+  const diagnostic = JSON.parse(runtime.result.content[0].text);
+  assert.equal(typeof diagnostic.ollama.reachable, 'boolean');
+  assert.deepEqual(Object.keys(diagnostic.agents).sort(), ['alex', 'aria', 'astyria', 'aurelius']);
   const status = await request('tools/call', { name: 'git_status', arguments: {} });
   assert.equal(status.result.isError, undefined);
   const parsed = JSON.parse(status.result.content[0].text);
