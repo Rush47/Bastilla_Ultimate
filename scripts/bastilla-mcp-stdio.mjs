@@ -12,12 +12,34 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const agents = new Set(['aria', 'alex', 'astyria', 'aurelius']);
 const tools = [
   { name: 'git_status', description: 'Read repository branch and working tree status', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'agent_runtime_status', description: 'Read local Ollama connectivity and agent memory-file presence without model inference', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'agent_memory_read', description: 'Read local JSON memory for one Bastilla agent', inputSchema: { type: 'object', properties: { agentId: { type: 'string', enum: [...agents] } }, required: ['agentId'], additionalProperties: false } },
 ];
 function send(message) {
   process.stdout.write(JSON.stringify(message) + '\n');
 }
 async function call(name, args = {}) {
+  if (name === 'agent_runtime_status') {
+    const endpoint = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
+    const report = { ollama: { reachable: false, endpoint: null, models: [] }, agents: {} };
+    for (const agentId of agents) {
+      try {
+        const info = await lstat(path.join(root, 'home', agentId, 'memory.json'));
+        report.agents[agentId] = { memoryFile: info.isFile() && info.size <= 65536 };
+      } catch { report.agents[agentId] = { memoryFile: false }; }
+    }
+    try {
+      const url = new URL(endpoint);
+      if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) throw new Error('Only loopback Ollama is probed');
+      const response = await fetch(new URL('/api/tags', url), { signal: AbortSignal.timeout(2000) });
+      if (response.ok) {
+        const data = await response.json();
+        report.ollama.reachable = true;
+        report.ollama.models = Array.isArray(data.models) ? data.models.map(m => String(m.name || '')).filter(Boolean).slice(0, 30) : [];
+      }
+    } catch { /* offline or invalid endpoint: do not claim readiness */ }
+    return report;
+  }
   if (name === 'git_status') {
     const opts = { cwd: root, timeout: 5000, maxBuffer: 65536 };
     const [branch, status] = await Promise.all([
