@@ -162,7 +162,7 @@ Dalszy tekst.`;
   assert.equal(components[0].props.rows[0][0], "Operacje bezpieczne");
 });
 
-test("extractGenerativeUI extracts python code block and generates interactive RAM chart", () => {
+test("extractGenerativeUI shows Python code without inventing RAM measurements", () => {
   const rawText = `Przykładowy kod monitorowania:
 \`\`\`python
 import psutil
@@ -181,14 +181,14 @@ plt.show()
 Wykres pojawi się powyżej.`;
 
   const { components } = extractGenerativeUI(rawText);
-  // Expecting 2 components: code_sandbox + chart (RAM)
-  assert.equal(components.length, 2);
+  // A script is not evidence that measurements were collected.
+  assert.equal(components.length, 1);
   const sandbox = components.find((c) => c.type === "code_sandbox");
   const chart = components.find((c) => c.type === "chart");
   assert.notEqual(sandbox, undefined);
-  assert.notEqual(chart, undefined);
+  assert.equal(chart, undefined);
   assert.equal(sandbox?.props.language, "python");
-  assert.equal(chart?.props.title.includes("Zużycia"), true);
+
 });
 
 test("extractGenerativeUI preserves exact document order in segments and parses telemetry + Polish emoji buttons", () => {
@@ -266,7 +266,7 @@ Zenity nie jest zainstalowane. Zainstaluj je komendą: sudo apt install zenity`;
   assert.equal(cleanText.includes("Zenity nie jest zainstalowane"), false);
 });
 
-test("extractGenerativeUI extracts command bullet list into action_buttons, telemetry, and chart", () => {
+test("extractGenerativeUI extracts diagnostic commands without inventing telemetry", () => {
   const diagText = `Dostęp do danych telemetrycznych jądra oraz szczegółowego statusu pamięci RAM:
 * **Logi jądra (Kernel messages):**
 * \`dmesg | tail -n 20\` – wyświetla ostatnie 20 komunikatów jądra.
@@ -285,8 +285,8 @@ test("extractGenerativeUI extracts command bullet list into action_buttons, tele
   const telem = components.find((c) => c.type === "system_telemetry");
   const chart = components.find((c) => c.type === "chart");
   assert.notEqual(btns, undefined);
-  assert.notEqual(telem, undefined);
-  assert.notEqual(chart, undefined);
+  assert.equal(telem, undefined);
+  assert.equal(chart, undefined);
   assert.equal(btns?.props.buttons.length >= 5, true);
 });
 

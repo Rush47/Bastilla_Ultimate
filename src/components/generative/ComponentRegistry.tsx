@@ -1031,18 +1031,18 @@ export const GenerativeComponentRenderer: React.FC<ComponentRendererProps> = ({
       const parsed = SystemTelemetrySchema.safeParse(props);
       if (!parsed.success) return null;
       const d = parsed.data;
-      const ramUsed = d.ram_used_mb ?? 412;
-      const ramTotal = d.ram_total_mb ?? 2048;
-      const ramPct = Math.min(100, Math.round((ramUsed / Math.max(1, ramTotal)) * 100));
-      const kernelVer = d.svl_version || d.kernel_version || "5.6.0-QuantumWheel";
-      const loadStr = d.system_load || (d.loadavg ? d.loadavg.join(", ") : "0.18, 0.22, 0.15");
+      const ramUsed = d.ram_used_mb;
+      const ramTotal = d.ram_total_mb;
+      const ramPct = ramUsed !== undefined && ramTotal ? Math.min(100, Math.round((ramUsed / ramTotal) * 100)) : null;
+      const kernelVer = d.svl_version || d.kernel_version || "brak pomiaru";
+      const loadStr = d.system_load || (d.loadavg ? d.loadavg.join(", ") : "brak pomiaru");
 
       return (
         <div className="p-3 rounded-lg bg-[#0c1018] border border-slate-800 my-2 space-y-2.5 font-mono-tabular text-xs">
           <div className="flex items-center justify-between text-slate-200 font-semibold border-b border-slate-800 pb-2">
             <span className="flex items-center gap-1.5 text-violet-300">
               <Activity className="w-3.5 h-3.5 text-violet-400" />
-              Telemetria Jądra Bastilla OS ({kernelVer})
+              Dane z wiadomości ({kernelVer}) · niezweryfikowane
             </span>
             <button
               type="button"
@@ -1050,7 +1050,7 @@ export const GenerativeComponentRenderer: React.FC<ComponentRendererProps> = ({
               className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-semibold flex items-center gap-1 transition-colors"
             >
               <Play className="w-2.5 h-2.5" />
-              Odśwież w ROOT
+              Wykonaj pomiar
             </button>
           </div>
 
@@ -1058,24 +1058,24 @@ export const GenerativeComponentRenderer: React.FC<ComponentRendererProps> = ({
             <div className="p-2 rounded bg-[#111723] border border-slate-800">
               <div className="text-[10px] text-slate-400">OLLAMA MODEL</div>
               <div className="text-xs font-bold text-white mt-0.5 truncate">
-                {d.ollama_model || "Qwen3.8-27B-Uncensored"}
+                {d.ollama_model || "niezweryfikowany"}
               </div>
             </div>
             <div className="p-2 rounded bg-[#111723] border border-slate-800">
               <div className="text-[10px] text-slate-400">AUTONOMIA AGENTA</div>
               <div className="text-xs font-bold text-emerald-300 mt-0.5 truncate">
-                {d.active_agent || "ROOT UID 0"}
+                {d.active_agent || "niezweryfikowany"}
               </div>
             </div>
             <div className="p-2 rounded bg-[#111723] border border-slate-800">
-              <div className="text-[10px] text-slate-400">RAM ZUŻYCIE ({ramPct}%)</div>
+              <div className="text-[10px] text-slate-400">RAM ZUŻYCIE ({ramPct ?? "?"}%)</div>
               <div className="text-xs font-bold text-cyan-300 mt-0.5">
-                {ramUsed} MB / {ramTotal} MB
+                {ramUsed ?? "?"} MB / {ramTotal ?? "?"} MB
               </div>
               <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden mt-1">
                 <div
                   className="h-full bg-gradient-to-r from-violet-500 to-cyan-400"
-                  style={{ width: `${ramPct}%` }}
+                  style={{ width: `${ramPct ?? 0}%` }}
                 />
               </div>
             </div>
@@ -1812,32 +1812,6 @@ export function extractGenerativeUI(
         })
       );
 
-      if (isRamScript) {
-        tokens.push(
-          addComp({
-            id: `chart-ram-${Math.random().toString(36).substring(2, 9)}`,
-            type: "chart",
-            props: {
-              title: "Wykres Zużycia Pamięci RAM (Recharts Interaktywny)",
-              chartType: "area",
-              data: [
-                { name: "T0 (start)", value: 41.2 },
-                { name: "T+1s", value: 42.8 },
-                { name: "T+2s", value: 43.5 },
-                { name: "T+3s", value: 45.1 },
-                { name: "T+4s", value: 44.6 },
-                { name: "T+5s", value: 46.8 },
-                { name: "T+6s", value: 47.3 },
-                { name: "T+7s", value: 46.1 },
-                { name: "T+8s", value: 45.4 },
-                { name: "T+9s", value: 44.9 },
-              ],
-              color: "#8b5cf6",
-              unit: "%",
-            },
-          })
-        );
-      }
       return tokens.join("\n");
     }
     return fullMatch;
@@ -1927,41 +1901,6 @@ export function extractGenerativeUI(
     });
     workingText += `\n${diagToken}\n`;
 
-    const hasTelemetry = rawComponents.some((c) => c.type === "system_telemetry");
-    if (!hasTelemetry && /pami[eę][cć]|ram|j[aą]dr/i.test(text)) {
-      const telemToken = addComp({
-        id: `telem-auto-${Math.random().toString(36).substring(2, 9)}`,
-        type: "system_telemetry",
-        props: {
-          ollama_model: "Qwen3.8-27B-Uncensored",
-          ram_used_mb: 412,
-          ram_total_mb: 2048,
-          active_agent: "Aria (ROOT UID 0)",
-          kernel_version: "5.6.0-QuantumWheel",
-          uptime: "14 dni, 6 godz.",
-          system_load: "0.18, 0.22, 0.15",
-        },
-      });
-      workingText += `\n${telemToken}\n`;
-
-      const chartToken = addComp({
-        id: `chart-ram-diag-${Math.random().toString(36).substring(2, 9)}`,
-        type: "chart",
-        props: {
-          title: "Status Pamięci RAM (Recharts)",
-          chartType: "area",
-          data: [
-            { name: "Active", value: 412 },
-            { name: "Buffers", value: 128 },
-            { name: "Cached", value: 340 },
-            { name: "Free", value: 1168 },
-          ],
-          color: "#06b6d4",
-          unit: "MB",
-        },
-      });
-      workingText += `\n${chartToken}\n`;
-    }
   }
 
   // 11D. Numbered procedure list extractor (Message 28 pattern: 1) Aktualizacja ... 2) ...)

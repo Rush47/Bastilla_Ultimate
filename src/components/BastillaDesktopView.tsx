@@ -104,7 +104,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
       setGestureLog(
         `Wykryto gest pionowy (${dy < 0 ? "Overview Up" : "Show Dock"}, Δy=${Math.round(
           dy
-        )}px) · Zsynchronizowano okna Wayland/Plasma`
+        )}px) · Gest zarejestrowany w panelu webowym`
       );
     }
   };
@@ -150,12 +150,12 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
             PULPIT BASTILLA VIOLET #{virtualDesktopIdx}
           </span>
           <span aria-hidden="true">·</span>
-          <span>Baza: AgenticLinux ({host?.os_release?.PRETTY_NAME || "Debian 12 / Fedora 45 bootc"})</span>
+          <span>System: {host?.os_release?.PRETTY_NAME || "niezweryfikowany"}</span>
           <span aria-hidden="true">·</span>
-          <span>Kernel: {svl?.System || "5.7.0-QuantumWheel-Max [DB-SYNCED]"}</span>
+          <span>Linux: {host?.uname || "niezweryfikowany"}</span>
           <span aria-hidden="true">·</span>
           <span className="text-emerald-400 font-semibold">
-            Operator: {svl?.Operator || "Mateusz Mitek"} [SUPREME ROOT UID=0 / GID=0 · SYSTEM & AI ODBLOKOWANE]
+            Operator: {svl?.Operator || "Mateusz Mitek"} · uprawnienia wymagają weryfikacji
           </span>
           <span aria-hidden="true">·</span>
           <span>Metryka C: {svl?.Compact_Metric_C ?? 2.5}</span>
@@ -198,7 +198,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
                   01. Czterej Agenci Linux i Konta Systemowe (SVL Core)
                 </h2>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Rzeczywiste konta użytkowników w /etc/passwd, izolowane procesy workerów Python i pamięć SQLite
+                  Profile agentów. Istnienie kont, heartbeat i dostęp wymagają potwierdzenia w diagnostyce.
                 </p>
               </div>
               <button
@@ -220,7 +220,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
                   svlAgent?.role ||
                   liveAgent?.worker_status?.role ||
                   "Autonomous Linux Agent";
-                const uid = liveAgent?.uid ?? svlAgent?.uid ?? 1001;
+                const uid = liveAgent?.uid ?? "?";
                 const pid = liveAgent?.pid ?? 0;
                 const metricC = svlAgent?.metric_c ?? 2.5;
                 const compactDom = svlAgent?.compact_domain || [-1, 1];
@@ -249,7 +249,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
                               {displayName}
                             </h3>
                             <span className="text-xs font-mono-tabular text-emerald-400">
-                              {pid > 0 ? `PID ${pid}` : "READY"}
+                              {liveAgent?.running ? `PID ${pid}` : "NIEPOTWIERDZONY"}
                             </span>
                           </div>
                           <p className="text-xs text-slate-400 line-clamp-1">{role}</p>
@@ -308,7 +308,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
               <span className="truncate">{gestureLog}</span>
             </div>
             <span className="font-mono-tabular text-slate-400 shrink-0">
-              SQLite Rekordy: {svl?.Database_Integration?.total_records ?? 36}
+              SQLite Rekordy: {svl?.Database_Integration?.total_records ?? 0}
             </span>
           </div>
         </div>
@@ -344,7 +344,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
                   {svl?.System || "5.7.0-QuantumWheel-Max"}
                 </div>
                 <div className="text-xs text-violet-400 mt-0.5">
-                  {svl?.Performance || "+1456% (Wzorzec: 364)"}
+                  {svl?.Performance || "Brak pomiaru wydajności"}
                 </div>
               </div>
               <div className="p-3 rounded-lg bg-[#111723] border border-slate-800">
@@ -420,7 +420,7 @@ export const BastillaDesktopView: React.FC<BastillaDesktopViewProps> = ({
           </div>
 
           <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400 font-mono-tabular">
-            <span>Silnik Wizji: Ollama 11B → Fallback Gemini 3.8 Flash</span>
+            <span>Silnik AI: {overview?.ai_routing.active_engine || "niezweryfikowany"}</span>
             <button
               type="button"
               onClick={onRefresh}

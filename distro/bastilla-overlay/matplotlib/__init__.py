@@ -1,1 +1,0 @@
-# matplotlib shim package

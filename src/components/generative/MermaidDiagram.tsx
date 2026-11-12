@@ -31,7 +31,7 @@ function initMermaidOnce() {
           tertiaryColor: "#07090e",
           fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
         },
-        securityLevel: "loose",
+        securityLevel: "strict",
         suppressErrorRendering: true,
       });
       mermaidInitialized = true;

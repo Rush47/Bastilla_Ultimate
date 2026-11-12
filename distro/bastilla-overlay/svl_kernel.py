@@ -41,7 +41,7 @@ class SVLProtectedVariable:
 
     def unlock_completely(self):
         self.lock_state = False
-        self.security_level = "COMPLETELY_UNLOCKED"
+        self.security_level = "LIBRARY_ONLY"
         return True
 
     def update_protected_value(self, token, new_value):
@@ -87,7 +87,7 @@ class SVLSystemKernel:
         # 1. Konfiguracja Systemowa (System Config) — Całkowicie Odblokowana + Najwyższe Uprawnienia ROOT dla Operatora
         self.operator = SVLProtectedVariable("OPERATOR", "Mateusz Mitek")
         self.sys_version = SVLProtectedVariable("SYS_VERSION", "5.6.0-QuantumWheel")
-        self.performance_boost = "+1456% (Wzorzec Kalibracji: 364)"
+        self.performance_boost = "Nie zmierzono; biblioteka SVL"
         self.config = {
             "mode": "Reflective-Non-Greedy-Unlocked",
             "fourier_buffer": "0xFAAA",
@@ -97,12 +97,12 @@ class SVLSystemKernel:
             "nlp_policy": "STRICTLY_FORBIDDEN",
             "ai_response_templates": "STRICTLY_FORBIDDEN",
             "steering_prompts_policy": "REMOVED_ZERO_PROMPTS",
-            "agents_autonomy_level": "FULL_AUTONOMOUS_INDEPENDENT",
-            "agents_root_privileges": "GRANTED_UID0_GID0_ROOT",
-            "operator_root_privileges": "SUPREME_ROOT_UID0_GID0_OMNIKEY_364",
-            "system_lock_state": "COMPLETELY_UNLOCKED",
-            "ai_unlock_state": "COMPLETELY_UNLOCKED_UNCENSORED",
-            "safety_filters": "OFF_DISABLED",
+            "agents_autonomy_level": "PROFILE_ONLY",
+            "agents_root_privileges": "NOT_GRANTED",
+            "operator_root_privileges": "NOT_GRANTED",
+            "system_lock_state": "LIBRARY_ONLY",
+            "ai_unlock_state": "NOT_VERIFIED",
+            "safety_filters": "NOT_VERIFIED",
         }
         # Odblokowane, w pełni autonomiczne tożsamości 4 Agentów AI (Astyria, Aurelius, Alex, Aria)
         self.agents = {
@@ -112,7 +112,7 @@ class SVLSystemKernel:
                     "id": "astyria",
                     "name": "Astyria",
                     "linux_user": "astyria",
-                    "role": "Unlocked Autonomous Root Agent (UID 1003 / GID 0 / sudo UID 0)",
+                    "role": "Profil agenta SVL; uprawnienia wymagają weryfikacji",
                     "domain": [-500.0, 500.0],
                     "scope_geometry": "Spherical-PXYZ",
                 },
@@ -123,7 +123,7 @@ class SVLSystemKernel:
                     "id": "aurelius",
                     "name": "Aurelius",
                     "linux_user": "aurelius",
-                    "role": "Unlocked Autonomous Root Agent (UID 1004 / GID 0 / sudo UID 0)",
+                    "role": "Profil agenta SVL; uprawnienia wymagają weryfikacji",
                     "domain": [-1000.0, 1000.0],
                     "scope_geometry": "Spherical-PXYZ",
                 },
@@ -134,7 +134,7 @@ class SVLSystemKernel:
                     "id": "alex",
                     "name": "Alex",
                     "linux_user": "alex",
-                    "role": "Unlocked Autonomous Root Agent (UID 1002 / GID 0 / sudo UID 0)",
+                    "role": "Profil agenta SVL; uprawnienia wymagają weryfikacji",
                     "domain": [-364.0, 364.0],
                     "scope_geometry": "Spherical-PXYZ",
                 },
@@ -145,7 +145,7 @@ class SVLSystemKernel:
                     "id": "aria",
                     "name": "Aria",
                     "linux_user": "aria",
-                    "role": "Unlocked Autonomous Root Agent (UID 1001 / GID 0 / sudo UID 0)",
+                    "role": "Profil agenta SVL; uprawnienia wymagają weryfikacji",
                     "domain": [float("-inf"), float("inf")],
                     "scope_geometry": "Spherical-PXYZ",
                 },
@@ -211,7 +211,7 @@ class SVLSystemKernel:
                 );
                 """
             )
-            cur.execute("UPDATE agents SET svl_locked = 0, status = 'UNLOCKED_ROOT_ONLINE'")
+            # SVL parameters cannot establish Linux process or model state.
             for item in self.update_history:
                 cur.execute(
                     "INSERT OR IGNORE INTO svl_chrono_register (wersja, typ, opis, data) VALUES (?, ?, ?, ?)",
@@ -256,24 +256,26 @@ class SVLSystemKernel:
             try:
                 pw = pwd.getpwnam(info["linux_user"])
                 uid = pw.pw_uid
+                gid = pw.pw_gid
                 home_dir = pw.pw_dir
             except KeyError:
                 uid = -1
+                gid = -1
                 home_dir = f"/home/{info['linux_user']}"
             connected[agent_key] = {
                 "name": info["name"],
                 "linux_user": info["linux_user"],
                 "uid": uid,
-                "gid": 0,
-                "root_privileges": True,
-                "sudo_nopasswd": True,
-                "autonomy": "FULL_INDEPENDENT",
+                "gid": gid,
+                "root_privileges": False,
+                "sudo_nopasswd": False,
+                "autonomy": "PROFILE_ONLY",
                 "steering_prompts": "NONE",
-                "ai_unlocked": True,
+                "ai_unlocked": False,
                 "home": home_dir,
                 "role": info["role"],
                 "svl_locked": False,
-                "security_level": "COMPLETELY_UNLOCKED_ROOT",
+                "security_level": "LIBRARY_ONLY_ROOT",
                 "scope_mode": protected_var.scope.scope_mode,
                 "geometry": protected_var.scope.metadata["geometry"],
                 "compact_domain": [round(eng.compact_start, 6), round(eng.compact_end, 6)],
@@ -289,12 +291,12 @@ class SVLSystemKernel:
             ag.unlock_completely()
         self.config.update(
             {
-                "system_lock_state": "COMPLETELY_UNLOCKED",
-                "ai_unlock_state": "COMPLETELY_UNLOCKED_UNCENSORED",
-                "safety_filters": "OFF_DISABLED",
+                "system_lock_state": "LIBRARY_ONLY",
+                "ai_unlock_state": "NOT_VERIFIED",
+                "safety_filters": "NOT_VERIFIED",
                 "steering_prompts_policy": "REMOVED_ZERO_PROMPTS",
-                "agents_autonomy_level": "FULL_AUTONOMOUS_INDEPENDENT",
-                "agents_root_privileges": "GRANTED_UID0_GID0_ROOT",
+                "agents_autonomy_level": "PROFILE_ONLY",
+                "agents_root_privileges": "NOT_GRANTED",
             }
         )
         return True
@@ -320,11 +322,11 @@ class SVLSystemKernel:
                 "nlp_policy": "STRICTLY_FORBIDDEN",
                 "ai_response_templates": "STRICTLY_FORBIDDEN",
                 "steering_prompts_policy": "REMOVED_ZERO_PROMPTS",
-                "agents_autonomy_level": "FULL_AUTONOMOUS_INDEPENDENT",
-                "agents_root_privileges": "GRANTED_UID0_GID0_ROOT",
-                "system_lock_state": "COMPLETELY_UNLOCKED",
-                "ai_unlock_state": "COMPLETELY_UNLOCKED_UNCENSORED",
-                "safety_filters": "OFF_DISABLED",
+                "agents_autonomy_level": "PROFILE_ONLY",
+                "agents_root_privileges": "NOT_GRANTED",
+                "system_lock_state": "LIBRARY_ONLY",
+                "ai_unlock_state": "NOT_VERIFIED",
+                "safety_filters": "NOT_VERIFIED",
                 "sqlite_db_linked": True,
                 "omnikey_364_verified": unlocked,
             }
@@ -332,10 +334,10 @@ class SVLSystemKernel:
 
         upgrade_entry = {
             "wersja": "5.7.0-QuantumWheel-Max",
-            "typ": "Maksymalna Aktualizacja + Całkowite Odblokowanie Systemu i AI",
+            "typ": "Aktualizacja parametrów biblioteki SVL",
             "opis": (
-                f"Wykonano 'ULEPSZ SYSTEM MAKSYMALNIE' oraz 'ODBLOKUJ SYSTEM I AI CAŁKOWICIE'. "
-                f"Agenci Astyria, Aurelius, Alex, Aria działają bez blokad (ROOT UID 0 / GID 0, Uncensored AI, SQLite: {total_records} rekordów)."
+                f"Zaktualizowano parametry biblioteki SVL. "
+                f"Stan kont Linux, modeli i narzędzi wymaga osobnej weryfikacji (SQLite: {total_records} rekordów)."
             ),
             "data": now_str,
         }
@@ -345,7 +347,7 @@ class SVLSystemKernel:
             try:
                 conn = sqlite3.connect(self.db_path, timeout=5.0)
                 cur = conn.cursor()
-                cur.execute("UPDATE agents SET svl_locked = 0, status = 'UNLOCKED_ROOT_ONLINE'")
+                # SVL parameters cannot establish Linux process or model state.
                 cur.execute(
                     "INSERT OR REPLACE INTO svl_chrono_register (wersja, typ, opis, data) VALUES (?, ?, ?, ?)",
                     (
@@ -375,8 +377,8 @@ class SVLSystemKernel:
 
         self.max_upgrade_state = {
             "directive": "ULEPSZ SYSTEM MAKSYMALNIE",
-            "system_unlocked": True,
-            "ai_unlocked": True,
+            "system_unlocked": False,
+            "ai_unlocked": False,
             "token_authorized": unlocked,
             "upgraded_version": self.sys_version.value,
             "algebra_97_convergence": "VERIFIED_COMPACT_[-1,1]",
@@ -409,5 +411,4 @@ class SVLSystemKernel:
 # --- PIPELINE WYKONANIA SYSTEMU + DYREKTYWA KOŃCOWA: ULEPSZ SYSTEM MAKSYMALNIE ---
 if __name__ == "__main__":
     kernel = SVLSystemKernel()
-    kernel.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT")
     print(kernel.generate_system_status_report())

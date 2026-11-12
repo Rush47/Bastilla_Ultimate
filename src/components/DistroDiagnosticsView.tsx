@@ -49,10 +49,11 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           commitMessage: commitMsg,
-          remoteUrl: "https://github.com/Bastilla_OS_Ultimate.git",
+          remoteUrl: "https://github.com/Rush47/Bastilla_Ultimate.git",
         }),
       });
       const data = await res.json();
+      if (!res.ok) { setSyncResult({ push_status: "WYMAGANY PRZEGLĄD", push_detail: data.error }); }
       if (data.ok) {
         setSyncResult(data.sync);
         fetchGitStatus();
@@ -129,14 +130,14 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
           <div>
             <div className="flex items-center justify-between mb-2">
               <h3 className="font-display text-lg font-bold text-white">
-                02. Synchronizacja GitHub: Bastilla_OS_Ultimate (gałąź main)
+                02. Przegląd zmian Rush47/Bastilla_Ultimate
               </h3>
               <span className="text-xs font-mono-tabular text-violet-400">
                 Gałąź: {gitInfo?.branch || "main"}
               </span>
             </div>
             <p className="text-xs text-slate-400 mb-4">
-              Jedna główna gałąź main zawierająca bazę AgenticLinux, jądro SVL v5.7.0-QuantumWheel-Max i konfigurację 4 agentów
+              Zmiany wymagają osobnej gałęzi, sprawdzenia diff i pull requestu. Automatyczny push do main jest wyłączony.
             </p>
 
             <form onSubmit={handleGitSync} className="space-y-3 mb-5">
@@ -145,7 +146,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
                   htmlFor="git-commit-msg"
                   className="block text-xs text-slate-400 mb-1"
                 >
-                  Opis commita na gałęzi main
+                  Opis planowanych zmian
                 </label>
                 <div className="flex gap-2">
                   <input
@@ -160,7 +161,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
                     disabled={syncing}
                     className="px-4 py-2 rounded bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-xs font-semibold whitespace-nowrap shrink-0"
                   >
-                    {syncing ? "Synchronizacja..." : "Commit & Sync main"}
+                    {syncing ? "Synchronizacja..." : "Sprawdź zasady przeglądu"}
                   </button>
                 </div>
               </div>
@@ -179,7 +180,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
 
             <div className="space-y-2">
               <div className="text-xs font-semibold text-slate-300">
-                Ostatnie commity na gałęzi main:
+                Ostatnie commity bieżącej gałęzi:
               </div>
               {gitInfo?.commits && gitInfo.commits.length > 0 ? (
                 gitInfo.commits.map((c: any, idx: number) => (
@@ -196,7 +197,7 @@ export const DistroDiagnosticsView: React.FC<DistroDiagnosticsViewProps> = ({
                 ))
               ) : (
                 <div className="p-3 rounded bg-[#111723] border border-slate-800 text-xs text-slate-400">
-                  Kliknij „Commit & Sync main”, aby utworzyć pierwszy zatwierdzony snapshot projektu Bastilla_OS_Ultimate na gałęzi main.
+                  Brak historii commitów.
                 </div>
               )}
             </div>

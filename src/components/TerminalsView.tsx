@@ -33,9 +33,9 @@ const MODE_CONFIG: Record<
   }
 > = {
   LINUX_ROOT: {
-    label: "1. Linux Root (bash)",
+    label: "1. Linux (bash)",
     subtitle:
-      "Rzeczywista powłoka root (uid=0) w systemie Linux — z obsługą poleceń językiem naturalnym (NLP)",
+      "Powłoka procesu serwera. Rzeczywiste uprawnienia sprawdź poleceniem id.",
     defaultCommand:
       "id && uname -a && grep -E 'aria|alex|astyria|aurelius' /etc/passwd && ps -ef | grep agent_worker | grep -v grep",
     nlpPlaceholder:
@@ -47,7 +47,7 @@ const MODE_CONFIG: Record<
       },
       {
         label: "Pliki bazowe AgenticLinux (/distro/agenticlinux)",
-        cmd: "ls -la /app/applet/distro/agenticlinux && head -n 25 /app/applet/distro/agenticlinux/packages.txt",
+        cmd: "ls -la distro/agenticlinux && head -n 25 distro/agenticlinux/packages.txt",
       },
       {
         label: "Zasoby Jądra (/proc/meminfo & df -h)",
@@ -56,9 +56,9 @@ const MODE_CONFIG: Record<
     ],
   },
   PYTHON_ROOT: {
-    label: "2. Python Root (SVL Kernel)",
+    label: "2. Python (SVL)",
     subtitle:
-      "Natywny interpreter Python 3.10 (root) z modułem svl_kernel i bazą SQLite — z poleceniami naturalnymi",
+      "Interpreter Python procesu serwera z modułem svl_kernel i bazą SQLite",
     defaultCommand: `from svl_kernel import SVLSystemKernel\nkernel = SVLSystemKernel()\nkernel.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT")\nprint(kernel.generate_system_status_report())`,
     nlpPlaceholder:
       "np. 'odpal ulepszenie systemu svl_kernel', 'wypisz tabele sqlite', 'oblicz metrykę c dla [-364, 364]'",
@@ -69,7 +69,7 @@ const MODE_CONFIG: Record<
       },
       {
         label: "Sprawdź tabele bazy SQLite (/var/lib/bastilla/bastilla.db)",
-        cmd: `import sqlite3\nconn = sqlite3.connect('/var/lib/bastilla/bastilla.db')\ncur = conn.cursor()\ntables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]\nprint("Tabele SQLite:", tables)\nfor t in tables:\n    print(f"  {t}: {cur.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]} rekordów")`,
+        cmd: `import sqlite3\nconn = sqlite3.connect(__import__('os').environ['BASTILLA_DB_PATH'])\ncur = conn.cursor()\ntables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]\nprint("Tabele SQLite:", tables)\nfor t in tables:\n    print(f"  {t}: {cur.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]} rekordów")`,
       },
       {
         label: "Test TopologicalInfinityEngine [-364, 364]",
@@ -135,9 +135,9 @@ const MODE_CONFIG: Record<
     ],
   },
   AGENT_USER: {
-    label: "5. Terminale Agentów ROOT (runuser)",
+    label: "5. Konta agentów (runuser)",
     subtitle:
-      "Wykonanie bezpośrednio na koncie Linux wybranego agenta z uprawnieniami ROOT (GID 0 + sudo UID 0)",
+      "Wymaga istniejącego konta Linux i prawa do runuser. Uprawnienia nie są przyznawane przez panel.",
     defaultCommand:
       "whoami && id && sudo id && sudo whoami && cat worker_status.json",
     nlpPlaceholder:
@@ -198,7 +198,7 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
       const entry: TerminalLogEntry = {
         id: Date.now(),
         mode,
-        agentUser: mode === "AGENT_USER" ? agentUser : "root",
+        agentUser: data.agentUser || agentUser,
         command: targetCmd,
         stdout: data.stdout || "",
         stderr: data.stderr || data.error || "",
@@ -207,6 +207,8 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
       };
       setLogs((prev) => [entry, ...prev]);
       onRefresh();
+    } catch (error) {
+      setLogs(prev => [{ id: Date.now(), mode, agentUser, command: targetCmd, stdout: "", stderr: error instanceof Error ? error.message : "Błąd połączenia", exitCode: 1, timestamp: new Date().toLocaleTimeString() }, ...prev]);
     } finally {
       setRunning(false);
     }
@@ -229,12 +231,16 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
         }),
       });
       const data = await res.json();
+      if (!data.ok) {
+        setLogs(prev => [{ id: Date.now(), mode, agentUser, command: trimmed, stdout: "", stderr: data.error || "Błąd tłumaczenia polecenia", exitCode: 1, timestamp: new Date().toLocaleTimeString() }, ...prev]);
+        return;
+      }
       if (data.ok) {
         setCommand(data.generatedCommand);
         const entry: TerminalLogEntry = {
           id: Date.now(),
           mode,
-          agentUser: mode === "AGENT_USER" ? agentUser : "root",
+          agentUser: mode === "AGENT_USER" ? agentUser : String(data.execution_identity?.uid ?? "server"),
           naturalPrompt: trimmed,
           command: data.generatedCommand,
           stdout: data.stdout || "",
@@ -246,6 +252,8 @@ export const TerminalsView: React.FC<TerminalsViewProps> = ({ onRefresh }) => {
         setNaturalPrompt("");
         onRefresh();
       }
+    } catch (error) {
+      setLogs(prev => [{ id: Date.now(), mode, agentUser, command: trimmed, stdout: "", stderr: error instanceof Error ? error.message : "Błąd połączenia", exitCode: 1, timestamp: new Date().toLocaleTimeString() }, ...prev]);
     } finally {
       setTranslatingNlp(false);
     }

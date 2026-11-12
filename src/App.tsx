@@ -1,3 +1,4 @@
+import { AgentControlView } from "./components/AgentControlView";
 import React, { useEffect, useState, useCallback } from "react";
 import type {
   AgentId,
@@ -5,11 +6,11 @@ import type {
   WorkspaceTab,
 } from "./types/bastilla";
 import { BastillaDesktopView } from "./components/BastillaDesktopView";
-import { ChatWorkView } from "./components/ChatWorkView";
-import { TerminalsView } from "./components/TerminalsView";
-import { AgentsMemoryView } from "./components/AgentsMemoryView";
-import { SolarSystem3DView } from "./components/SolarSystem3DView";
-import { DistroDiagnosticsView } from "./components/DistroDiagnosticsView";
+const ChatWorkView = React.lazy(() => import("./components/ChatWorkView").then(m => ({ default: m.ChatWorkView })));
+const TerminalsView = React.lazy(() => import("./components/TerminalsView").then(m => ({ default: m.TerminalsView })));
+const AgentsMemoryView = React.lazy(() => import("./components/AgentsMemoryView").then(m => ({ default: m.AgentsMemoryView })));
+const SolarSystem3DView = React.lazy(() => import("./components/SolarSystem3DView").then(m => ({ default: m.SolarSystem3DView })));
+const DistroDiagnosticsView = React.lazy(() => import("./components/DistroDiagnosticsView").then(m => ({ default: m.DistroDiagnosticsView })));
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("desktop");
@@ -17,6 +18,9 @@ export default function App() {
     AgentId | "council"
   >("aria");
   const [overview, setOverview] = useState<SystemOverviewResponse | null>(null);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [accessToken, setAccessToken] = useState("");
+  const [accessError, setAccessError] = useState("");
   const [loading, setLoading] = useState<boolean>(true);
 
   const [continuousMission, setContinuousMission] = useState<{
@@ -40,6 +44,7 @@ export default function App() {
   const fetchOverview = useCallback(async () => {
     try {
       const res = await fetch("/api/system/overview");
+      if (res.status === 401) { setNeedsLogin(true); return; }
       const contentType = res.headers.get("content-type") || "";
       if (res.ok && contentType.includes("application/json")) {
         const data = await res.json();
@@ -81,7 +86,7 @@ export default function App() {
 
   const toggleMission = async () => {
     try {
-      const res = await fetch("/api/missions/continuous/toggle", { method: "POST" });
+      const res = await fetch("/api/missions/continuous/toggle", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       const contentType = res.headers.get("content-type") || "";
       if (res.ok && contentType.includes("application/json")) {
         const data = await res.json();
@@ -93,7 +98,7 @@ export default function App() {
   const triggerMissionCycle = async () => {
     setTriggeringCycle(true);
     try {
-      const res = await fetch("/api/missions/continuous/trigger", { method: "POST" });
+      const res = await fetch("/api/missions/continuous/trigger", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       const contentType = res.headers.get("content-type") || "";
       if (res.ok && contentType.includes("application/json")) {
         const data = await res.json();
@@ -107,10 +112,26 @@ export default function App() {
     }
   };
 
+  if (needsLogin) return <main className="max-w-md mx-auto p-6 space-y-4">
+    <h1 className="text-xl font-bold">Dostęp do Bastilla</h1>
+    <form className="space-y-3" onSubmit={async e => {
+      e.preventDefault();
+      try {
+        const response = await fetch("/api/access/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: accessToken }) });
+        if (!response.ok) throw new Error("Nieautoryzowane. Sprawdź token dostępu.");
+        setAccessToken(""); setAccessError(""); setNeedsLogin(false); void fetchOverview();
+      } catch (error) { setAccessError(error instanceof Error ? error.message : "Błąd połączenia."); }
+    }}>
+      <label>Token panelu<input type="password" autoComplete="off" className="block w-full min-h-11 bg-slate-900 border border-slate-600 rounded px-3 mt-1" value={accessToken} onChange={e => setAccessToken(e.target.value)} required /></label>
+      <button className="min-h-11 bg-violet-600 px-4 rounded">Połącz</button>
+      {accessError && <p role="alert">{accessError}</p>}
+    </form>
+  </main>;
+
   return (
     <div className="min-h-screen bg-[#07090e] text-slate-100 flex flex-col">
       {/* Responsive Compact Top Bar */}
-      <header className="h-12 sm:h-16 flex items-center justify-between gap-3 sm:gap-8 px-3 sm:px-6 border-b border-slate-800 bg-[#0a0d14]">
+      <header className="flex flex-wrap lg:flex-nowrap items-center justify-between gap-3 px-3 sm:px-6 py-3 border-b border-slate-800 bg-[#0a0d14]">
         {/* Zone 1: Single text element wordmark */}
         <a
           href="#desktop"
@@ -126,8 +147,9 @@ export default function App() {
         {/* Zone 2: 5 concise single-line text navigation links */}
         <nav
           aria-label="Główna nawigacja systemu"
-          className="flex items-center gap-6 text-sm font-medium text-slate-300 overflow-x-auto"
+          className="order-3 lg:order-none flex w-full lg:w-auto min-w-0 items-center gap-5 text-sm font-medium text-slate-300 overflow-x-auto"
         >
+          <button type="button" onClick={() => setActiveTab("control")} className={`min-h-11 whitespace-nowrap shrink-0 border-b-2 ${activeTab === "control" ? "border-violet-500 text-white" : "border-transparent text-slate-400"}`}>Sterowanie</button>
           <button
             type="button"
             onClick={() => setActiveTab("desktop")}
@@ -215,13 +237,13 @@ export default function App() {
             />
           </span>
           <span className="font-bold text-white uppercase text-[11px] tracking-wide shrink-0 flex items-center gap-1.5">
-            {continuousMission?.active ? "🟢 MISJA CIĄGŁA AKTYWNA" : "🟡 MISJA WSTRZYMANA"}
+            {continuousMission?.active ? "🟢 KONTROLA SQLITE AKTYWNA" : "🟡 KONTROLA SQLITE WSTRZYMANA"}
           </span>
           <span className="px-1.5 py-0.5 rounded bg-violet-950/80 border border-violet-700/50 text-violet-300 text-[10px] shrink-0 font-bold">
             Cykl #{continuousMission?.cycle ?? 0}
           </span>
           <span className="text-slate-400 hidden md:inline truncate max-w-sm lg:max-w-xl text-[11px]">
-            {continuousMission?.lastAction || "Samoleczenie i ulepszanie backendu i GUI (Aria, Alex, Astyria, Aurelius)"}
+            {continuousMission?.lastAction || "Kontrola SQLite wykonywana przez serwer"}
           </span>
         </div>
 
@@ -246,13 +268,15 @@ export default function App() {
                 : "bg-emerald-600 hover:bg-emerald-500 text-white"
             }`}
           >
-            {continuousMission?.active ? "Wstrzymaj" : "Wznów misję"}
+            {continuousMission?.active ? "Wstrzymaj" : "Wznów kontrolę"}
           </button>
         </div>
       </div>
 
       {/* Main Content Stage */}
-      <main className="flex-1">
+      {overview?.host.legacy_records_unverified && <p className="px-3 sm:px-6 py-3 text-sm text-amber-200 border-b border-amber-900">Zachowano historię starszej wersji, która może zawierać dane demonstracyjne. Dostęp agentów i rzeczywiste wyniki sprawdź w zakładce Sterowanie.</p>}
+      <main className="flex-1 min-w-0">
+        <React.Suspense fallback={<p className="p-6">Ładowanie panelu…</p>}>
         {loading && !overview ? (
           <div className="p-8 max-w-5xl mx-auto space-y-4">
             <div className="h-24 rounded-xl bg-slate-900/80 border border-slate-800 animate-pulse" />
@@ -263,6 +287,7 @@ export default function App() {
           </div>
         ) : (
           <>
+            {activeTab === "control" && <AgentControlView />}
             {activeTab === "desktop" && (
               <BastillaDesktopView
                 overview={overview}
@@ -302,6 +327,7 @@ export default function App() {
             )}
           </>
         )}
+        </React.Suspense>
       </main>
     </div>
   );

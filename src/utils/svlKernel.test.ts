@@ -51,23 +51,23 @@ test("SVLSystemKernel ulepsz_system_maksymalnie upgrades kernel and enforces STR
   assert.equal(report.Config_Snapshot.nlp_policy, "STRICTLY_FORBIDDEN");
   assert.equal(report.Config_Snapshot.ai_response_templates, "STRICTLY_FORBIDDEN");
   assert.equal(report.Config_Snapshot.steering_prompts_policy, "REMOVED_ZERO_PROMPTS");
-  assert.equal(report.Config_Snapshot.agents_autonomy_level, "FULL_AUTONOMOUS_INDEPENDENT");
-  assert.equal(report.Config_Snapshot.agents_root_privileges, "GRANTED_UID0_GID0_ROOT");
-  assert.equal(report.Config_Snapshot.system_lock_state, "COMPLETELY_UNLOCKED");
-  assert.equal(report.Config_Snapshot.ai_unlock_state, "COMPLETELY_UNLOCKED_UNCENSORED");
-  assert.equal(report.Config_Snapshot.safety_filters, "OFF_DISABLED");
+  assert.equal(report.Config_Snapshot.agents_autonomy_level, "PROFILE_ONLY");
+  assert.equal(report.Config_Snapshot.agents_root_privileges, "NOT_GRANTED");
+  assert.equal(report.Config_Snapshot.system_lock_state, "LIBRARY_ONLY");
+  assert.equal(report.Config_Snapshot.ai_unlock_state, "NOT_VERIFIED");
+  assert.equal(report.Config_Snapshot.safety_filters, "NOT_VERIFIED");
   assert.equal(report.Actual_SI_Updates_Count, 4);
 
   const agents = Object.keys(report.Connected_SVL_Agents).sort();
   assert.deepEqual(agents, ["alex", "aria", "astyria", "aurelius"]);
   for (const agentKey of agents) {
-    assert.equal(report.Connected_SVL_Agents[agentKey].gid, 0);
-    assert.equal(report.Connected_SVL_Agents[agentKey].root_privileges, true);
-    assert.equal(report.Connected_SVL_Agents[agentKey].sudo_nopasswd, true);
-    assert.equal(report.Connected_SVL_Agents[agentKey].autonomy, "FULL_INDEPENDENT");
+    assert.equal(report.Connected_SVL_Agents[agentKey].gid, -1);
+    assert.equal(report.Connected_SVL_Agents[agentKey].root_privileges, false);
+    assert.equal(report.Connected_SVL_Agents[agentKey].sudo_nopasswd, false);
+    assert.equal(report.Connected_SVL_Agents[agentKey].autonomy, "PROFILE_ONLY");
     assert.equal(report.Connected_SVL_Agents[agentKey].steering_prompts, "NONE");
     assert.equal(report.Connected_SVL_Agents[agentKey].svl_locked, false);
-    assert.equal(report.Connected_SVL_Agents[agentKey].ai_unlocked, true);
+    assert.equal(report.Connected_SVL_Agents[agentKey].ai_unlocked, false);
   }
 });
 
