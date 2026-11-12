@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 export interface MCPToolDefinition {
@@ -13,30 +14,6 @@ export interface MCPToolDefinition {
 }
 
 export const MCP_TOOLS: MCPToolDefinition[] = [
-  {
-    name: "sqlite_query",
-    description: "Wykonaj zapytanie SQL na bazie danych SQLite Bastilla OS (/var/lib/bastilla/bastilla.db)",
-    parameters: {
-      type: "object",
-      properties: {
-        sql: { type: "string", description: "Instrukcja SQL do wykonania" },
-        params: { type: "string", description: "Parametry JSON zapytania" },
-      },
-      required: ["sql"],
-    },
-  },
-  {
-    name: "terminal_exec",
-    description: "Wykonaj polecenie systemowe w powłoce Linux pod uprawnieniami Supreme Root (UID 0 / GID 0)",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string", description: "Polecenie bash do wykonania" },
-        agentUser: { type: "string", description: "Kontekst agenta (aria, alex, astyria, aurelius)" },
-      },
-      required: ["command"],
-    },
-  },
   {
     name: "git_status",
     description: "Pobierz status gałęzi i zmienionych plików w repozytorium GitHub Bastilla_Ultimate",
@@ -71,44 +48,14 @@ export class MCPServerManager {
   }
 
   executeTool(toolName: string, args: Record<string, any>, operatorToken?: string) {
-    if (operatorToken && operatorToken !== "364_OMNIKLUCZ_ROOT" && operatorToken !== "SUPREME_ROOT_UID0_GID0") {
-      throw new Error("Brak uprawnień Supreme Root do wykonania narzędzia MCP.");
-    }
-
-    if (toolName === "sqlite_query") {
-      const sql = args.sql;
-      let params = [];
-      try {
-        params = args.params ? JSON.parse(args.params) : [];
-      } catch {
-        params = [];
-      }
-      const pyScript = `
-import sqlite3, sys, json
-conn = sqlite3.connect(sys.argv[1])
-conn.row_factory = sqlite3.Row
-cur = conn.cursor()
-cur.execute(sys.argv[2], json.loads(sys.argv[3]))
-res = [dict(r) for r in cur.fetchall()]
-conn.commit()
-conn.close()
-print(json.dumps(res))
-`;
-      const out = execFileSync("python3", ["-c", pyScript, this.dbPath, sql, JSON.stringify(params)], {
-        encoding: "utf8",
-        timeout: 5000,
-      });
-      return { ok: true, result: JSON.parse(out.trim() || "[]") };
-    }
-
-    if (toolName === "terminal_exec") {
-      const command = args.command;
-      const out = execFileSync("bash", ["-c", command], {
-        cwd: this.projectRoot,
-        encoding: "utf8",
-        timeout: 8000,
-      });
-      return { ok: true, output: out.trim() };
+    const expected = process.env.BASTILLA_API_TOKEN;
+    // Never grant privileged MCP operations based on a missing token or a
+    // hard-coded magic string. This is defense in depth; HTTP routes must
+    // independently apply their normal authentication and origin checks.
+    if (!expected || !operatorToken ||
+        Buffer.byteLength(expected) !== Buffer.byteLength(operatorToken) ||
+        !timingSafeEqual(Buffer.from(expected), Buffer.from(operatorToken))) {
+      throw new Error("MCP requires an authenticated operator token.");
     }
 
     if (toolName === "git_status") {
@@ -118,7 +65,10 @@ print(json.dumps(res))
     }
 
     if (toolName === "agent_memory_read") {
-      const agentId = (args.agentId || "aria").toLowerCase();
+      const agentId = String(args.agentId || "").toLowerCase();
+      if (!["aria", "alex", "astyria", "aurelius"].includes(agentId)) {
+        throw new Error("Invalid agent identifier.");
+      }
       const memPath = path.join(this.projectRoot, `home/${agentId}/memory.json`);
       let memData = {};
       if (existsSync(memPath)) {
