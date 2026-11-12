@@ -42,7 +42,10 @@ async function call(name, args = {}) {
   throw new Error('Unknown tool: ' + name);
 }
 async function handle(msg) {
-  if (!msg || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') return;
+  if (!msg || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+    send({ jsonrpc: '2.0', id: msg?.id ?? null, error: { code: -32600, message: 'Invalid Request' } });
+    return;
+  }
   const id = msg.id;
   if (id === undefined) return; // notifications
   try {
@@ -54,6 +57,10 @@ async function handle(msg) {
       case 'ping': result = {}; break;
       case 'tools/list': result = { tools }; break;
       case 'tools/call':
+        if (typeof msg.params?.name !== 'string' || !tools.some(tool => tool.name === msg.params.name)) {
+          send({ jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown tool' } });
+          return;
+        }
         try {
           const output = await call(msg.params?.name, msg.params?.arguments || {});
           result = { content: [{ type: 'text', text: JSON.stringify(output) }] };
@@ -81,7 +88,7 @@ process.stdin.on('data', chunk => {
     buffer = buffer.slice(i + 1);
     if (line) {
       try { void handle(JSON.parse(line)); }
-      catch { /* malformed input is ignored; keep stdout protocol-only */ }
+      catch { send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }); }
     }
   }
 });
