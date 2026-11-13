@@ -16,7 +16,7 @@ import {
   ShieldCheck,
   FlaskConical,
 } from "lucide-react";
-import { apiFetchJson, buildApiUrl } from "../utils/apiClient";
+import { apiFetchJson, buildApiUrl, isApiRateLimited } from "../utils/apiClient";
 
 export interface CodexTask {
   id: number;
@@ -177,10 +177,11 @@ export function CodexTasksPanel({
     fetchTasks();
     fetchGitSummary();
     const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      if (isApiRateLimited()) return;
       fetchTasks();
-      fetchCodexStatus();
       if (activeTab === "git") fetchGitSummary();
-    }, 3000);
+    }, 15000);
 
     // Reconnect immediately when tab/browser regains visibility on Android/desktop
     const onVisibility = () => {

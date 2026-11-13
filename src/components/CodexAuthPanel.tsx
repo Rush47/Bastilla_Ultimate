@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import type { CodexStatus } from "../types/codex";
-import { apiFetchJson } from "../utils/apiClient";
+import { apiFetchJson, isApiRateLimited } from "../utils/apiClient";
 
 export function CodexAuthPanel() {
   const [status, setStatus] = useState<CodexStatus | null>(null);
@@ -22,7 +22,11 @@ export function CodexAuthPanel() {
   const pending = status?.login?.state === "starting" || status?.login?.state === "pending";
   useEffect(() => {
     if (!pending) return;
-    const interval = setInterval(() => void refresh(), 2000);
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      if (isApiRateLimited()) return;
+      void refresh();
+    }, 4000);
     return () => clearInterval(interval);
   }, [pending, refresh]);
 

@@ -127,9 +127,10 @@ export function mapButtonLabelToRootCommand(label: string): string {
 function renderInlineMarkdown(line: string, onExecuteCommand?: (cmd: string) => void): React.ReactNode {
   const parts = line.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s][^*]*\*)/g);
   return parts.map((part, i) => {
+    const uniqueKey = `${i}-${part.slice(0, 10)}`;
     if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
       return (
-        <strong key={i} className="font-semibold text-white">
+        <strong key={uniqueKey} className="font-semibold text-white">
           {part.slice(2, -2)}
         </strong>
       );
@@ -143,7 +144,7 @@ function renderInlineMarkdown(line: string, onExecuteCommand?: (cmd: string) => 
       if (isRunnableCmd && onExecuteCommand) {
         return (
           <button
-            key={i}
+            key={uniqueKey}
             type="button"
             onClick={() => onExecuteCommand(`/exec ${codeVal.trim()}`)}
             title={`Kliknij, aby uruchomić w Linux Root: ${codeVal}`}
@@ -156,7 +157,7 @@ function renderInlineMarkdown(line: string, onExecuteCommand?: (cmd: string) => 
       }
       return (
         <code
-          key={i}
+          key={uniqueKey}
           className="px-1.5 py-0.5 mx-0.5 rounded bg-slate-900 border border-slate-700/80 text-cyan-300 font-mono text-[11px]"
         >
           {codeVal}
@@ -165,12 +166,12 @@ function renderInlineMarkdown(line: string, onExecuteCommand?: (cmd: string) => 
     }
     if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
       return (
-        <em key={i} className="italic text-slate-300">
+        <em key={uniqueKey} className="italic text-slate-300">
           {part.slice(1, -1)}
         </em>
       );
     }
-    return <React.Fragment key={i}>{part}</React.Fragment>;
+    return <React.Fragment key={uniqueKey}>{part}</React.Fragment>;
   });
 }
 

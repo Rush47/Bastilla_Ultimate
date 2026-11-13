@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback, memo } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback, memo } from "react";
 import type {
   AgentId,
   ChatMessageRecord,
@@ -6,7 +6,12 @@ import type {
   SystemOverviewResponse,
   ToolExecutionOutcomeSummary,
 } from "../types/bastilla";
-import { AGENT_AVATARS } from "./BastillaDesktopView";
+import {
+  AGENT_AVATARS,
+  OPERATOR_AVATAR,
+  getAgentAvatarUrl,
+  getOperatorAvatarUrl,
+} from "./BastillaDesktopView";
 import {
   Send,
   Image as ImageIcon,
@@ -29,13 +34,24 @@ import {
   Images,
   Wand2,
   Settings2,
+  Search,
+  FileText,
+  Monitor,
 } from "lucide-react";
 import {
   GenerativeComponentRenderer,
   FormattedMarkdownText,
   extractGenerativeUI,
 } from "./generative/ComponentRegistry";
-import { apiFetchJson, buildApiUrl } from "../utils/apiClient";
+import {
+  apiFetchJson,
+  buildApiUrl,
+  delayMs,
+  markApiRateLimited,
+  parseRetryAfterMs,
+  resetApiRateLimit,
+  subscribeBastillaEvent,
+} from "../utils/apiClient";
 
 interface ChatWorkViewProps {
   overview: SystemOverviewResponse | null;
@@ -92,7 +108,10 @@ interface ChatInputBarProps {
       | "continuous_mission"
   ) => void;
   onOpenImageGenModal: (prefill?: string) => void;
+  onCaptureDesktopScreenshot: () => void;
   imagePreviewName: string;
+  attachmentKind: "image" | "video" | "document" | null;
+  attachmentPreviewUrl: string | null;
   onClearImage: () => void;
   sending: boolean;
   generatingImage: boolean;
@@ -108,7 +127,10 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
     onLoadVisionSample,
     onTriggerGenerativeSample,
     onOpenImageGenModal,
+    onCaptureDesktopScreenshot,
     imagePreviewName,
+    attachmentKind,
+    attachmentPreviewUrl,
     onClearImage,
     sending,
     generatingImage,
@@ -253,19 +275,39 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
           </button>
         </div>
 
-        {/* Vision / Edit Image Attached Banner */}
+        {/* Vision / Video / Document Attachment Banner */}
         {imagePreviewName && (
-          <div className="flex items-center justify-between px-2.5 py-1.5 rounded-md bg-violet-950/40 border border-violet-600/60 text-[11px] text-violet-200 font-mono-tabular">
-            <div className="flex items-center gap-1.5 truncate">
-              <Eye className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-              <span className="font-semibold text-cyan-300">OBRAZ ZAŁĄCZONY:</span>
+          <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-violet-950/40 border border-violet-600/60 text-[11px] text-violet-200 font-mono-tabular">
+            <div className="flex items-center gap-2 min-w-0">
+              {attachmentKind === "image" && attachmentPreviewUrl ? (
+                <img
+                  src={attachmentPreviewUrl}
+                  alt={imagePreviewName}
+                  className="w-8 h-8 rounded object-cover border border-cyan-400/50 shrink-0"
+                />
+              ) : attachmentKind === "video" && attachmentPreviewUrl ? (
+                <video
+                  src={attachmentPreviewUrl}
+                  controls
+                  className="w-16 h-10 rounded border border-violet-400/50 shrink-0 bg-black"
+                />
+              ) : (
+                <FileText className="w-4 h-4 text-cyan-400 shrink-0" />
+              )}
+              <span className="font-semibold text-cyan-300 shrink-0">
+                {attachmentKind === "video"
+                  ? "WIDEO:"
+                  : attachmentKind === "document"
+                  ? "DOKUMENT:"
+                  : "OBRAZ:"}
+              </span>
               <span className="truncate">{imagePreviewName}</span>
             </div>
             <button
               type="button"
               onClick={onClearImage}
-              aria-label="Usuń załączony obraz"
-              className="min-h-8 min-w-8 text-rose-400 hover:text-rose-300 ml-2"
+              aria-label="Usuń załącznik"
+              className="min-h-8 min-w-8 text-rose-400 hover:text-rose-300 ml-2 shrink-0"
             >
               ✕
             </button>
@@ -303,18 +345,28 @@ const ChatInputBar: React.FC<ChatInputBarProps> = memo(
               <label
                 htmlFor="vision-upload-micro"
                 className="min-h-10 min-w-10 px-2.5 flex items-center justify-center gap-1.5 rounded-lg bg-[#0b0f18] hover:bg-slate-800 border border-slate-700 text-slate-300 cursor-pointer transition-colors shrink-0 text-xs"
-                title="Wgraj obraz (Vision lub edycja/wariant)"
+                title="Wgraj obraz, wideo lub dokument (Vision / kontekst)"
               >
                 <ImageIcon className="w-4 h-4 text-cyan-400" />
-                <span className="hidden sm:inline text-[11px]">Obraz</span>
+                <span className="hidden sm:inline text-[11px]">Załącznik</span>
                 <input
                   id="vision-upload-micro"
                   type="file"
-                  accept="image/*"
+                  accept="image/*,video/*,.pdf,.txt,.md,.json,.py,.ts,.tsx,.sh,.log,.csv"
                   onChange={handleFileChange}
                   className="hidden"
                 />
               </label>
+
+              <button
+                type="button"
+                onClick={onCaptureDesktopScreenshot}
+                className="min-h-10 px-2.5 rounded-lg bg-[#0b0f18] hover:bg-slate-800 border border-slate-700 text-violet-300 text-xs font-mono-tabular transition-colors shrink-0 flex items-center gap-1"
+                title="Pobierz aktualny zrzut pulpitu X11 i załącz do analizy AI"
+              >
+                <Monitor className="w-3.5 h-3.5" />
+                <span className="hidden md:inline text-[11px]">Zrzut X11</span>
+              </button>
 
               <button
                 type="button"
@@ -384,6 +436,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [ollamaEndpointInput, setOllamaEndpointInput] = useState<string>(
     overview?.ollama_status?.endpoint || "http://127.0.0.1:11434"
   );
+  const [ollamaDefaultModelInput, setOllamaDefaultModelInput] = useState<string>(
+    overview?.ai_routing?.default_model || "llama3.2-vision:11b"
+  );
   const [savingOllamaConfig, setSavingOllamaConfig] = useState<boolean>(false);
   const [generatingImage, setGeneratingImage] = useState<boolean>(false);
   const [showImageGenPanel, setShowImageGenPanel] = useState<boolean>(false);
@@ -395,6 +450,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [enginePreference, setEnginePreference] = useState<OllamaEngineChoice>("auto");
   const [filterByAgent, setFilterByAgent] = useState<boolean>(true);
+  const [searchQuery, setSearchQuery] = useState<string>("");
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [showCanvasDrawer, setShowCanvasDrawer] = useState<boolean>(false);
   const [showMobileTools, setShowMobileTools] = useState<boolean>(false);
@@ -402,6 +458,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const [imageBase64, setImageBase64] = useState<string | null>(null);
   const [imageMimeType, setImageMimeType] = useState<string>("image/jpeg");
   const [imagePreviewName, setImagePreviewName] = useState<string>("");
+  const [attachmentKind, setAttachmentKind] = useState<"image" | "video" | "document" | null>(null);
+  const [attachmentPreviewUrl, setAttachmentPreviewUrl] = useState<string | null>(null);
+  const [attachmentTextContext, setAttachmentTextContext] = useState<string>("");
   const [activeArtifact, setActiveArtifact] = useState<{
     title: string;
     code: string;
@@ -411,9 +470,52 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     code: `from svl_kernel import SVLSystemKernel\n\nkernel = SVLSystemKernel()\nprint(kernel.generate_system_status_report())`,
   });
   const [executingArtifact, setExecutingArtifact] = useState<boolean>(false);
+  const [bidirectionalAuto, setBidirectionalAuto] = useState<boolean>(false);
+  const [bidirectionalBusy, setBidirectionalBusy] = useState<string | null>(null);
+  const [selectingAiAvatars, setSelectingAiAvatars] = useState<boolean>(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const pendingOptimisticIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    apiFetchJson<{ ok: boolean; state?: { autoEnabled?: boolean } }>(
+      "/api/chat/bidirectional/status"
+    )
+      .then((res) => {
+        if (res.ok && res.state) {
+          setBidirectionalAuto(Boolean(res.state.autoEnabled));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const onChatMessage = (ev: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(ev.data || "{}");
+        const incoming = parsed?.message as ChatMessageRecord | undefined;
+        if (!incoming || !incoming.id) return;
+        setLocalMessages((prev) => {
+          if (prev.some((m) => m.id === incoming.id)) return prev;
+          return [...prev, incoming];
+        });
+      } catch {}
+    };
+    const onBidirectionalStatus = (ev: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(ev.data || "{}");
+        if (parsed?.state) {
+          setBidirectionalAuto(Boolean(parsed.state.autoEnabled));
+        }
+      } catch {}
+    };
+    const unsubChat = subscribeBastillaEvent("chat_message", onChatMessage);
+    const unsubBidir = subscribeBastillaEvent("bidirectional_chat_status", onBidirectionalStatus);
+    return () => {
+      unsubChat();
+      unsubBidir();
+    };
+  }, []);
 
   useEffect(() => {
     if (!isFullscreen) return;
@@ -426,11 +528,18 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
 
   useEffect(() => {
     const serverChats = overview?.host?.db?.chats || [];
+    const dedupe = (items: ChatMessageRecord[]) => {
+      const seen = new Map<number, ChatMessageRecord>();
+      for (const item of items) {
+        if (item && item.id != null) seen.set(item.id, item);
+      }
+      return Array.from(seen.values());
+    };
     setLocalMessages((prev) => {
       const activeId = pendingOptimisticIdRef.current;
-      if (!activeId) return serverChats;
+      if (!activeId) return dedupe(serverChats);
       const inFlight = prev.find((m) => m.id === activeId);
-      if (!inFlight) return serverChats;
+      if (!inFlight) return dedupe(serverChats);
       const inFlightTs = Date.parse(inFlight.created_at) || 0;
       const alreadyOnServer = serverChats.some(
         (srv) =>
@@ -439,7 +548,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           srv.content === inFlight.content &&
           (Date.parse(srv.created_at) || 0) >= inFlightTs - 5000
       );
-      return alreadyOnServer ? serverChats : [...serverChats, inFlight];
+      return alreadyOnServer ? dedupe(serverChats) : dedupe([...serverChats, inFlight]);
     });
   }, [overview?.host?.db?.chats]);
 
@@ -454,27 +563,121 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     if (ep && !showOllamaConfig) {
       setOllamaEndpointInput(ep);
     }
-  }, [overview?.ollama_status?.endpoint, showOllamaConfig]);
+    const defMod = overview?.ai_routing?.default_model;
+    if (defMod && !showOllamaConfig) {
+      setOllamaDefaultModelInput(defMod);
+    }
+  }, [overview?.ollama_status?.endpoint, overview?.ai_routing?.default_model, showOllamaConfig]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [localMessages.length, selectedAgent, streamingContent]);
 
-  const visibleMessages = filterByAgent
-    ? localMessages.filter((m) => m.agent_id === selectedAgent)
-    : localMessages;
+  const visibleMessages = useMemo(() => {
+    const seenIds = new Set<number>();
+    return localMessages.filter((m) => {
+      if (!m || m.id == null || seenIds.has(m.id)) return false;
+      seenIds.add(m.id);
+      const matchesAgent =
+        !filterByAgent ||
+        selectedAgent === "council" ||
+        m.agent_id === selectedAgent ||
+        m.agent_id === "council" ||
+        Boolean(m.engine_used && m.engine_used.includes("@wszyscy")) ||
+        Boolean(m.content && m.content.toLowerCase().includes(`@${selectedAgent}`));
+      if (!matchesAgent) return false;
+      const q = searchQuery.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        m.content.toLowerCase().includes(q) ||
+        m.agent_id.toLowerCase().includes(q) ||
+        (m.engine_used || "").toLowerCase().includes(q)
+      );
+    });
+  }, [localMessages, filterByAgent, selectedAgent, searchQuery]);
+
+  const handleClearAttachment = useCallback(() => {
+    if (attachmentPreviewUrl && attachmentPreviewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(attachmentPreviewUrl);
+    }
+    setImageBase64(null);
+    setImagePreviewName("");
+    setAttachmentKind(null);
+    setAttachmentPreviewUrl(null);
+    setAttachmentTextContext("");
+  }, [attachmentPreviewUrl]);
 
   const handleProcessImageFile = useCallback((file: File) => {
+    if (attachmentPreviewUrl && attachmentPreviewUrl.startsWith("blob:")) {
+      URL.revokeObjectURL(attachmentPreviewUrl);
+    }
     setImagePreviewName(file.name);
-    setImageMimeType(file.type || "image/jpeg");
+    setImageMimeType(file.type || "application/octet-stream");
+    setAttachmentTextContext("");
+
+    if (file.type.startsWith("video/")) {
+      setAttachmentKind("video");
+      setAttachmentPreviewUrl(URL.createObjectURL(file));
+      setImageBase64(null);
+      setAttachmentTextContext(`[Załącznik wideo: ${file.name}, ${Math.round(file.size / 1024)} KB, ${file.type}]`);
+      return;
+    }
+
+    const isTextLike =
+      file.type.startsWith("text/") ||
+      /\.(txt|md|json|py|ts|tsx|js|sh|log|csv|yml|yaml|toml)$/i.test(file.name);
+    if (isTextLike || file.type === "application/pdf") {
+      setAttachmentKind("document");
+      setAttachmentPreviewUrl(null);
+      setImageBase64(null);
+      if (isTextLike) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const content = String(reader.result || "").slice(0, 16000);
+          setAttachmentTextContext(`\n\n--- Załączony dokument: ${file.name} ---\n\`\`\`\n${content}\n\`\`\``);
+        };
+        reader.readAsText(file);
+      } else {
+        setAttachmentTextContext(`\n\n[Załączony plik PDF/binarny: ${file.name}, ${Math.round(file.size / 1024)} KB]`);
+      }
+      return;
+    }
+
+    setAttachmentKind("image");
     const reader = new FileReader();
     reader.onload = () => {
       const result = String(reader.result || "");
       const base64 = result.includes(",") ? result.split(",")[1] : result;
+      setAttachmentPreviewUrl(result);
       setImageBase64(base64);
     };
     reader.readAsDataURL(file);
-  }, []);
+  }, [attachmentPreviewUrl]);
+
+  const handleCaptureDesktopScreenshot = useCallback(async () => {
+    setErrorMsg(null);
+    setStatusNotice(null);
+    try {
+      const data = await apiFetchJson<{
+        ok: boolean;
+        screenshot?: { base64: string; mimeType: string; width: number; height: number; display: string };
+        error?: string;
+      }>("/api/desktop/screenshot", {
+        method: "POST",
+        body: JSON.stringify({ agentId: selectedAgent === "council" ? "astyria" : selectedAgent }),
+      });
+      if (data.ok && data.screenshot) {
+        setImageBase64(data.screenshot.base64);
+        setImageMimeType(data.screenshot.mimeType);
+        setAttachmentKind("image");
+        setAttachmentPreviewUrl(`data:${data.screenshot.mimeType};base64,${data.screenshot.base64}`);
+        setImagePreviewName(`desktop_${data.screenshot.display}_${data.screenshot.width}x${data.screenshot.height}.png`);
+        setStatusNotice(`Przechwycono świeży zrzut X11 (${data.screenshot.width}x${data.screenshot.height}).`);
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Najpierw uruchom sesję pulpitu X11 w zakładce Pulpit Violet.");
+    }
+  }, [selectedAgent]);
 
   const handleLoadVisionSample = useCallback(() => {
     const canvas = document.createElement("canvas");
@@ -495,6 +698,8 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     const dataUrl = canvas.toDataURL("image/jpeg");
     setImageBase64(dataUrl.split(",")[1]);
     setImageMimeType("image/jpeg");
+    setAttachmentKind("image");
+    setAttachmentPreviewUrl(dataUrl);
     setImagePreviewName("real_vision_test_pattern.jpg");
     setStatusNotice("Załadowano obraz testowy Real Vision.");
   }, []);
@@ -556,7 +761,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
   const sendDirectMessage = useCallback(
     async (textToSend: string) => {
       const trimmed = textToSend.trim();
-      if (!trimmed && !imageBase64) return;
+      if (!trimmed && !imageBase64 && !attachmentTextContext) return;
 
       setErrorMsg(null);
       setStatusNotice(null);
@@ -575,14 +780,14 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
       }
 
       const effectivePrompt =
-        trimmed || "Przeanalizuj ten obraz w trybie Real Vision i opisz co przedstawia.";
+        `${trimmed || "Przeanalizuj załącznik."}${attachmentTextContext ? attachmentTextContext : ""}`;
       const optimisticUserMsg: ChatMessageRecord = {
         id: Date.now(),
         session_id: "bastilla-main",
         sender_role: "user",
         agent_id: selectedAgent,
         engine_used: "Operator",
-        content: trimmed || "[Przesłano obraz do analizy Real Vision]",
+        content: trimmed || `[Załączono: ${imagePreviewName || "plik"}]`,
         created_at: new Date().toISOString(),
       };
 
@@ -598,20 +803,41 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
       let savedOnServer = false;
 
       try {
-        const res = await fetch(buildApiUrl("/api/chat/stream"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-          credentials: "include",
-          signal: controller.signal,
-          body: JSON.stringify({
-            agentId: selectedAgent,
-            sessionId: "bastilla-main",
-            message: effectivePrompt,
-            imageBase64,
-            imageMimeType,
-            enginePreference: imageBase64 ? "llama3.2-vision:11b" : enginePreference,
-          }),
+        const streamPayload = JSON.stringify({
+          agentId: selectedAgent,
+          sessionId: "bastilla-main",
+          message: effectivePrompt,
+          imageBase64,
+          imageMimeType,
+          enginePreference: imageBase64
+            ? overview?.ai_routing?.default_model || "llama3.2-vision:11b"
+            : enginePreference,
         });
+
+        let res: Response | null = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          res = await fetch(buildApiUrl("/api/chat/stream"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+            credentials: "include",
+            signal: controller.signal,
+            body: streamPayload,
+          });
+          if (res.status === 429) {
+            const waitMs = markApiRateLimited(parseRetryAfterMs(res));
+            if (attempt < 3) {
+              setStatusNotice(`Limit zapytań proxy (HTTP 429) — automatyczne ponowienie za ${Math.ceil(Math.min(waitMs, 6000) / 1000)} s...`);
+              await delayMs(Math.min(waitMs, 6000), controller.signal);
+              continue;
+            }
+            throw new Error("Limit zapytań proxy (HTTP 429). Odczekaj kilka sekund i wyślij wiadomość ponownie.");
+          }
+          break;
+        }
+        setStatusNotice(null);
+        if (!res) {
+          throw new Error("Brak odpowiedzi serwera strumienia.");
+        }
 
         const contentType = (res.headers.get("content-type") || "").toLowerCase();
         if (!res.ok || contentType.includes("text/html")) {
@@ -621,10 +847,11 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           }
           throw new Error(
             contentType.includes("text/html")
-              ? `Serwer zwrócił HTML (HTTP ${res.status}) zamiast strumienia API.`
+              ? `Serwer zwrócił stronę HTML (HTTP ${res.status}) zamiast strumienia API.`
               : `Błąd strumienia czatu (HTTP ${res.status})`
           );
         }
+        resetApiRateLimit();
 
         if (!res.body) {
           throw new Error("Brak strumienia danych z serwera.");
@@ -673,6 +900,11 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               if (evt.engine || evt.enginePreference) {
                 setStreamingEngine(evt.engine || evt.enginePreference);
               }
+            } else if (evt.type === "peer_reply" && evt.messageRecord) {
+              const peerMsg = evt.messageRecord as ChatMessageRecord;
+              setLocalMessages((prev) =>
+                prev.some((m) => m.id === peerMsg.id) ? prev : [...prev, peerMsg]
+              );
             } else if (evt.type === "done") {
               finalDonePayload = evt;
             } else if (evt.type === "error") {
@@ -681,8 +913,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           }
         }
 
-        setImageBase64(null);
-        setImagePreviewName("");
+        handleClearAttachment();
 
         const finalText = (
           finalDonePayload?.assistantMessageRecord?.content ??
@@ -705,16 +936,23 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             setMessageToolsMap((prev) => ({ ...prev, [asstId]: finalTools }));
           }
           setLocalMessages((prev) => {
-            const cleaned = finalDonePayload?.userMessageRecord
-              ? prev.map((m) =>
-                  m.id === optimisticUserMsg.id ? finalDonePayload.userMessageRecord : m
-                )
-              : prev;
+            const byId = new Map<number, ChatMessageRecord>();
+            for (const m of prev) {
+              if (m.id === optimisticUserMsg.id) {
+                const rep = finalDonePayload?.userMessageRecord || m;
+                byId.set(rep.id, rep);
+              } else {
+                byId.set(m.id, m);
+              }
+            }
+            if (finalDonePayload?.userMessageRecord) {
+              byId.set(finalDonePayload.userMessageRecord.id, finalDonePayload.userMessageRecord);
+            }
             const asstRecord: ChatMessageRecord = finalDonePayload?.assistantMessageRecord || {
               id: asstId,
               session_id: "bastilla-main",
               sender_role: "assistant",
-              agent_id: selectedAgent,
+              agent_id: selectedAgent === "council" ? "aria" : selectedAgent,
               engine_used:
                 finalDonePayload?.engineUsed || streamingEngine || enginePreference,
               content: finalText,
@@ -722,7 +960,16 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               artifact_code: finalDonePayload?.artifactCode,
               created_at: finalDonePayload?.createdAt || new Date().toISOString(),
             };
-            return [...cleaned, asstRecord];
+            byId.set(asstRecord.id, asstRecord);
+            const peerList: ChatMessageRecord[] = Array.isArray(finalDonePayload?.peerMessages)
+              ? finalDonePayload.peerMessages
+              : [];
+            for (const pm of peerList) {
+              if (pm && pm.id != null) {
+                byId.set(pm.id, pm);
+              }
+            }
+            return Array.from(byId.values());
           });
         }
         if (finalDonePayload?.artifactCode) {
@@ -752,6 +999,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     [
       imageBase64,
       imageMimeType,
+      imagePreviewName,
+      attachmentTextContext,
+      handleClearAttachment,
       selectedAgent,
       enginePreference,
       onRefresh,
@@ -834,8 +1084,9 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     }
   };
 
-  const handleSaveOllamaEndpoint = async (endpointOverride?: string) => {
+  const handleSaveOllamaEndpoint = async (endpointOverride?: string, defaultModelOverride?: string) => {
     const nextValue = (endpointOverride !== undefined ? endpointOverride : ollamaEndpointInput).trim();
+    const nextDefaultModel = (defaultModelOverride !== undefined ? defaultModelOverride : ollamaDefaultModelInput).trim() || "llama3.2-vision:11b";
     setSavingOllamaConfig(true);
     setErrorMsg(null);
     try {
@@ -843,26 +1094,28 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
         ok: boolean;
         state?: string;
         endpoint?: string;
+        default_model?: string;
         modelNames?: string[];
         message?: string;
         error?: string;
       }>("/api/ollama/config", {
         method: "POST",
-        body: JSON.stringify({ endpoint: nextValue }),
+        body: JSON.stringify({ endpoint: nextValue, defaultModel: nextDefaultModel }),
         timeoutMs: 10000,
       });
       if (data.endpoint) setOllamaEndpointInput(data.endpoint);
+      if (data.default_model) setOllamaDefaultModelInput(data.default_model);
       if (data.state === "READY" || data.state === "ONLINE") {
         setStatusNotice(
-          `Ollama ${data.state} (${data.endpoint}) · Modele: ${(data.modelNames || []).join(", ") || "brak"}`
+          `Ollama ${data.state} (${data.endpoint}) · Standardowy: ${data.default_model || nextDefaultModel} · Zainstalowane: ${(data.modelNames || []).join(", ") || "brak"}`
         );
         setShowOllamaConfig(false);
       } else {
-        setStatusNotice(data.message || `Zapisano adres Ollama: ${data.endpoint} (${data.state})`);
+        setStatusNotice(data.message || `Zapisano konfigurację Ollama: ${data.endpoint} (${data.state})`);
       }
       onRefresh();
     } catch (err: any) {
-      setErrorMsg(err?.message || "Nie udało się zapisać adresu Ollama.");
+      setErrorMsg(err?.message || "Nie udało się zapisać konfiguracji Ollama.");
     } finally {
       setSavingOllamaConfig(false);
     }
@@ -971,6 +1224,109 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
     }
   };
 
+  const handleToggleBidirectionalAuto = async () => {
+    setErrorMsg(null);
+    try {
+      const res = await apiFetchJson<{ ok: boolean; state?: { autoEnabled: boolean } }>(
+        "/api/chat/bidirectional/toggle",
+        {
+          method: "POST",
+          body: JSON.stringify({ autoEnabled: !bidirectionalAuto }),
+        }
+      );
+      if (res.ok && res.state) {
+        setBidirectionalAuto(res.state.autoEnabled);
+        setStatusNotice(
+          res.state.autoEnabled
+            ? "Włączono automatyczny czat obustronny (@wszyscy — agenci piszą do Operatora i między sobą)."
+            : "Wstrzymano automatyczny czat obustronny."
+        );
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Błąd przełączania czatu obustronnego.");
+    }
+  };
+
+  const handleTriggerBidirectionalChat = async (
+    mode: "to_operator" | "agent_to_agent" | "council_roundtable"
+  ) => {
+    setBidirectionalBusy(mode);
+    setErrorMsg(null);
+    try {
+      const initiator = selectedAgent !== "council" ? selectedAgent : undefined;
+      const res = await apiFetchJson<{
+        ok: boolean;
+        messages?: ChatMessageRecord[];
+        error?: string;
+      }>("/api/chat/bidirectional/trigger", {
+        method: "POST",
+        body: JSON.stringify({
+          mode,
+          initiator,
+          enginePreference,
+        }),
+        timeoutMs: 60000,
+      });
+      if (res.ok && Array.isArray(res.messages)) {
+        setLocalMessages((prev) => {
+          const next = [...prev];
+          for (const m of res.messages!) {
+            if (!next.some((existing) => existing.id === m.id)) {
+              next.push(m);
+            }
+          }
+          return next;
+        });
+        if (mode !== "to_operator") {
+          onSelectAgent("council");
+        }
+        setStatusNotice(
+          mode === "to_operator"
+            ? "Agent wysłał bezpośrednią wiadomość do Operatora."
+            : mode === "agent_to_agent"
+            ? "Agenci przeprowadzili rozmowę między sobą na kanale @wszyscy."
+            : "Wszyscy 4 agenci przeprowadzili wspólną naradę na kanale @wszyscy."
+        );
+        onRefresh();
+      } else if (!res.ok) {
+        setErrorMsg(res.error || "Nie udało się wywołać rozmowy obustronnej.");
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Błąd czatu obustronnego.");
+    } finally {
+      setBidirectionalBusy(null);
+    }
+  };
+
+  const handleAiChooseAvatars = async () => {
+    setSelectingAiAvatars(true);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetchJson<{
+        ok: boolean;
+        selections?: Array<{ agentId: string; label: string; avatarUrl: string }>;
+        error?: string;
+      }>("/api/agents/avatar/ai-select", {
+        method: "POST",
+        body: JSON.stringify({ announceInChat: true, enginePreference }),
+        timeoutMs: 60000,
+      });
+      if (res.ok) {
+        setStatusNotice(
+          "Agenci AI wybrali dla siebie nowe awatary z internetu i ogłosili swój wybór na kanale @wszyscy."
+        );
+        onSelectAgent("council");
+        onRefresh();
+      } else {
+        setErrorMsg(res.error || "Błąd wyboru awatarów AI.");
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message || "Błąd wyboru awatarów AI.");
+    } finally {
+      setSelectingAiAvatars(false);
+    }
+  };
+
   const ollamaState =
     overview?.ollama_status?.state ||
     overview?.ai_routing?.ollama_state ||
@@ -995,7 +1351,10 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             {(["aria", "alex", "astyria", "aurelius", "council"] as const).map((id) => {
               const info = AGENT_LABELS[id];
               const active = selectedAgent === id;
-              const count = localMessages.filter((m) => m.agent_id === id).length;
+              const count =
+                id === "council"
+                  ? localMessages.length
+                  : localMessages.filter((m) => m.agent_id === id).length;
               return (
                 <button
                   key={id}
@@ -1009,10 +1368,13 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                 >
                   {id !== "council" ? (
                     <img
-                      src={AGENT_AVATARS[id]}
+                      src={getAgentAvatarUrl(overview, id)}
                       alt={info.name}
                       referrerPolicy="no-referrer"
                       className="w-4 h-4 rounded object-cover shrink-0"
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).src = AGENT_AVATARS[id];
+                      }}
                     />
                   ) : (
                     <span className="w-4 h-4 rounded bg-violet-700/60 text-[9px] font-bold flex items-center justify-center text-violet-200">
@@ -1081,6 +1443,7 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
             <button
               type="button"
               onClick={() => setIsFullscreen((v) => !v)}
+              title={isFullscreen ? "Wyłącz pełny ekran" : "Włącz pełny ekran"}
               aria-label={isFullscreen ? "Wyłącz pełny ekran" : "Włącz pełny ekran"}
               className="min-h-9 sm:min-h-7 px-2.5 rounded-md bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-semibold flex items-center gap-1 whitespace-nowrap"
             >
@@ -1115,7 +1478,16 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               onChange={(e) => setEnginePreference(e.target.value as OllamaEngineChoice)}
               className="min-h-8 sm:min-h-6 px-2 rounded bg-[#07090e] border border-violet-500/50 text-[11px] font-mono-tabular text-white focus:outline-none focus:border-violet-400 max-w-[220px] sm:max-w-none"
             >
-              <option value="auto">Auto (Ollama → Gemini)</option>
+              <option value="auto">
+                Auto ({overview?.ai_routing?.default_model || "llama3.2-vision:11b"} → Ollama → Gemini)
+              </option>
+              {!(overview?.ai_routing.available_models || []).includes(
+                overview?.ai_routing?.default_model || "llama3.2-vision:11b"
+              ) && (
+                <option value={overview?.ai_routing?.default_model || "llama3.2-vision:11b"}>
+                  Ollama (Standardowy): {overview?.ai_routing?.default_model || "llama3.2-vision:11b"}
+                </option>
+              )}
               {(overview?.ai_routing.available_models || []).map((model) => (
                 <option key={model} value={model}>
                   Ollama: {model}
@@ -1168,6 +1540,17 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           </div>
 
           <div className="flex items-center gap-1.5">
+            <label className="relative flex items-center">
+              <Search className="w-3 h-3 text-slate-400 absolute left-2 pointer-events-none" />
+              <input
+                type="search"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Szukaj w rozmowach..."
+                aria-label="Szukaj w historii rozmów"
+                className="min-h-8 sm:min-h-6 w-32 sm:w-44 pl-6 pr-2 rounded bg-[#07090e] border border-slate-800 focus:border-violet-500 text-[11px] text-white placeholder-slate-500 focus:outline-none"
+              />
+            </label>
             <button
               type="button"
               onClick={() => setFilterByAgent((v) => !v)}
@@ -1197,6 +1580,74 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
           </div>
         </div>
 
+        {/* Row 2B: Two-Way Chat (@wszyscy) & AI Internet Avatars Bar */}
+        <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/60 overflow-x-auto no-scrollbar">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span className="text-[10px] font-mono-tabular text-violet-300 font-semibold shrink-0">
+              Czat Obustronny (@wszyscy):
+            </span>
+            <button
+              type="button"
+              onClick={handleToggleBidirectionalAuto}
+              className={`min-h-7 sm:min-h-6 px-2 rounded border text-[10px] font-mono-tabular font-semibold transition-colors whitespace-nowrap ${
+                bidirectionalAuto
+                  ? "bg-emerald-600/30 border-emerald-500 text-emerald-200"
+                  : "bg-[#111723] border-slate-700 text-slate-300 hover:border-violet-500"
+              }`}
+              title="Włącz/wyłącz automatyczne wiadomości od agentów do Operatora i między sobą"
+            >
+              Auto-Czat: {bidirectionalAuto ? "WŁ" : "WYŁ"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleTriggerBidirectionalChat("to_operator")}
+              disabled={Boolean(bidirectionalBusy)}
+              className="min-h-7 sm:min-h-6 px-2 rounded bg-violet-950/60 hover:bg-violet-900/70 disabled:opacity-50 border border-violet-700/60 text-violet-200 text-[10px] font-mono-tabular whitespace-nowrap"
+              title="Niech wybrany agent napisze z własnej inicjatywy do Ciebie (@Operator)"
+            >
+              {bidirectionalBusy === "to_operator"
+                ? "Pisze do Ciebie..."
+                : "Napisz do mnie (Agent → Operator)"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleTriggerBidirectionalChat("agent_to_agent")}
+              disabled={Boolean(bidirectionalBusy)}
+              className="min-h-7 sm:min-h-6 px-2 rounded bg-cyan-950/60 hover:bg-cyan-900/70 disabled:opacity-50 border border-cyan-700/60 text-cyan-200 text-[10px] font-mono-tabular whitespace-nowrap"
+              title="Wywołaj bezpośrednią wymianę zdań między dwoma agentami na kanale @wszyscy"
+            >
+              {bidirectionalBusy === "agent_to_agent"
+                ? "Rozmowa agentów..."
+                : "Rozmowa między agentami (@wszyscy)"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleTriggerBidirectionalChat("council_roundtable")}
+              disabled={Boolean(bidirectionalBusy)}
+              className="min-h-7 sm:min-h-6 px-2 rounded bg-emerald-950/60 hover:bg-emerald-900/70 disabled:opacity-50 border border-emerald-700/60 text-emerald-200 text-[10px] font-mono-tabular whitespace-nowrap"
+              title="Narada wszystkich 4 agentów (Aria, Alex, Astyria, Aurelius) na kanale @wszyscy"
+            >
+              {bidirectionalBusy === "council_roundtable"
+                ? "Narada 4X..."
+                : "Narada 4 Agentów (@wszyscy)"}
+            </button>
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => void handleAiChooseAvatars()}
+              disabled={selectingAiAvatars}
+              className="min-h-7 sm:min-h-6 px-2.5 rounded bg-violet-600/80 hover:bg-violet-500 disabled:opacity-50 text-white text-[10px] font-semibold whitespace-nowrap"
+              title="Niech każdy z 4 agentów AI wybierze dla siebie nowy awatar z internetu"
+            >
+              {selectingAiAvatars
+                ? "AI wybiera awatary..."
+                : "AI: Wybierz avatary z internetu"}
+            </button>
+          </div>
+        </div>
+
         {/* Row 3 (Collapsible): Live OLLAMA_BASE_URL Endpoint Configuration */}
         {showOllamaConfig && (
           <div className="pt-1.5 border-t border-slate-800/70 space-y-1 text-[11px]">
@@ -1212,6 +1663,14 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                 placeholder="http://127.0.0.1:11434 lub https://twoja-ollama.trycloudflare.com"
                 className="flex-1 min-h-8 sm:min-h-7 px-2.5 rounded bg-[#07090e] border border-slate-700 text-white font-mono-tabular text-xs focus:outline-none focus:border-violet-500"
               />
+              <input
+                type="text"
+                aria-label="Standardowy model Ollama"
+                value={ollamaDefaultModelInput}
+                onChange={(e) => setOllamaDefaultModelInput(e.target.value)}
+                placeholder="llama3.2-vision:11b"
+                className="sm:w-52 min-h-8 sm:min-h-7 px-2.5 rounded bg-[#07090e] border border-violet-600/60 text-white font-mono-tabular text-xs focus:outline-none focus:border-violet-400"
+              />
               <div className="flex items-center gap-1.5 shrink-0">
                 <button
                   type="button"
@@ -1223,11 +1682,19 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => void handleSaveOllamaEndpoint("")}
+                  onClick={() => void handleSaveOllamaEndpoint("", "llama2-uncensored:latest")}
+                  disabled={savingOllamaConfig}
+                  className="min-h-8 sm:min-h-7 px-2.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-cyan-300"
+                >
+                  llama2-uncensored
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSaveOllamaEndpoint("", "llama3.2-vision:11b")}
                   disabled={savingOllamaConfig}
                   className="min-h-8 sm:min-h-7 px-2.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300"
                 >
-                  Domyślny
+                  Domyślny (11B Vision)
                 </button>
                 <button
                   type="button"
@@ -1392,15 +1859,26 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
                   <div className="flex items-center justify-between gap-2 text-[11px] text-slate-400 mb-1.5 font-mono-tabular">
                     <div className="flex items-center gap-2 truncate">
                       {msg.sender_role === "user" ? (
-                        <div className="w-5 h-5 rounded bg-violet-600 text-white font-bold flex items-center justify-center text-[10px] shrink-0">
-                          M
-                        </div>
+                        <img
+                          src={getOperatorAvatarUrl(overview)}
+                          alt="Operator Mateusz Mitek"
+                          referrerPolicy="no-referrer"
+                          className="w-6 h-6 rounded-md object-cover shrink-0 border border-violet-400/70"
+                          onError={(e) => {
+                            (e.currentTarget as HTMLImageElement).src = OPERATOR_AVATAR;
+                          }}
+                        />
                       ) : (
                         <img
-                          src={AGENT_AVATARS[msg.agent_id as AgentId] || AGENT_AVATARS.aria}
+                          src={getAgentAvatarUrl(overview, msg.agent_id)}
                           alt={msg.agent_id}
                           referrerPolicy="no-referrer"
-                          className="w-5 h-5 rounded object-cover shrink-0 border border-violet-500/50"
+                          className="w-6 h-6 rounded-md object-cover shrink-0 border border-violet-500/50"
+                          onError={(e) => {
+                            const fallback =
+                              AGENT_AVATARS[msg.agent_id as AgentId] || AGENT_AVATARS.aria;
+                            (e.currentTarget as HTMLImageElement).src = fallback;
+                          }}
                         />
                       )}
                       <span className="font-semibold text-slate-200">
@@ -1560,11 +2038,11 @@ export const ChatWorkView: React.FC<ChatWorkViewProps> = ({
               if (prefill) setImagePromptInput(prefill);
               setShowImageGenPanel(true);
             }}
+            onCaptureDesktopScreenshot={() => void handleCaptureDesktopScreenshot()}
             imagePreviewName={imagePreviewName}
-            onClearImage={() => {
-              setImageBase64(null);
-              setImagePreviewName("");
-            }}
+            attachmentKind={attachmentKind}
+            attachmentPreviewUrl={attachmentPreviewUrl}
+            onClearImage={handleClearAttachment}
             sending={sending}
             generatingImage={generatingImage}
             selectedAgentName={AGENT_LABELS[selectedAgent].name}

@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { existsSync, openSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -67,11 +67,15 @@ export function pickPreferredOllamaModel(
 ): string | null {
   if (!models || models.length === 0) return null;
   if (options.multimodal) {
+    const llamaVision = models.find((m) => m.multimodal && /llama3\.2-vision/i.test(m.name));
+    if (llamaVision) return llamaVision.name;
     const mm = models.find((m) => m.multimodal);
     if (mm) return mm.name;
   }
   const qwenChat = models.find((m) => /qwen/i.test(m.name) && (!options.multimodal || m.multimodal));
   if (qwenChat) return qwenChat.name;
+  const llamaVisionFallback = models.find((m) => /llama3\.2-vision/i.test(m.name));
+  if (llamaVisionFallback) return llamaVisionFallback.name;
   const uncensored = models.find((m) => m.uncensored);
   if (uncensored) return uncensored.name;
   return models[0].name;
@@ -144,7 +148,7 @@ export async function pullOllamaModelSafe(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: cleanModel, stream: false }),
-      signal: AbortSignal.timeout(120000),
+      signal: AbortSignal.timeout(600000),
     });
     const text = await res.text();
     let parsed: any = {};
@@ -203,7 +207,15 @@ async function detectOllamaBinary(): Promise<{
     try {
       const stat = statSync(binaryPath);
       if (stat.isFile()) {
-        const head = readFileSync(binaryPath, { encoding: "utf8" }).slice(0, 256);
+        const fd = openSync(binaryPath, "r");
+        const buf = Buffer.alloc(256);
+        let bytesRead = 0;
+        try {
+          bytesRead = readSync(fd, buf, 0, 256, 0);
+        } finally {
+          closeSync(fd);
+        }
+        const head = buf.subarray(0, bytesRead).toString("utf8");
         if (head.startsWith("#!") && head.includes("python")) {
           binaryType = "python-http-wrapper";
         } else {
@@ -217,7 +229,7 @@ async function detectOllamaBinary(): Promise<{
 
   let daemonPid: number | null = null;
   try {
-    const { stdout } = await execFileAsync("pgrep", ["-f", "ollama serve"], { timeout: 1500 });
+    const { stdout } = await execFileAsync("pgrep", ["-f", "(^|/)ollama serve"], { timeout: 1500 });
     const pid = parseInt(stdout.trim().split(/\s+/)[0] || "", 10);
     if (!Number.isNaN(pid) && pid > 0) daemonPid = pid;
   } catch {}
@@ -311,7 +323,7 @@ export async function probeOllamaStatus(ollamaBaseUrl: string): Promise<OllamaSt
         parameterSize: String(m.details?.parameter_size || ""),
         family: String(m.details?.family || ""),
         modifiedAt: String(m.modified_at || ""),
-        multimodal: /vision|llava|vl|minicpm-v|qwen2\.5vl|qwen3\.5|bakllava/i.test(lower),
+        multimodal: /vision|llava|vl|minicpm-v|qwen2\.5vl|qwen3\.5|bakllava|moondream/i.test(lower),
         uncensored: /uncensored|abliterated|dolphin|hermes/i.test(lower),
       };
     });
@@ -400,14 +412,33 @@ export async function startOllamaDaemon(ollamaBaseUrl: string): Promise<{
 
   try {
     const logFd = openSync("/tmp/bastilla-ollama.log", "a");
+    let hostEnv = "127.0.0.1:11434";
+    try {
+      const parsed = new URL(ollamaBaseUrl);
+      if (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "0.0.0.0") {
+        hostEnv = `${parsed.hostname}:${parsed.port || "11434"}`;
+      }
+    } catch {}
     const child = spawn(before.binaryPath, ["serve"], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        OLLAMA_HOST: process.env.OLLAMA_HOST || hostEnv,
+        OLLAMA_MODELS: process.env.OLLAMA_MODELS || "/root/.ollama/models",
+        OLLAMA_KEEP_ALIVE: process.env.OLLAMA_KEEP_ALIVE || "10m",
+        OLLAMA_MAX_LOADED_MODELS: process.env.OLLAMA_MAX_LOADED_MODELS || "1",
+        OLLAMA_NUM_PARALLEL: process.env.OLLAMA_NUM_PARALLEL || "1",
+        OLLAMA_CONTEXT_LENGTH: process.env.OLLAMA_CONTEXT_LENGTH || "1024",
+        HOME: process.env.HOME || "/root",
+      },
     });
     child.unref();
+    try {
+      closeSync(logFd);
+    } catch {}
 
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 15; i++) {
       await new Promise((r) => setTimeout(r, 400));
       const check = await probeOllamaStatus(ollamaBaseUrl);
       if (check.reachable) {
@@ -449,13 +480,15 @@ export async function streamOllamaChat(options: {
       const payload: Record<string, any> = {
         model: options.model,
         stream: true,
+        keep_alive: "10m",
+        options: { num_ctx: 1024 },
         messages: conversation,
       };
       if (options.tools?.length) {
         payload.tools = options.tools;
       }
 
-      const res = await fetch(`${endpoint}/api/chat`, {
+      let res = await fetch(`${endpoint}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -464,7 +497,22 @@ export async function streamOllamaChat(options: {
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        throw new Error(`Ollama HTTP ${res.status}: ${errText.slice(0, 200) || res.statusText}`);
+        if (res.status === 400 && payload.tools && /does not support tools|tool/i.test(errText)) {
+          const retryPayload = { ...payload };
+          delete retryPayload.tools;
+          res = await fetch(`${endpoint}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(retryPayload),
+            signal: options.signal,
+          });
+          if (!res.ok) {
+            const retryErrText = await res.text().catch(() => "");
+            throw new Error(`Ollama HTTP ${res.status}: ${retryErrText.slice(0, 200) || res.statusText}`);
+          }
+        } else {
+          throw new Error(`Ollama HTTP ${res.status}: ${errText.slice(0, 200) || res.statusText}`);
+        }
       }
 
       const contentType = (res.headers.get("content-type") || "").toLowerCase();

@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import type { AgentId, SystemOverviewResponse } from "../types/bastilla";
-import { AGENT_AVATARS } from "./BastillaDesktopView";
+import { AGENT_AVATARS, getAgentAvatarUrl } from "./BastillaDesktopView";
 import {
   RotateCcw,
   Send,
@@ -168,10 +168,13 @@ export const AgentsMemoryView: React.FC<AgentsMemoryViewProps> = ({
                 <div>
                   <div className="flex items-center gap-3 mb-3">
                     <img
-                      src={AGENT_AVATARS[agentId]}
+                      src={getAgentAvatarUrl(overview, agentId)}
                       alt={agentId}
                       referrerPolicy="no-referrer"
                       className="w-11 h-11 rounded-lg object-cover border border-slate-700 shrink-0"
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).src = AGENT_AVATARS[agentId];
+                      }}
                     />
                     <div className="min-w-0">
                       <div className="font-display font-bold text-base text-white capitalize">

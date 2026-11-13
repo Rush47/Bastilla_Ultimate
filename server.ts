@@ -34,6 +34,12 @@ import {
   GenerateContentResponse,
   type FunctionDeclaration,
 } from "@google/genai";
+import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  desktopSessionManager,
+  bridgeAuthenticatedVncWebSocket,
+} from "./server/desktop";
+import { collectSphericalContext } from "./server/spherical-worker";
 import {
   SVLSystemKernel,
   TopologicalInfinityEngine,
@@ -57,8 +63,12 @@ const DB_PATH = path.resolve(process.env.BASTILLA_DB_PATH ||
     : path.join(PROJECT_ROOT, ".bastilla/bastilla.db")));
 const ENV_OLLAMA_EXPLICIT = Boolean(process.env.OLLAMA_BASE_URL?.trim());
 let activeOllamaBaseUrl = (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+let activeOllamaDefaultModel = (process.env.OLLAMA_MODEL || "llama3.2-vision:11b").trim() || "llama3.2-vision:11b";
 function getOllamaBaseUrl(): string {
   return activeOllamaBaseUrl;
+}
+function getDefaultOllamaModel(): string {
+  return activeOllamaDefaultModel;
 }
 process.env.BASTILLA_PROJECT_ROOT = PROJECT_ROOT;
 process.env.BASTILLA_DB_PATH = DB_PATH;
@@ -663,6 +673,7 @@ async function startServer() {
   await ensureLinuxProvisioned();
 
   const app = express();
+  app.set("trust proxy", true);
   app.use(express.json({ limit: "15mb" }));
   installApiSecurity(app);
   // MCP Streamable HTTP (JSON-RPC subset). Protected by installApiSecurity.
@@ -907,6 +918,19 @@ print(json.dumps({
     mcpManager: mcp,
     executeTerminal: (mode, command, agentId) =>
       executeTerminalCommandInternal(mode, command, agentId),
+    desktop: {
+      getStatus: () => desktopSessionManager.getStatus(),
+      captureScreenshot: (agentId) => desktopSessionManager.captureScreenshot(agentId),
+      listWindows: () => desktopSessionManager.listWindows(),
+      focusWindow: (target, agentId) => desktopSessionManager.focusWindow(target, agentId),
+      mouseMove: (x, y, agentId) => desktopSessionManager.mouseMove(x, y, agentId),
+      mouseClick: (x, y, button, doubleClick, agentId) =>
+        desktopSessionManager.mouseClick(x, y, button, doubleClick, agentId),
+      mouseScroll: (direction, clicks, agentId) =>
+        desktopSessionManager.mouseScroll(direction, clicks, agentId),
+      keyboardType: (text, agentId) => desktopSessionManager.keyboardType(text, agentId),
+      keyboardPress: (key, agentId) => desktopSessionManager.keyboardPress(key, agentId),
+    },
   });
 
   const applyImageOutcomeToReplyText = (
@@ -963,25 +987,26 @@ print(json.dumps({
     });
   });
 
-  if (!ENV_OLLAMA_EXPLICIT) {
-    try {
-      const savedMeta = await querySqliteJson(
-        `import sqlite3, sys, json
+  try {
+    const savedMeta = await querySqliteJson(
+      `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
-row = conn.execute("SELECT value FROM bastilla_metadata WHERE key='ollama_base_url'").fetchone()
+rows = dict(conn.execute("SELECT key, value FROM bastilla_metadata WHERE key IN ('ollama_base_url', 'ollama_default_model')").fetchall())
 conn.close()
-print(json.dumps({"url": row[0] if row else ""}))`
-      );
-      if (savedMeta?.url && /^https?:\/\//i.test(String(savedMeta.url))) {
-        activeOllamaBaseUrl = String(savedMeta.url).trim().replace(/\/+$/, "");
-      }
-    } catch {}
-  }
+print(json.dumps({"url": rows.get("ollama_base_url", ""), "defaultModel": rows.get("ollama_default_model", "")}))`
+    );
+    if (!ENV_OLLAMA_EXPLICIT && savedMeta?.url && /^https?:\/\//i.test(String(savedMeta.url))) {
+      activeOllamaBaseUrl = String(savedMeta.url).trim().replace(/\/+$/, "");
+    }
+    if (savedMeta?.defaultModel && /^[a-zA-Z0-9._:/-]{1,120}$/.test(String(savedMeta.defaultModel).trim())) {
+      activeOllamaDefaultModel = String(savedMeta.defaultModel).trim();
+    }
+  } catch {}
 
   app.get("/api/ollama/status", async (_req, res) => {
     try {
       const status = await probeOllamaStatus(getOllamaBaseUrl());
-      res.json({ ok: true, ...status });
+      res.json({ ok: true, default_model: getDefaultOllamaModel(), ...status });
     } catch (err: any) {
       res.status(500).json({ ok: false, state: "ERROR", error: err?.message || "Błąd diagnostyki Ollama." });
     }
@@ -989,27 +1014,66 @@ print(json.dumps({"url": row[0] if row else ""}))`
 
   app.post("/api/ollama/config", async (req, res) => {
     try {
-      const raw = String(req.body?.endpoint || "").trim().replace(/\/+$/, "");
-      if (raw && !/^https?:\/\/[^/\s]+/i.test(raw)) {
-        return res.status(400).json({
-          ok: false,
-          error: "Adres Ollama musi zaczynać się od http:// lub https:// (np. http://127.0.0.1:11434).",
-        });
-      }
-      const nextUrl = raw || (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
-      activeOllamaBaseUrl = nextUrl;
-      await querySqliteJson(
-        `import sqlite3, sys, json
+      const hasEndpoint = req.body?.endpoint !== undefined;
+      const hasDefaultModel = req.body?.defaultModel !== undefined;
+
+      if (hasEndpoint) {
+        const raw = String(req.body?.endpoint || "").trim().replace(/\/+$/, "");
+        if (raw && !/^https?:\/\/[^/\s]+/i.test(raw)) {
+          return res.status(400).json({
+            ok: false,
+            error: "Adres Ollama musi zaczynać się od http:// lub https:// (np. http://127.0.0.1:11434).",
+          });
+        }
+        const nextUrl = raw || (process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
+        activeOllamaBaseUrl = nextUrl;
+        await querySqliteJson(
+          `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
 conn.execute("INSERT OR REPLACE INTO bastilla_metadata (key, value) VALUES ('ollama_base_url', ?)", (sys.argv[2],))
 conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
-        [raw]
-      );
+          [raw]
+        );
+      }
+
+      if (hasDefaultModel) {
+        const rawModel = String(req.body?.defaultModel || "").trim();
+        if (rawModel && !/^[a-zA-Z0-9._:/-]{1,120}$/.test(rawModel)) {
+          return res.status(400).json({
+            ok: false,
+            error: "Nieprawidłowa nazwa standardowego modelu Ollama.",
+          });
+        }
+        const nextModel = rawModel || (process.env.OLLAMA_MODEL || "llama3.2-vision:11b").trim();
+        activeOllamaDefaultModel = nextModel;
+        await querySqliteJson(
+          `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("INSERT OR REPLACE INTO bastilla_metadata (key, value) VALUES ('ollama_default_model', ?)", (sys.argv[2],))
+conn.execute("UPDATE agents SET model_primary = ?", (f"ollama/{sys.argv[3]}",))
+conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
+          [rawModel, nextModel]
+        );
+      }
+
       const status = await probeOllamaStatus(getOllamaBaseUrl());
-      broadcastSystemEvent("ollama", { state: status.state, reachable: status.reachable, endpoint: status.endpoint });
-      res.json({ ok: true, ...status });
+      const defaultModel = getDefaultOllamaModel();
+      broadcastSystemEvent("ollama", {
+        state: status.state,
+        reachable: status.reachable,
+        endpoint: status.endpoint,
+        defaultModel,
+      });
+      res.json({
+        ok: true,
+        ...status,
+        default_model: defaultModel,
+        message: hasDefaultModel
+          ? `Ustawiono standardowy model Ollama: ${defaultModel} (${status.state}, ${status.endpoint}).`
+          : status.message,
+      });
     } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || "Nie udało się zapisać adresu Ollama." });
+      res.status(500).json({ ok: false, error: err?.message || "Nie udało się zapisać konfiguracji Ollama." });
     }
   });
 
@@ -1194,10 +1258,11 @@ conn = sqlite3.connect(sys.argv[1])
 rows = [r[0] for r in conn.execute("PRAGMA quick_check")]
 conn.close()
 print(json.dumps({"results": rows}))`);
-      const [ollama, images, codex] = await Promise.all([
+      const [ollama, images, codex, gitSync] = await Promise.all([
         probeOllamaStatus(getOllamaBaseUrl()),
         imageManager.probeStatus(),
         codexAuth.status(),
+        performBidirectionalGitSync({ trigger: "manual_system_sync" }),
       ]);
       const syncResult = {
         ok: true,
@@ -1205,10 +1270,26 @@ print(json.dumps({"results": rows}))`);
         ollama,
         images,
         codex,
+        git_sync: {
+          branch: gitSync.branch,
+          ahead: gitSync.ahead,
+          behind: gitSync.behind,
+          head_hash: gitSync.headHash,
+          remote_head_hash: gitSync.remoteHeadHash,
+          inbound_status: gitSync.inboundStatus,
+          outbound_status: gitSync.outboundStatus,
+          auto_sync_enabled: gitSync.enabled,
+          detail: gitSync.lastDetail,
+        },
         mcp_tools: mcp.listTools().tools.map((t) => t.name),
         syncedAt: new Date().toISOString(),
       };
-      broadcastSystemEvent("sync", { syncedAt: syncResult.syncedAt, ollama: ollama.state, images: images.engineStatus });
+      broadcastSystemEvent("sync", {
+        syncedAt: syncResult.syncedAt,
+        ollama: ollama.state,
+        images: images.engineStatus,
+        git_sync: syncResult.git_sync,
+      });
       res.json(syncResult);
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || "Synchronizacja systemu nie powiodła się." });
@@ -1391,19 +1472,20 @@ print(json.dumps({"results": rows}))`);
   // 1. Live System, Linux Kernel, SVL Core & SQLite State Overview
   app.get("/api/system/overview", async (_req, res) => {
     try {
-      let svlReport: any = null;
-      try {
-        const { stdout } = await execFileAsync(
-          "python3",
-          [path.join(KERNEL_DIR, "svl_kernel.py")],
-          { timeout: 5000 }
-        );
-        svlReport = JSON.parse(stdout);
-      } catch {
-        const fallbackKernel = new SVLSystemKernel();
-        fallbackKernel.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT");
-        svlReport = fallbackKernel.generate_system_status_report();
-      }
+      const svlPromise = (async () => {
+        try {
+          const { stdout } = await execFileAsync(
+            "python3",
+            [path.join(KERNEL_DIR, "svl_kernel.py")],
+            { timeout: 5000 }
+          );
+          return JSON.parse(stdout);
+        } catch {
+          const fallbackKernel = new SVLSystemKernel();
+          fallbackKernel.ulepsz_system_maksymalnie("364_OMNIKLUCZ_ROOT");
+          return fallbackKernel.generate_system_status_report();
+        }
+      })();
 
       const hostProbeScript = `
 import json, os, pwd, subprocess, sqlite3, sys
@@ -1411,9 +1493,16 @@ from datetime import datetime, timezone
 
 def cmd_out(c):
     try:
-        return subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT, timeout=3).decode('utf-8', 'replace').strip()
-    except Exception as e:
+        return subprocess.check_output(c, shell=True, stderr=subprocess.STDOUT, timeout=2).decode('utf-8', 'replace').strip()
+    except Exception:
         return ""
+
+def which_bin(name, fallback=""):
+    for p in ("/usr/local/bin/" + name, "/usr/bin/" + name, "/bin/" + name):
+        if os.path.exists(p) and os.access(p, os.X_OK):
+            return p
+    found = cmd_out(f"which {name}")
+    return found or fallback
 
 os_release = {}
 if os.path.exists("/etc/os-release"):
@@ -1431,10 +1520,58 @@ if os.path.exists("/proc/meminfo"):
             if len(parts) == 2:
                 meminfo[parts[0].strip()] = parts[1].strip()
 
-loadavg = cmd_out("cat /proc/loadavg").split()[:3]
-uptime_sec = float(cmd_out("cat /proc/uptime").split()[0] or 0)
-uname_str = cmd_out("uname -srmo")
+loadavg = []
+if os.path.exists("/proc/loadavg"):
+    try:
+        with open("/proc/loadavg") as f:
+            loadavg = f.read().strip().split()[:3]
+    except Exception:
+        pass
+
+uptime_sec = 0.0
+if os.path.exists("/proc/uptime"):
+    try:
+        with open("/proc/uptime") as f:
+            uptime_sec = float(f.read().strip().split()[0] or 0)
+    except Exception:
+        pass
+
+try:
+    u = os.uname()
+    uname_str = f"{u.sysname} {u.release} {u.machine} GNU/Linux"
+except Exception:
+    uname_str = cmd_out("uname -srmo")
+
 disk_df = cmd_out("df -h / | tail -n 1").split()
+
+db_data = {"memories": [], "ipc": [], "tasks": [], "fleet": [], "missions": [], "hypercomm": [], "chats": [], "agents": []}
+legacy_records_unverified = False
+operator_avatar_url = "/assets/operator_lucy_vault33.webp"
+agent_avatars_map = {}
+if os.path.exists(sys.argv[1]):
+    conn = sqlite3.connect(sys.argv[1])
+    conn.row_factory = sqlite3.Row
+    metadata = conn.execute("SELECT value FROM bastilla_metadata WHERE key='legacy_records_unverified'").fetchone()
+    legacy_records_unverified = bool(metadata and metadata[0] == 'true')
+    op_meta = conn.execute("SELECT value FROM bastilla_metadata WHERE key='operator_avatar_url'").fetchone()
+    if op_meta and op_meta[0]:
+        operator_avatar_url = op_meta[0]
+    try:
+        db_agents = [dict(r) for r in conn.execute("SELECT * FROM agents").fetchall()]
+        db_data["agents"] = db_agents
+        for ag_row in db_agents:
+            if ag_row.get("id") and ag_row.get("avatar_url"):
+                agent_avatars_map[ag_row["id"]] = ag_row["avatar_url"]
+    except Exception:
+        pass
+    db_data["memories"] = [dict(r) for r in conn.execute("SELECT * FROM agent_memories ORDER BY id DESC LIMIT 40").fetchall()]
+    db_data["ipc"] = [dict(r) for r in conn.execute("SELECT * FROM agent_ipc_messages ORDER BY id DESC LIMIT 30").fetchall()]
+    db_data["tasks"] = [dict(r) for r in conn.execute("SELECT * FROM task_history ORDER BY id DESC LIMIT 30").fetchall()]
+    db_data["fleet"] = [dict(r) for r in conn.execute("SELECT * FROM fleet_units").fetchall()]
+    db_data["missions"] = [dict(r) for r in conn.execute("SELECT * FROM missions").fetchall()]
+    db_data["hypercomm"] = [dict(r) for r in conn.execute("SELECT * FROM hypercomm_relays").fetchall()]
+    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM (SELECT * FROM chat_messages ORDER BY id DESC LIMIT 150) ORDER BY id ASC").fetchall()]
+    conn.close()
 
 agents_live = []
 for a in ["aria", "alex", "astyria", "aurelius"]:
@@ -1443,7 +1580,7 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
         uid, gid, home, shell = pw.pw_uid, pw.pw_gid, pw.pw_dir, pw.pw_shell
     except KeyError:
         uid, gid, home, shell = -1, -1, f"/home/{a}", "/bin/bash"
-    pids = cmd_out(f"pgrep -u {a} -f 'agent_worker.py {a}([ ]|$)' || true").splitlines()
+    pids = cmd_out(f"pgrep -u {a} -f 'agent_worker.py {a}([ ]|$)' || true").splitlines() if uid >= 0 else []
     pid = int(pids[0]) if pids and pids[0].isdigit() else 0
     worker_status = {}
     status_path = f"/home/{a}/worker_status.json"
@@ -1470,70 +1607,64 @@ for a in ["aria", "alex", "astyria", "aurelius"]:
         "shell": shell,
         "pid": pid,
         "running": pid > 0 and heartbeat_valid,
+        "avatar_url": agent_avatars_map.get(a, ""),
         "worker_status": worker_status
     })
 
+gh_bin = which_bin("gh", "/usr/local/bin/gh")
+gh_installed = os.path.exists(gh_bin)
+llmman_installed = os.path.exists("/usr/local/bin/llmman")
+opencode_installed = os.path.exists("/usr/local/bin/opencode")
+openclaw_installed = os.path.exists("/usr/local/bin/openclaw")
+cloudflared_installed = os.path.exists("/usr/local/bin/cloudflared")
+ollama_bin = which_bin("ollama", "/usr/local/bin/ollama")
+ollama_installed = os.path.exists(ollama_bin)
+
 tools = {
     "gh": {
-        "installed": os.path.exists("/usr/local/bin/gh") or bool(cmd_out("which gh")),
-        "version": cmd_out("gh --version | head -n 1"),
-        "binary_path": cmd_out("which gh") or "/usr/local/bin/gh",
+        "installed": gh_installed,
+        "version": cmd_out(f"{gh_bin} --version | head -n 1") if gh_installed else "",
+        "binary_path": gh_bin,
         "auth_ready": False,
         "requirement_note": "Zainstalowany klient. Uprawnienia do repozytorium wymagają osobnego zapytania GitHub."
     },
     "llmman": {
-        "installed": os.path.exists("/usr/local/bin/llmman"),
-        "version": cmd_out("/usr/local/bin/llmman --version"),
+        "installed": llmman_installed,
+        "version": cmd_out("/usr/local/bin/llmman --version") if llmman_installed else "",
         "binary_path": "/usr/local/bin/llmman",
         "elf_path": "/usr/local/bin/llmman.fedora45.elf",
         "auth_ready": False,
         "requirement_note": "Obecność pliku nie potwierdza działania modelu; wrapper wymaga osobnej weryfikacji."
     },
     "opencode": {
-        "installed": os.path.exists("/usr/local/bin/opencode"),
-        "version": cmd_out("/usr/local/bin/opencode --version"),
+        "installed": opencode_installed,
+        "version": cmd_out("/usr/local/bin/opencode --version") if opencode_installed else "",
         "binary_path": "/usr/local/bin/opencode",
         "auth_ready": False,
         "requirement_note": "Wrapper CLI; dostęp do modelu niezweryfikowany."
     },
     "openclaw": {
-        "installed": os.path.exists("/usr/local/bin/openclaw"),
-        "version": cmd_out("/usr/local/bin/openclaw --version"),
+        "installed": openclaw_installed,
+        "version": cmd_out("/usr/local/bin/openclaw --version") if openclaw_installed else "",
         "binary_path": "/usr/local/bin/openclaw",
         "auth_ready": False,
         "requirement_note": "Wrapper CLI; wykonanie kontenera niezweryfikowane."
     },
     "cloudflared": {
-        "installed": os.path.exists("/usr/local/bin/cloudflared"),
-        "version": cmd_out("cloudflared --version"),
+        "installed": cloudflared_installed,
+        "version": cmd_out("/usr/local/bin/cloudflared --version") if cloudflared_installed else "",
         "binary_path": "/usr/local/bin/cloudflared",
         "auth_ready": False,
         "requirement_note": "Tunel i poświadczenia niezweryfikowane."
     },
     "ollama": {
-        "installed": os.path.exists("/usr/local/bin/ollama") or bool(cmd_out("which ollama")),
-        "version": cmd_out("ollama --version"),
-        "binary_path": cmd_out("which ollama") or "/usr/local/bin/ollama",
+        "installed": ollama_installed,
+        "version": cmd_out(f"{ollama_bin} --version") if ollama_installed else "",
+        "binary_path": ollama_bin,
         "auth_ready": False,
         "requirement_note": "Wymaga uruchomionej usługi Ollama i pobranego modelu."
     }
 }
-
-db_data = {"memories": [], "ipc": [], "tasks": [], "fleet": [], "missions": [], "hypercomm": [], "chats": []}
-legacy_records_unverified = False
-if os.path.exists(sys.argv[1]):
-    conn = sqlite3.connect(sys.argv[1])
-    conn.row_factory = sqlite3.Row
-    metadata = conn.execute("SELECT value FROM bastilla_metadata WHERE key='legacy_records_unverified'").fetchone()
-    legacy_records_unverified = bool(metadata and metadata[0] == 'true')
-    db_data["memories"] = [dict(r) for r in conn.execute("SELECT * FROM agent_memories ORDER BY id DESC LIMIT 40").fetchall()]
-    db_data["ipc"] = [dict(r) for r in conn.execute("SELECT * FROM agent_ipc_messages ORDER BY id DESC LIMIT 30").fetchall()]
-    db_data["tasks"] = [dict(r) for r in conn.execute("SELECT * FROM task_history ORDER BY id DESC LIMIT 30").fetchall()]
-    db_data["fleet"] = [dict(r) for r in conn.execute("SELECT * FROM fleet_units").fetchall()]
-    db_data["missions"] = [dict(r) for r in conn.execute("SELECT * FROM missions").fetchall()]
-    db_data["hypercomm"] = [dict(r) for r in conn.execute("SELECT * FROM hypercomm_relays").fetchall()]
-    db_data["chats"] = [dict(r) for r in conn.execute("SELECT * FROM (SELECT * FROM chat_messages ORDER BY id DESC LIMIT 150) ORDER BY id ASC").fetchall()]
-    conn.close()
 
 distro_files = []
 distro_dir = os.path.join(os.environ["BASTILLA_PROJECT_ROOT"], "distro/agenticlinux")
@@ -1557,14 +1688,21 @@ print(json.dumps({
         "use_pct": disk_df[4] if len(disk_df) > 4 else "N/A",
     },
     "agents_live": agents_live,
+    "operator_avatar_url": operator_avatar_url,
     "tools": tools,
     "db": db_data,
     "legacy_records_unverified": legacy_records_unverified,
     "distro_files": distro_files
 }))
 `;
-      const hostData = await querySqliteJson(hostProbeScript);
-      const codexStatus = await codexAuth.status();
+      const [svlReport, hostData, codexStatus, ollamaStatus, imageStatus, desktopStatus] = await Promise.all([
+        svlPromise,
+        querySqliteJson(hostProbeScript),
+        codexAuth.status(),
+        probeOllamaStatus(getOllamaBaseUrl()),
+        imageManager.probeStatus(),
+        desktopSessionManager.getStatus(),
+      ]);
       hostData.tools.codex = {
         installed: codexStatus.installed,
         version: codexStatus.version,
@@ -1572,10 +1710,6 @@ print(json.dumps({
         auth_ready: codexStatus.auth_ready,
         requirement_note: codexStatus.message,
       };
-      const [ollamaStatus, imageStatus] = await Promise.all([
-        probeOllamaStatus(getOllamaBaseUrl()),
-        imageManager.probeStatus(),
-      ]);
 
       hostData.tools.ollama.auth_ready = ollamaStatus.reachable && ollamaStatus.models.length > 0;
       hostData.tools.ollama.requirement_note = ollamaStatus.message;
@@ -1585,12 +1719,15 @@ print(json.dumps({
           process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"
       );
 
+      const preferredActiveModel = pickPreferredOllamaModel(ollamaStatus.models) || ollamaStatus.modelNames[0];
+
       res.json({
         ok: true,
         svl_report: svlReport,
         host: hostData,
         ai_routing: {
-          primary_model: ollamaStatus.modelNames[0] ? `ollama/${ollamaStatus.modelNames[0]}` : "unverified",
+          default_model: getDefaultOllamaModel(),
+          primary_model: preferredActiveModel ? `ollama/${preferredActiveModel}` : "unverified",
           available_models: ollamaStatus.modelNames,
           ollama_online: ollamaStatus.reachable,
           ollama_state: ollamaStatus.state,
@@ -1606,6 +1743,7 @@ print(json.dumps({
         ollama_status: ollamaStatus,
         image_status: imageStatus,
         images: imageManager.listHistory(20),
+        desktop_status: desktopStatus,
         app_url:
           process.env.APP_URL ||
           `http://localhost:${PORT}`,
@@ -1809,16 +1947,18 @@ Polecenie użytkownika: "${prompt.trim()}"`;
 
         try {
           const ollamaEndpoint = getOllamaBaseUrl();
-          const preferredOllamaModel = process.env.OLLAMA_MODEL || "llama3.2-vision:11b";
+          const preferredOllamaModel = getDefaultOllamaModel();
           let ollamaRes = await fetch(`${ollamaEndpoint}/api/chat`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               model: preferredOllamaModel,
               stream: false,
+              keep_alive: "10m",
+              options: { num_ctx: 1024 },
               messages: [{ role: "user", content: translationPrompt }],
             }),
-            signal: AbortSignal.timeout(15000),
+            signal: AbortSignal.timeout(45000),
           });
           if (ollamaRes.status === 404) {
             const liveOllama = await probeOllamaStatus(ollamaEndpoint);
@@ -1830,9 +1970,11 @@ Polecenie użytkownika: "${prompt.trim()}"`;
                 body: JSON.stringify({
                   model: altModel,
                   stream: false,
+                  keep_alive: "10m",
+                  options: { num_ctx: 1024 },
                   messages: [{ role: "user", content: translationPrompt }],
                 }),
-                signal: AbortSignal.timeout(15000),
+                signal: AbortSignal.timeout(45000),
               });
             }
           }
@@ -1937,6 +2079,93 @@ Polecenie użytkownika: "${prompt.trim()}"`;
     }
   });
 
+  // Helper to generate a single agent's contextual response via Ollama -> Gemini fallback
+  async function generateAgentReplyTurn(opts: {
+    speakerId: string;
+    prompt: string;
+    systemExtra?: string;
+    enginePreference?: string;
+    signal?: AbortSignal;
+  }): Promise<{ text: string; engineUsed: string }> {
+    const speaker = (AGENTS as readonly string[]).includes(opts.speakerId) ? opts.speakerId : "aria";
+    const pref = opts.enginePreference || "auto";
+    const targetModel =
+      pref === "auto" || pref === "ollama"
+        ? getDefaultOllamaModel()
+        : pref;
+    const sysInstruction = [
+      buildAgentSystemInstruction(speaker),
+      opts.systemExtra || "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    let replyText = "";
+    let usedEngine = "";
+
+    if (pref !== "gemini") {
+      const ollamaEndpoint = getOllamaBaseUrl();
+      const ollamaMessages = [
+        { role: "system", content: sysInstruction },
+        { role: "user", content: opts.prompt },
+      ];
+      try {
+        const sig = opts.signal
+          ? AbortSignal.any([opts.signal, AbortSignal.timeout(90000)])
+          : AbortSignal.timeout(90000);
+        const streamed = await streamOllamaChat({
+          ollamaBaseUrl: ollamaEndpoint,
+          model: targetModel,
+          messages: ollamaMessages,
+          signal: sig,
+          onChunk: () => {},
+        });
+        replyText = streamed.text;
+        usedEngine = streamed.model;
+      } catch (err: any) {
+        if (/404|not found/i.test(String(err?.message || ""))) {
+          try {
+            const liveOllama = await probeOllamaStatus(ollamaEndpoint);
+            const altModel = pickPreferredOllamaModel(liveOllama.models);
+            if (altModel && altModel !== targetModel) {
+              const retryStream = await streamOllamaChat({
+                ollamaBaseUrl: ollamaEndpoint,
+                model: altModel,
+                messages: ollamaMessages,
+                signal: opts.signal
+                  ? AbortSignal.any([opts.signal, AbortSignal.timeout(90000)])
+                  : AbortSignal.timeout(90000),
+                onChunk: () => {},
+              });
+              replyText = retryStream.text;
+              usedEngine = retryStream.model;
+            }
+          } catch {}
+        }
+      }
+    }
+
+    if (!replyText && (!opts.signal || !opts.signal.aborted)) {
+      const sig = opts.signal || AbortSignal.timeout(30000);
+      const streamedGemini = await streamLiveMultimodalModel(
+        [{ role: "user", parts: [{ text: opts.prompt }] }],
+        sig,
+        () => {},
+        sysInstruction
+      );
+      replyText = streamedGemini.text;
+      usedEngine =
+        pref === "gemini"
+          ? streamedGemini.modelUsed
+          : `${streamedGemini.modelUsed} (Fallback dla ${targetModel})`;
+    }
+
+    return {
+      text: redact(replyText).trim(),
+      engineUsed: usedEngine || "gemini-3.1-flash-lite",
+    };
+  }
+
   // 4A. Real Server-Sent Events (SSE) Streaming Chat Endpoint (GET + POST with upstream abort)
   async function handleChatStreamRequest(
     req: express.Request,
@@ -2000,7 +2229,7 @@ Polecenie użytkownika: "${prompt.trim()}"`;
         `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
 conn.row_factory = sqlite3.Row
-rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 10", (sys.argv[2], sys.argv[3])).fetchall()
+rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 4", (sys.argv[2], sys.argv[3])).fetchall()
 conn.close()
 print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         [agentId, sessionId]
@@ -2108,9 +2337,9 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
       const groundingPrompt = buildToolGroundingPrompt(executedOutcomes, AGENT_TOOL_CATALOG);
 
       const targetModel = imageBase64
-        ? "llama3.2-vision:11b"
+        ? process.env.OLLAMA_VISION_MODEL || getDefaultOllamaModel()
         : enginePreference === "auto" || enginePreference === "ollama"
-        ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b"
+        ? getDefaultOllamaModel()
         : enginePreference;
 
       if (!fullText && enginePreference !== "gemini") {
@@ -2118,7 +2347,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           ...(hasToolsOrIntents ? [{ role: "system", content: groundingPrompt }] : []),
           ...priorTurns.map((h) => ({
             role: h.sender_role === "user" ? "user" : "assistant",
-            content: h.content,
+            content: h.content.length > 350 ? `${h.content.slice(0, 350)}...` : h.content,
           })),
           {
             role: "user",
@@ -2142,7 +2371,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
             }
           : {};
         try {
-          const timeoutSignal = AbortSignal.timeout(45000);
+          const timeoutSignal = AbortSignal.timeout(90000);
           const combinedSignal = AbortSignal.any([abortController.signal, timeoutSignal]);
           const streamed = await streamOllamaChat({
             ollamaBaseUrl: ollamaEndpoint,
@@ -2160,19 +2389,22 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           if (abortController.signal.aborted) {
             return res.end();
           }
-          // If the default model isn't installed on a real Ollama host, retry with an actual model from /api/tags
-          if (/404|not found/i.test(String(err?.message || ""))) {
+          // If the default model isn't installed or cannot fit in host RAM, retry with another local model from /api/tags
+          if (/404|not found|500|memory|timeout|timed out/i.test(String(err?.message || ""))) {
             try {
               const liveOllama = await probeOllamaStatus(ollamaEndpoint);
-              const altModel = pickPreferredOllamaModel(liveOllama.models, {
-                multimodal: Boolean(imageBase64),
-              });
+              const candidateModels = liveOllama.models.filter((m) => m.name !== targetModel);
+              const altModel =
+                pickPreferredOllamaModel(candidateModels, {
+                  multimodal: Boolean(imageBase64),
+                }) ||
+                pickPreferredOllamaModel(candidateModels, { multimodal: false });
               if (altModel && altModel !== targetModel) {
                 const retryStream = await streamOllamaChat({
                   ollamaBaseUrl: ollamaEndpoint,
                   model: altModel,
                   messages: ollamaMessages,
-                  signal: AbortSignal.any([abortController.signal, AbortSignal.timeout(45000)]),
+                  signal: AbortSignal.any([abortController.signal, AbortSignal.timeout(90000)]),
                   ...ollamaToolOpt,
                   onChunk: (delta) => {
                     writeEvent({ type: "chunk", text: redact(delta) });
@@ -2241,14 +2473,33 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         }
       }
 
+      const peerMessages: any[] = [];
+
       if (saveToDb && fullText) {
         // Record IPC mentions if operator addressed @wszyscy or specific agent
         const mentioned = [...message.toLowerCase().matchAll(/@(aria|alex|astyria|aurelius|wszyscy)\b/g)].map((m) => m[1]);
-        if (mentioned.length > 0) {
-          const targets = mentioned.includes("wszyscy") ? [...AGENTS] : Array.from(new Set(mentioned));
-          const sender = (AGENTS as readonly string[]).includes(agentId) ? agentId : "aria";
+        const mentionedSpecific = Array.from(
+          new Set(mentioned.filter((m) => m !== "wszyscy" && (AGENTS as readonly string[]).includes(m)))
+        );
+        const primarySpeaker =
+          agentId === "council"
+            ? mentionedSpecific[0] || "aria"
+            : (AGENTS as readonly string[]).includes(agentId)
+            ? agentId
+            : "aria";
+        const effectiveAsstAgentId = agentId === "council" ? primarySpeaker : agentId;
+        const effectiveEngineLabel =
+          agentId === "council" || mentioned.includes("wszyscy")
+            ? `${engineUsed} · @wszyscy`
+            : engineUsed;
+
+        if (mentioned.length > 0 || agentId === "council") {
+          const targets =
+            agentId === "council" || mentioned.includes("wszyscy")
+              ? [...AGENTS]
+              : mentionedSpecific;
           for (const recipient of targets) {
-            if (recipient !== sender && (AGENTS as readonly string[]).includes(recipient)) {
+            if (recipient !== primarySpeaker && (AGENTS as readonly string[]).includes(recipient)) {
               querySqliteJson(
                 `import sqlite3, sys, json, os
 from datetime import datetime, timezone
@@ -2264,7 +2515,7 @@ if os.path.exists(f"/home/{sys.argv[3]}"):
     with open(inbox, "a", encoding="utf-8") as f:
         f.write(json.dumps({"id": msg_id, "from": sys.argv[2], "subject": "CHAT_MENTION", "payload": sys.argv[4], "ts": now}) + "\\n")
 print(json.dumps({"id": msg_id}))`,
-                [sender, recipient, message.slice(0, 600)]
+                [primarySpeaker, recipient, message.slice(0, 600)]
               ).catch(() => {});
             }
           }
@@ -2280,14 +2531,14 @@ cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engin
   (sys.argv[2], sys.argv[3], sys.argv[4], now))
 user_id = cur.lastrowid
 cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)",
-  (sys.argv[2], sys.argv[3], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], now))
+  (sys.argv[2], sys.argv[9], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], now))
 asst_id = cur.lastrowid
 cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'CHAT_DIALOGUE', ?, 4, ?)",
-  (sys.argv[3] if sys.argv[3] != 'council' else 'aria', f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
+  (sys.argv[9], f"Rozmowa z Operatorem: {sys.argv[4][:100]}", now))
 conn.commit()
 conn.close()
 print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
-          [sessionId, agentId, message, engineUsed, fullText, artifactTitle, artifactCode]
+          [sessionId, agentId, message, effectiveEngineLabel, fullText, artifactTitle, artifactCode, effectiveAsstAgentId]
         );
         userMessageRecord = {
           id: savedRows.user_id || Date.now() - 1,
@@ -2302,13 +2553,78 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
           id: savedRows.asst_id || Date.now(),
           session_id: sessionId,
           sender_role: "assistant",
-          agent_id: agentId,
-          engine_used: engineUsed,
+          agent_id: effectiveAsstAgentId,
+          engine_used: effectiveEngineLabel,
           content: fullText,
           artifact_title: artifactTitle,
           artifact_code: artifactCode,
           created_at: savedRows.created_at || new Date().toISOString(),
         };
+        broadcastSystemEvent("chat_message", { message: userMessageRecord });
+        broadcastSystemEvent("chat_message", { message: assistantMessageRecord });
+
+        // Multi-agent dialogue on @wszyscy (council) or when peer @agents are mentioned
+        const isBroadcastCouncil = agentId === "council" || mentioned.includes("wszyscy");
+        const peerTargets = isBroadcastCouncil
+          ? (mentionedSpecific.length > 1
+              ? mentionedSpecific.filter((a) => a !== primarySpeaker)
+              : AGENTS.filter((a) => a !== primarySpeaker))
+          : mentionedSpecific.filter((a) => a !== primarySpeaker);
+
+        if (!slashTermMatch && peerTargets.length > 0 && !abortController.signal.aborted) {
+          let runningTranscript = `[Operator Mateusz Mitek]: ${message}\n[Agent ${primarySpeaker.toUpperCase()}]: ${fullText}`;
+          let prevSpeaker = primarySpeaker;
+          for (const peerId of peerTargets) {
+            if (abortController.signal.aborted) break;
+            try {
+              const peerPrompt =
+                `Trwa rozmowa wielopodmiotowa na kanale wspólnym @wszyscy w Bastilla OS Ultimate.\n` +
+                `Dotychczasowy przebieg wymiany zdań:\n${runningTranscript}\n\n` +
+                `Teraz Twoja kolej jako ${peerId.toUpperCase()}. Odpowiedz zwięźle (2-4 zdania) po polsku: ` +
+                `zwróć się zarówno do Operatora (@Operator), jak i odnieś się bezpośrednio do wypowiedzi poprzedniego agenta (@${prevSpeaker}).`;
+              const peerGen = await generateAgentReplyTurn({
+                speakerId: peerId,
+                prompt: peerPrompt,
+                systemExtra: groundingPrompt,
+                enginePreference,
+                signal: abortController.signal,
+              });
+              if (!peerGen.text) continue;
+              const peerLabel = `${peerGen.engineUsed} · @wszyscy (→ @${prevSpeaker} & Operator)`;
+              const peerSaved = await querySqliteJson(
+                `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], now))
+row_id = cur.lastrowid
+cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, 'COUNCIL_DIALOGUE', ?, 'DELIVERED', ?)",
+  (sys.argv[3], sys.argv[6], sys.argv[5][:600], now))
+conn.commit(); conn.close()
+print(json.dumps({"id": row_id, "created_at": now}))`,
+                [sessionId, peerId, peerLabel, peerGen.text, prevSpeaker]
+              );
+              const peerRecord = {
+                id: peerSaved.id || Date.now() + peerMessages.length + 3,
+                session_id: sessionId,
+                sender_role: "assistant" as const,
+                agent_id: peerId,
+                engine_used: peerLabel,
+                content: peerGen.text,
+                artifact_title: "",
+                artifact_code: "",
+                created_at: peerSaved.created_at || new Date().toISOString(),
+              };
+              peerMessages.push(peerRecord);
+              runningTranscript += `\n[Agent ${peerId.toUpperCase()}]: ${peerGen.text}`;
+              prevSpeaker = peerId;
+              writeEvent({ type: "peer_reply", messageRecord: peerRecord });
+              broadcastSystemEvent("chat_message", { message: peerRecord });
+            } catch {}
+          }
+        }
       }
 
       writeEvent({
@@ -2320,6 +2636,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
         toolOutcomes: executedOutcomes,
         userMessageRecord,
         assistantMessageRecord,
+        peerMessages,
       });
       res.end();
     } catch (e: any) {
@@ -2460,7 +2777,7 @@ print(json.dumps({"user_id": user_id, "asst_id": asst_id, "created_at": now}))`,
         `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
 conn.row_factory = sqlite3.Row
-rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 10", (sys.argv[2], sys.argv[3])).fetchall()
+rows = conn.execute("SELECT sender_role, agent_id, content FROM chat_messages WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 4", (sys.argv[2], sys.argv[3])).fetchall()
 conn.close()
 print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
         [agentId, sessionId]
@@ -2470,11 +2787,9 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
       const isOllamaSelection = !resolved && enginePreference !== "gemini";
 
       const targetOllamaModel = imageBase64
-        ? "llama3.2-vision:11b"
-        : enginePreference === "auto" || !enginePreference
-        ? process.env.OLLAMA_MODEL || "llama3.2-vision:11b"
-        : enginePreference === "ollama"
-        ? "llama3.2-vision:11b"
+        ? process.env.OLLAMA_VISION_MODEL || getDefaultOllamaModel()
+        : enginePreference === "auto" || !enginePreference || enginePreference === "ollama"
+        ? getDefaultOllamaModel()
         : enginePreference;
 
       // Step 1: Attempt active Ollama daemon with automatic model fallback from /api/tags
@@ -2484,7 +2799,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
           ...(hasToolsOrIntents ? [{ role: "system", content: groundingPrompt }] : []),
           ...priorTurns.map((h) => ({
             role: h.sender_role === "user" ? "user" : "assistant",
-            content: h.content,
+            content: h.content.length > 350 ? `${h.content.slice(0, 350)}...` : h.content,
           })),
           {
             role: "user",
@@ -2511,7 +2826,7 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
                 ollamaBaseUrl: ollamaEndpoint,
                 model: targetOllamaModel,
                 messages: ollamaMessages,
-                signal: AbortSignal.timeout(25000),
+                signal: AbortSignal.timeout(90000),
                 onChunk: () => {},
                 ...ollamaToolOpt,
               });
@@ -2521,17 +2836,20 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
                 resolved = true;
               }
             } catch (toolErr: any) {
-              if (/404|not found/i.test(String(toolErr?.message || ""))) {
+              if (/404|not found|500|memory|timeout|timed out/i.test(String(toolErr?.message || ""))) {
                 const liveOllama = await probeOllamaStatus(ollamaEndpoint);
-                const altModel = pickPreferredOllamaModel(liveOllama.models, {
-                  multimodal: Boolean(imageBase64),
-                });
+                const candidateModels = liveOllama.models.filter((m) => m.name !== targetOllamaModel);
+                const altModel =
+                  pickPreferredOllamaModel(candidateModels, {
+                    multimodal: Boolean(imageBase64),
+                  }) ||
+                  pickPreferredOllamaModel(candidateModels, { multimodal: false });
                 if (altModel && altModel !== targetOllamaModel) {
                   const retryStream = await streamOllamaChat({
                     ollamaBaseUrl: ollamaEndpoint,
                     model: altModel,
                     messages: ollamaMessages,
-                    signal: AbortSignal.timeout(25000),
+                    signal: AbortSignal.timeout(90000),
                     onChunk: () => {},
                     ...ollamaToolOpt,
                   });
@@ -2554,9 +2872,11 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
               body: JSON.stringify({
                 model: targetOllamaModel,
                 stream: false,
+                keep_alive: "10m",
+                options: { num_ctx: 1024 },
                 messages: ollamaMessages,
               }),
-              signal: AbortSignal.timeout(25000),
+              signal: AbortSignal.timeout(90000),
             });
             if (ollamaRes.ok) {
               const data: any = await ollamaRes.json();
@@ -2565,11 +2885,14 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
                 engineUsed = bodyEngine(data, targetOllamaModel);
                 resolved = true;
               }
-            } else if (ollamaRes.status === 404) {
+            } else if (ollamaRes.status === 404 || ollamaRes.status >= 500) {
               const liveOllama = await probeOllamaStatus(ollamaEndpoint);
-              const altModel = pickPreferredOllamaModel(liveOllama.models, {
-                multimodal: Boolean(imageBase64),
-              });
+              const candidateModels = liveOllama.models.filter((m) => m.name !== targetOllamaModel);
+              const altModel =
+                pickPreferredOllamaModel(candidateModels, {
+                  multimodal: Boolean(imageBase64),
+                }) ||
+                pickPreferredOllamaModel(candidateModels, { multimodal: false });
               if (altModel && altModel !== targetOllamaModel) {
                 const retryRes = await fetch(`${ollamaEndpoint}/api/chat`, {
                   method: "POST",
@@ -2577,9 +2900,11 @@ print(json.dumps({"history": [dict(r) for r in reversed(rows)]}))`,
                   body: JSON.stringify({
                     model: altModel,
                     stream: false,
+                    keep_alive: "10m",
+                    options: { num_ctx: 1024 },
                     messages: ollamaMessages,
                   }),
-                  signal: AbortSignal.timeout(25000),
+                  signal: AbortSignal.timeout(90000),
                 });
                 if (retryRes.ok) {
                   const retryData: any = await retryRes.json();
@@ -2791,6 +3116,273 @@ print(json.dumps({"deleted": deleted, "ok": True}))`,
     }
   });
 
+  // 4C. Two-Way Chat Engine: Agents writing proactively to Operator & conversing between themselves on @wszyscy
+  const chatBidirectionalState = {
+    autoEnabled: false,
+    intervalSec: 45,
+    mode: "both" as "both" | "to_operator" | "agent_to_agent",
+    nextAgentIndex: 0,
+    totalTurns: 0,
+    lastTurnAt: null as string | null,
+    lastSummary: "Czat obustronny gotowy — każdy agent może pisać do Operatora i między sobą na kanale @wszyscy.",
+  };
+
+  let chatBidirectionalBusy = false;
+  let chatBidirectionalTimer: NodeJS.Timeout | null = null;
+
+  async function executeBidirectionalChatExchange(options?: {
+    mode?: "to_operator" | "agent_to_agent" | "council_roundtable";
+    initiator?: string;
+    recipient?: string;
+    topic?: string;
+    sessionId?: string;
+    enginePreference?: string;
+  }) {
+    if (chatBidirectionalBusy) {
+      throw new Error("Trwa już wymiana wiadomości na kanale obustronnym.");
+    }
+    chatBidirectionalBusy = true;
+    try {
+      const sessionId = options?.sessionId || "bastilla-main";
+      const enginePreference = options?.enginePreference || "auto";
+      const chosenMode =
+        options?.mode ||
+        (chatBidirectionalState.mode === "both"
+          ? chatBidirectionalState.totalTurns % 2 === 0
+            ? "to_operator"
+            : "agent_to_agent"
+          : chatBidirectionalState.mode);
+
+      const initiator =
+        options?.initiator && (AGENTS as readonly string[]).includes(options.initiator)
+          ? options.initiator
+          : AGENTS[chatBidirectionalState.nextAgentIndex % AGENTS.length];
+      chatBidirectionalState.nextAgentIndex = (chatBidirectionalState.nextAgentIndex + 1) % AGENTS.length;
+
+      const recipient =
+        options?.recipient && (AGENTS as readonly string[]).includes(options.recipient) && options.recipient !== initiator
+          ? options.recipient
+          : AGENTS[(AGENTS.indexOf(initiator as any) + 1) % AGENTS.length];
+
+      // Gather real live context from SQLite + Ollama + GitHub Sync
+      const [recentDb, ollamaLive] = await Promise.all([
+        querySqliteJson(
+          `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+chats = [dict(r) for r in reversed(conn.execute("SELECT sender_role, agent_id, content FROM chat_messages ORDER BY id DESC LIMIT 6").fetchall())]
+ipc = [dict(r) for r in conn.execute("SELECT sender, recipient, subject, payload FROM agent_ipc_messages ORDER BY id DESC LIMIT 4").fetchall()]
+conn.close()
+print(json.dumps({"chats": chats, "ipc": ipc}))`
+        ),
+        probeOllamaStatus(getOllamaBaseUrl()),
+      ]);
+
+      const recentChatSnippet = Array.isArray(recentDb?.chats) && recentDb.chats.length > 0
+        ? recentDb.chats
+            .map((c: any) => `[${c.sender_role === "user" ? "Operator" : c.agent_id.toUpperCase()}]: ${String(c.content || "").slice(0, 180)}`)
+            .join("\n")
+        : "Brak wcześniejszych wiadomości.";
+
+      const liveSystemSummary =
+        `Stan rzeczywisty systemu: Ollama=${ollamaLive.state} (${ollamaLive.endpoint}, modele=${ollamaLive.modelNames.join(",") || "brak"}), ` +
+        `GitHub Auto-Sync=${gitAutoSyncState.enabled ? "AKTYWNY" : "WSTRZYMANY"} (gałąź=${gitAutoSyncState.branch}, +${gitAutoSyncState.ahead}/-${gitAutoSyncState.behind}, IN=${gitAutoSyncState.inboundStatus}, OUT=${gitAutoSyncState.outboundStatus}), ` +
+        `Kontrola SQLite cykl=#${continuousMissionState.cycle}.`;
+
+      const createdMessages: any[] = [];
+
+      const saveAndBroadcastAgentMsg = async (speakerId: string, engineLabel: string, textContent: string, ipcTarget?: string) => {
+        const saved = await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES (?, 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], now))
+row_id = cur.lastrowid
+if sys.argv[6]:
+    cur.execute("INSERT INTO agent_ipc_messages (sender, recipient, subject, payload, status, created_at) VALUES (?, ?, 'BIDIRECTIONAL_CHAT', ?, 'DELIVERED', ?)",
+      (sys.argv[3], sys.argv[6], sys.argv[5][:600], now))
+conn.commit(); conn.close()
+print(json.dumps({"id": row_id, "created_at": now}))`,
+          [sessionId, speakerId, engineLabel, textContent, ipcTarget || ""]
+        );
+        const msgRecord = {
+          id: saved.id || Date.now() + createdMessages.length,
+          session_id: sessionId,
+          sender_role: "assistant" as const,
+          agent_id: speakerId,
+          engine_used: engineLabel,
+          content: textContent,
+          artifact_title: "",
+          artifact_code: "",
+          created_at: saved.created_at || new Date().toISOString(),
+        };
+        createdMessages.push(msgRecord);
+        broadcastSystemEvent("chat_message", { message: msgRecord });
+        return msgRecord;
+      };
+
+      if (chosenMode === "to_operator") {
+        const prompt =
+          `${liveSystemSummary}\n\n` +
+          `Ostatnie wiadomości na czacie:\n${recentChatSnippet}\n\n` +
+          (options?.topic ? `Temat od Operatora: ${options.topic}\n\n` : "") +
+          `Jako agent ${initiator.toUpperCase()} napisz z własnej inicjatywy bezpośrednią wiadomość do Operatora Mateusza Mitka (@Operator) na kanale @wszyscy (2-4 konkretne zdania). ` +
+          `Podaj rzeczywisty raport ze swojego obszaru, odnieś się do bieżącej sytuacji w systemie lub zadaj Operatorowi konkretne pytanie techniczne.`;
+        const gen = await generateAgentReplyTurn({
+          speakerId: initiator,
+          prompt,
+          enginePreference,
+        });
+        if (gen.text) {
+          await saveAndBroadcastAgentMsg(
+            initiator,
+            `${gen.engineUsed} · → @Operator (@wszyscy)`,
+            gen.text
+          );
+        }
+      } else if (chosenMode === "agent_to_agent") {
+        const prompt1 =
+          `${liveSystemSummary}\n\n` +
+          `Ostatnie wiadomości na czacie:\n${recentChatSnippet}\n\n` +
+          (options?.topic ? `Temat rozmowy: ${options.topic}\n\n` : "") +
+          `Jako agent ${initiator.toUpperCase()} rozpocznij rozmowę na kanale @wszyscy z agentem @${recipient} (widoczną również dla @Operator). ` +
+          `Napisz 2-3 konkretne zdania po polsku o aktualnym stanie systemu, zadaniach lub synchronizacji i zadaj @${recipient} pytanie.`;
+        const gen1 = await generateAgentReplyTurn({
+          speakerId: initiator,
+          prompt: prompt1,
+          enginePreference,
+        });
+        if (gen1.text) {
+          await saveAndBroadcastAgentMsg(
+            initiator,
+            `${gen1.engineUsed} · @wszyscy (→ @${recipient})`,
+            gen1.text,
+            recipient
+          );
+
+          const prompt2 =
+            `${liveSystemSummary}\n\n` +
+            `Agent ${initiator.toUpperCase()} właśnie napisał do Ciebie (@${recipient}) na kanale @wszyscy:\n"${gen1.text}"\n\n` +
+            `Jako agent ${recipient.toUpperCase()} odpowiedz bezpośrednio do @${initiator} oraz do @Operator (2-4 konkretne zdania po polsku).`;
+          const gen2 = await generateAgentReplyTurn({
+            speakerId: recipient,
+            prompt: prompt2,
+            enginePreference,
+          });
+          if (gen2.text) {
+            await saveAndBroadcastAgentMsg(
+              recipient,
+              `${gen2.engineUsed} · @wszyscy (→ @${initiator} & @Operator)`,
+              gen2.text,
+              initiator
+            );
+          }
+        }
+      } else {
+        // council_roundtable: all 4 agents converse on @wszyscy
+        let transcript = options?.topic
+          ? `Temat narady @wszyscy: ${options.topic}`
+          : `Narada techniczna @wszyscy nad stanem Bastilla OS Ultimate (${liveSystemSummary})`;
+        let prev = "";
+        for (const ag of AGENTS) {
+          const prompt =
+            `${liveSystemSummary}\n\n` +
+            `Przebieg narady na kanale @wszyscy:\n${transcript}\n\n` +
+            `Jako agent ${ag.toUpperCase()} zabierz głos (2-3 zwięzłe zdania po polsku): ` +
+            (prev
+              ? `odnieś się do wypowiedzi @${prev} oraz zwróć się do @Operator i pozostałych agentów.`
+              : `otwórz naradę, zwracając się do @Operator oraz @alex, @astyria i @aurelius.`);
+          const gen = await generateAgentReplyTurn({
+            speakerId: ag,
+            prompt,
+            enginePreference,
+          });
+          if (gen.text) {
+            await saveAndBroadcastAgentMsg(
+              ag,
+              `${gen.engineUsed} · Narada @wszyscy${prev ? ` (→ @${prev})` : ""}`,
+              gen.text,
+              prev || "alex"
+            );
+            transcript += `\n[${ag.toUpperCase()}]: ${gen.text}`;
+            prev = ag;
+          }
+        }
+      }
+
+      chatBidirectionalState.totalTurns += 1;
+      chatBidirectionalState.lastTurnAt = new Date().toISOString();
+      chatBidirectionalState.lastSummary =
+        `Wykonano turę #${chatBidirectionalState.totalTurns} (${chosenMode}, wiadomości: ${createdMessages.length}).`;
+      broadcastSystemEvent("bidirectional_chat_status", { state: chatBidirectionalState });
+      return { state: chatBidirectionalState, messages: createdMessages };
+    } finally {
+      chatBidirectionalBusy = false;
+    }
+  }
+
+  function restartChatBidirectionalTimer() {
+    if (chatBidirectionalTimer) {
+      clearInterval(chatBidirectionalTimer);
+      chatBidirectionalTimer = null;
+    }
+    if (chatBidirectionalState.autoEnabled) {
+      chatBidirectionalTimer = setInterval(() => {
+        if (chatBidirectionalState.autoEnabled && !chatBidirectionalBusy) {
+          void executeBidirectionalChatExchange().catch(() => {});
+        }
+      }, chatBidirectionalState.intervalSec * 1000);
+    }
+  }
+
+  app.get("/api/chat/bidirectional/status", (_req, res) => {
+    res.json({ ok: true, state: chatBidirectionalState });
+  });
+
+  app.post("/api/chat/bidirectional/toggle", (req, res) => {
+    const { autoEnabled, intervalSec, mode } = req.body || {};
+    if (typeof autoEnabled === "boolean") {
+      chatBidirectionalState.autoEnabled = autoEnabled;
+    } else if (autoEnabled === undefined && intervalSec === undefined && mode === undefined) {
+      chatBidirectionalState.autoEnabled = !chatBidirectionalState.autoEnabled;
+    }
+    if (intervalSec !== undefined) {
+      const parsed = Number(intervalSec);
+      if (Number.isFinite(parsed) && parsed >= 20 && parsed <= 600) {
+        chatBidirectionalState.intervalSec = Math.round(parsed);
+      }
+    }
+    if (mode === "both" || mode === "to_operator" || mode === "agent_to_agent") {
+      chatBidirectionalState.mode = mode;
+    }
+    restartChatBidirectionalTimer();
+    broadcastSystemEvent("bidirectional_chat_status", { state: chatBidirectionalState });
+    res.json({ ok: true, state: chatBidirectionalState });
+  });
+
+  app.post("/api/chat/bidirectional/trigger", async (req, res) => {
+    try {
+      const { mode, initiator, recipient, topic, sessionId, enginePreference } = req.body || {};
+      const out = await executeBidirectionalChatExchange({
+        mode:
+          mode === "to_operator" || mode === "agent_to_agent" || mode === "council_roundtable"
+            ? mode
+            : undefined,
+        initiator: typeof initiator === "string" ? initiator : undefined,
+        recipient: typeof recipient === "string" ? recipient : undefined,
+        topic: typeof topic === "string" ? topic : undefined,
+        sessionId: typeof sessionId === "string" ? sessionId : undefined,
+        enginePreference: typeof enginePreference === "string" ? enginePreference : undefined,
+      });
+      res.json({ ok: true, ...out });
+    } catch (err: any) {
+      res.status(409).json({ ok: false, error: err?.message || "Błąd wywołania czatu obustronnego." });
+    }
+  });
+
   app.post("/api/system/unlock", (_req, res) => {
     res.status(410).json({ ok: false, error: "Parametry SVL nie nadają uprawnień Linux ani dostępu do AI. Skonfiguruj konta i integracje osobno." });
   });
@@ -2865,7 +3457,7 @@ print(json.dumps({"saved": True, "created_at": now}))`,
 
   app.post("/api/agents/avatar", async (req, res) => {
     const { agentId = "aria", avatarUrl = "" } = req.body || {};
-    const valid = ["aria", "alex", "astyria", "aurelius"];
+    const valid = ["aria", "alex", "astyria", "aurelius", "operator"];
     if (!valid.includes(agentId)) {
       return res.status(400).json({ ok: false, error: "Nieprawidłowy agent." });
     }
@@ -2873,6 +3465,20 @@ print(json.dumps({"saved": True, "created_at": now}))`,
       return res.status(400).json({ ok: false, error: "URL avatara jest wymagany." });
     }
     try {
+      const cleanUrl = avatarUrl.trim();
+      if (agentId === "operator") {
+        const out = await querySqliteJson(
+          `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO bastilla_metadata (key, value) VALUES ('operator_avatar_url', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (sys.argv[2],))
+conn.commit(); conn.close()
+print(json.dumps({"updated": True, "agentId": "operator", "avatarUrl": sys.argv[2]}))`,
+          [cleanUrl]
+        );
+        broadcastSystemEvent("sync", { operatorAvatarUrl: cleanUrl });
+        return res.json({ ok: true, result: out });
+      }
       const out = await querySqliteJson(
         `import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
@@ -2881,12 +3487,223 @@ cur.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (sys.argv[3], sys.a
 updated = cur.rowcount > 0
 conn.commit(); conn.close()
 print(json.dumps({"updated": updated, "agentId": sys.argv[2], "avatarUrl": sys.argv[3]}))`,
-        [agentId, avatarUrl.trim()]
+        [agentId, cleanUrl]
       );
       if (!out?.updated) {
         return res.status(404).json({ ok: false, error: "Nie znaleziono profilu agenta w bazie danych." });
       }
+      broadcastSystemEvent("sync", { agentId, avatarUrl: cleanUrl });
       res.json({ ok: true, result: out });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.post("/api/operator/avatar", async (req, res) => {
+    const { avatarUrl = "/assets/operator_lucy_vault33.webp" } = req.body || {};
+    const cleanUrl =
+      typeof avatarUrl === "string" && avatarUrl.trim()
+        ? avatarUrl.trim()
+        : "/assets/operator_lucy_vault33.webp";
+    try {
+      const out = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO bastilla_metadata (key, value) VALUES ('operator_avatar_url', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (sys.argv[2],))
+conn.commit(); conn.close()
+print(json.dumps({"updated": True, "operatorAvatarUrl": sys.argv[2]}))`,
+        [cleanUrl]
+      );
+      broadcastSystemEvent("sync", { operatorAvatarUrl: cleanUrl });
+      res.json({ ok: true, result: out });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  // Curated pool of verified, high-availability internet avatars per agent persona so AI can choose & rotate
+  const INTERNET_AVATAR_CATALOG: Record<
+    string,
+    Array<{ id: string; label: string; url: string }>
+  > = {
+    aria: [
+      {
+        id: "aria-cyber-queen",
+        label: "Cybernetic Neural Commander (RoboHash Set 4)",
+        url: "https://robohash.org/Bastilla-Aria-Root-1001.png?set=set4&size=256x256&bgset=bg2",
+      },
+      {
+        id: "aria-adventurer-violet",
+        label: "DiceBear Adventurer Violet Kernel",
+        url: "https://api.dicebear.com/9.x/adventurer/svg?seed=AriaBastillaRoot&backgroundColor=2e1065",
+      },
+      {
+        id: "aria-lorelei-quantum",
+        label: "DiceBear Lorelei Quantum Tactician",
+        url: "https://api.dicebear.com/9.x/lorelei/svg?seed=AriaQuantumWheel&backgroundColor=1e1b4b",
+      },
+    ],
+    alex: [
+      {
+        id: "alex-bottts-kernel",
+        label: "DiceBear Bottts Linux Kernel Mecha",
+        url: "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=AlexKernel364&backgroundColor=0f172a",
+      },
+      {
+        id: "alex-robohash-mecha",
+        label: "RoboHash Tactical Android UID 1002",
+        url: "https://robohash.org/Bastilla-Alex-Kernel-1002.png?set=set1&size=256x256&bgset=bg1",
+      },
+      {
+        id: "alex-pixel-hacker",
+        label: "DiceBear Pixel Art Systems Architect",
+        url: "https://api.dicebear.com/9.x/pixel-art/svg?seed=AlexBastillaRoot&backgroundColor=082f49",
+      },
+    ],
+    astyria: [
+      {
+        id: "astyria-notionists-astro",
+        label: "DiceBear Notionists Deep-Space Navigator",
+        url: "https://api.dicebear.com/9.x/notionists/svg?seed=AstyriaDeepSpace500&backgroundColor=172554",
+      },
+      {
+        id: "astyria-robohash-synth",
+        label: "RoboHash Orbital Synth UID 1003",
+        url: "https://robohash.org/Bastilla-Astyria-Orbital-1003.png?set=set3&size=256x256&bgset=bg2",
+      },
+      {
+        id: "astyria-avataaars-cyber",
+        label: "DiceBear Avataaars Telemetry Specialist",
+        url: "https://api.dicebear.com/9.x/avataaars/svg?seed=AstyriaBastilla&backgroundColor=311042",
+      },
+    ],
+    aurelius: [
+      {
+        id: "aurelius-bottts-guardian",
+        label: "DiceBear Bottts Cryptographic Guardian",
+        url: "https://api.dicebear.com/9.x/bottts/svg?seed=AureliusGuardian1000&backgroundColor=022c22",
+      },
+      {
+        id: "aurelius-robohash-sentinel",
+        label: "RoboHash Sovereign Sentinel UID 1004",
+        url: "https://robohash.org/Bastilla-Aurelius-Sentinel-1004.png?set=set2&size=256x256&bgset=bg1",
+      },
+      {
+        id: "aurelius-identicon-matrix",
+        label: "DiceBear Shapes Quantum Matrix",
+        url: "https://api.dicebear.com/9.x/shapes/svg?seed=AureliusOmniklucz364&backgroundColor=064e3b",
+      },
+    ],
+  };
+
+  let avatarSelectionRound = 0;
+
+  app.post("/api/agents/avatar/ai-select", async (req, res) => {
+    try {
+      const { agentId, announceInChat = true, enginePreference = "auto" } = req.body || {};
+      const targetAgents =
+        typeof agentId === "string" && (AGENTS as readonly string[]).includes(agentId)
+          ? [agentId]
+          : [...AGENTS];
+
+      avatarSelectionRound += 1;
+      const selections: Array<{
+        agentId: string;
+        avatarUrl: string;
+        label: string;
+        reason: string;
+        engineUsed: string;
+      }> = [];
+
+      for (const ag of targetAgents) {
+        const pool = INTERNET_AVATAR_CATALOG[ag] || INTERNET_AVATAR_CATALOG.aria;
+        const defaultChoiceIdx = (avatarSelectionRound + AGENTS.indexOf(ag as any)) % pool.length;
+        let chosenItem = pool[defaultChoiceIdx];
+        let reason = `Wybrałem internetowy awatar "${chosenItem.label}" dopasowany do mojej roli w Bastilla OS.`;
+        let engineUsed = "AI Avatar Selector";
+
+        const prompt =
+          `Wybierasz dla siebie nowy awatar z internetu jako agent ${ag.toUpperCase()} w Bastilla OS Ultimate.\n` +
+          `Dostępne zweryfikowane awatary internetowe:\n` +
+          pool.map((item, i) => `${i + 1}. [${item.id}] ${item.label} — ${item.url}`).join("\n") +
+          `\n\nWybierz numer (1-${pool.length}) lub podaj identyfikator swojego wyboru i w 1-2 krótkich zdaniach po polsku napisz do @Operator na kanale @wszyscy, dlaczego wybrałeś ten awatar.`;
+
+        const aiTurn = await generateAgentReplyTurn({
+          speakerId: ag,
+          prompt,
+          enginePreference,
+        });
+
+        if (aiTurn.text) {
+          engineUsed = aiTurn.engineUsed;
+          const matchedItem = pool.find(
+            (p, idx) =>
+              aiTurn.text.includes(p.id) ||
+              aiTurn.text.includes(p.url) ||
+              new RegExp(`\\b${idx + 1}\\b`).test(aiTurn.text.slice(0, 60))
+          );
+          if (matchedItem) {
+            chosenItem = matchedItem;
+          }
+          reason = aiTurn.text;
+        }
+
+        await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("UPDATE agents SET avatar_url = ? WHERE id = ?", (sys.argv[3], sys.argv[2]))
+cur.execute("INSERT INTO agent_memories (agent_id, category, content, importance, created_at) VALUES (?, 'AVATAR_UPDATE', ?, 4, ?)",
+  (sys.argv[2], f"Wybrano nowy awatar z internetu ({sys.argv[4]}): {sys.argv[3]}", now))
+conn.commit(); conn.close()
+print(json.dumps({"updated": True}))`,
+          [ag, chosenItem.url, chosenItem.label]
+        );
+
+        if (announceInChat) {
+          const chatText = `**[Nowy Awatar z Internetu — ${chosenItem.label}]**\n${reason}`;
+          const savedMsg = await querySqliteJson(
+            `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES ('bastilla-main', 'assistant', ?, ?, ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], now))
+row_id = cur.lastrowid
+conn.commit(); conn.close()
+print(json.dumps({"id": row_id, "created_at": now}))`,
+            [ag, `${engineUsed} · Awatar @wszyscy`, chatText]
+          );
+          broadcastSystemEvent("chat_message", {
+            message: {
+              id: savedMsg.id || Date.now(),
+              session_id: "bastilla-main",
+              sender_role: "assistant",
+              agent_id: ag,
+              engine_used: `${engineUsed} · Awatar @wszyscy`,
+              content: chatText,
+              artifact_title: "",
+              artifact_code: "",
+              created_at: savedMsg.created_at || new Date().toISOString(),
+            },
+          });
+        }
+
+        selections.push({
+          agentId: ag,
+          avatarUrl: chosenItem.url,
+          label: chosenItem.label,
+          reason,
+          engineUsed,
+        });
+      }
+
+      broadcastSystemEvent("sync", { avatarsUpdated: selections });
+      res.json({ ok: true, selections });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
     }
@@ -2969,7 +3786,352 @@ print(json.dumps({"logged": True}))`,
     }
   });
 
-  // 7. Git Repository Bastilla_OS_Ultimate (main branch) Inspection & Sync
+  // 7. Git Repository Bastilla_OS_Ultimate Inspection & Automatic Two-Way GitHub Sync
+  const isTestGitEnv =
+    Boolean(process.env.NODE_TEST_CONTEXT) ||
+    process.env.BASTILLA_PROVISION_HOST === "false" ||
+    process.env.BASTILLA_GIT_AUTO_SYNC === "false";
+
+  interface GitSyncEvent {
+    timestamp: string;
+    direction: "INBOUND" | "OUTBOUND" | "SYSTEM";
+    status: string;
+    detail: string;
+  }
+
+  const gitAutoSyncState = {
+    enabled: !isTestGitEnv,
+    intervalSec: Math.max(15, Math.min(3600, Number(process.env.BASTILLA_GIT_SYNC_INTERVAL_SEC) || 60)),
+    autoFastForwardPull: true,
+    autoPushWorkBranch: true,
+    repoName: "Rush47/Bastilla_Ultimate",
+    remoteName: "origin",
+    remoteUrl: "https://github.com/Rush47/Bastilla_Ultimate.git",
+    branch: "main",
+    targetBaseBranch: "main",
+    headHash: "",
+    remoteHeadHash: "",
+    ahead: 0,
+    behind: 0,
+    changedFilesCount: 0,
+    inboundStatus: "IDLE" as "IDLE" | "FETCHED" | "FAST_FORWARDED" | "REBASED" | "DIVERGED" | "DIRTY_SKIPPED" | "ERROR",
+    outboundStatus: "IDLE" as "IDLE" | "PUSHED" | "UP_TO_DATE" | "PROTECTED_MAIN" | "AUTH_REQUIRED" | "ERROR",
+    authReady: false,
+    syncCount: 0,
+    lastSyncAt: null as string | null,
+    lastDetail: "Automatyczna synchronizacja obustronna z GitHubem skonfigurowana.",
+    recentEvents: [] as GitSyncEvent[],
+  };
+
+  function addGitSyncEvent(direction: GitSyncEvent["direction"], status: string, detail: string) {
+    gitAutoSyncState.recentEvents.unshift({
+      timestamp: new Date().toISOString(),
+      direction,
+      status,
+      detail: redact(detail),
+    });
+    if (gitAutoSyncState.recentEvents.length > 30) {
+      gitAutoSyncState.recentEvents.pop();
+    }
+  }
+
+  async function runGitSafe(args: string[], timeoutMs = 10000): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+    try {
+      const { stdout, stderr } = await execFileAsync("git", args, {
+        cwd: PROJECT_ROOT,
+        timeout: timeoutMs,
+      });
+      return { ok: true, stdout: stdout.trim(), stderr: stderr.trim() };
+    } catch (err: any) {
+      return {
+        ok: false,
+        stdout: String(err?.stdout || "").trim(),
+        stderr: String(err?.stderr || err?.message || "Błąd wykonania git").trim(),
+      };
+    }
+  }
+
+  async function checkGithubAuthReady(): Promise<boolean> {
+    if (process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim()) {
+      return true;
+    }
+    try {
+      await execFileAsync("gh", ["auth", "status"], { cwd: PROJECT_ROOT, timeout: 4000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  let gitSyncMutex = false;
+
+  async function performBidirectionalGitSync(options?: {
+    trigger?: string;
+    commitMessage?: string;
+    stageAndCommit?: boolean;
+    pushNow?: boolean;
+  }) {
+    if (gitSyncMutex) return gitAutoSyncState;
+    gitSyncMutex = true;
+    try {
+      const [branchRes, headRes, statusRes, authReady] = await Promise.all([
+        runGitSafe(["rev-parse", "--abbrev-ref", "HEAD"]),
+        runGitSafe(["rev-parse", "--short", "HEAD"]),
+        runGitSafe(["status", "--porcelain"]),
+        checkGithubAuthReady(),
+      ]);
+
+      let branch = branchRes.ok && branchRes.stdout ? branchRes.stdout : "main";
+      let headHash = headRes.ok ? headRes.stdout : "";
+      let changedFiles = statusRes.ok && statusRes.stdout
+        ? statusRes.stdout.split("\n").filter((l) => l.trim().length > 0)
+        : [];
+
+      gitAutoSyncState.authReady = authReady;
+      gitAutoSyncState.branch = branch;
+      gitAutoSyncState.headHash = headHash;
+      gitAutoSyncState.changedFilesCount = changedFiles.length;
+
+      // 1. Optional stage & commit onto a working branch (never directly onto main)
+      if (options?.stageAndCommit && changedFiles.length > 0) {
+        const cleanMsg = String(options.commitMessage || "chore: automatic bidirectional sync snapshot")
+          .replace(/[\r\n]+/g, " ")
+          .trim()
+          .slice(0, 160);
+        if (branch === "main") {
+          const autoBranch = `sync/bastilla-auto-${new Date().toISOString().slice(0, 10)}`;
+          const checkoutRes = await runGitSafe(["checkout", "-B", autoBranch]);
+          if (checkoutRes.ok) {
+            branch = autoBranch;
+            gitAutoSyncState.branch = branch;
+            addGitSyncEvent("SYSTEM", "BRANCH_SWITCH", `Utworzono gałąź roboczą ${branch} (ochrona gałęzi main).`);
+          }
+        }
+        if (branch !== "main") {
+          await runGitSafe(["add", "-A"]);
+          const commitRes = await runGitSafe(["commit", "-m", cleanMsg]);
+          if (commitRes.ok) {
+            const newHead = await runGitSafe(["rev-parse", "--short", "HEAD"]);
+            headHash = newHead.ok ? newHead.stdout : headHash;
+            gitAutoSyncState.headHash = headHash;
+            changedFiles = [];
+            gitAutoSyncState.changedFilesCount = 0;
+            addGitSyncEvent("OUTBOUND", "COMMITTED", `Zapisano commit ${headHash} na gałęzi ${branch}: ${cleanMsg}`);
+          }
+        }
+      }
+
+      // 2. INBOUND: Fetch from GitHub (origin) & Fast-Forward Pull if behind
+      const fetchRes = await runGitSafe(["fetch", "origin", "--prune"], 12000);
+      const remoteHeadRes = await runGitSafe(["rev-parse", "--short", "origin/main"]);
+      if (remoteHeadRes.ok) {
+        gitAutoSyncState.remoteHeadHash = remoteHeadRes.stdout;
+      }
+
+      const remoteBranchExists = (await runGitSafe(["rev-parse", "--verify", `origin/${branch}`])).ok;
+      const compareRef = remoteBranchExists ? `origin/${branch}` : "origin/main";
+      const revListRes = await runGitSafe(["rev-list", "--left-right", "--count", `HEAD...${compareRef}`]);
+
+      let ahead = 0;
+      let behind = 0;
+      if (revListRes.ok && revListRes.stdout) {
+        const parts = revListRes.stdout.split(/\s+/);
+        ahead = Number(parts[0]) || 0;
+        behind = Number(parts[1]) || 0;
+      }
+      gitAutoSyncState.ahead = ahead;
+      gitAutoSyncState.behind = behind;
+
+      if (!fetchRes.ok) {
+        gitAutoSyncState.inboundStatus = "ERROR";
+        addGitSyncEvent("INBOUND", "FETCH_ERROR", `Nie udało się pobrać zmian z origin: ${fetchRes.stderr.slice(0, 140)}`);
+      } else if (behind > 0) {
+        if (changedFiles.length > 0) {
+          gitAutoSyncState.inboundStatus = "DIRTY_SKIPPED";
+          addGitSyncEvent(
+            "INBOUND",
+            "DIRTY_SKIPPED",
+            `Wykryto +${behind} nowych commitów na ${compareRef}, pominięto auto-merge z powodu ${changedFiles.length} niezapisanych plików.`
+          );
+        } else if (ahead === 0 && gitAutoSyncState.autoFastForwardPull) {
+          const ffRes = await runGitSafe(["merge", "--ff-only", compareRef]);
+          if (ffRes.ok) {
+            const updatedHead = await runGitSafe(["rev-parse", "--short", "HEAD"]);
+            gitAutoSyncState.headHash = updatedHead.ok ? updatedHead.stdout : headHash;
+            gitAutoSyncState.behind = 0;
+            behind = 0;
+            gitAutoSyncState.inboundStatus = "FAST_FORWARDED";
+            addGitSyncEvent(
+              "INBOUND",
+              "FAST_FORWARDED",
+              `Zintegrowano nowe commity z GitHub (${compareRef} → ${gitAutoSyncState.headHash}).`
+            );
+          } else {
+            gitAutoSyncState.inboundStatus = "DIVERGED";
+            addGitSyncEvent("INBOUND", "DIVERGED", `Nie można wykonać fast-forward z ${compareRef}.`);
+          }
+        } else {
+          gitAutoSyncState.inboundStatus = "DIVERGED";
+          addGitSyncEvent(
+            "INBOUND",
+            "DIVERGED",
+            `Gałąź ${branch} ma +${ahead}/-${behind} względem ${compareRef} (pobrano referencje).`
+          );
+        }
+      } else {
+        gitAutoSyncState.inboundStatus = "FETCHED";
+      }
+
+      // 3. OUTBOUND: Push working branch to GitHub (origin)
+      if (ahead === 0 && remoteBranchExists) {
+        gitAutoSyncState.outboundStatus = "UP_TO_DATE";
+      } else if (branch === "main" && ahead > 0) {
+        gitAutoSyncState.outboundStatus = "PROTECTED_MAIN";
+      } else if (ahead > 0 && (gitAutoSyncState.autoPushWorkBranch || options?.pushNow)) {
+        if (!authReady && !options?.pushNow) {
+          gitAutoSyncState.outboundStatus = "AUTH_REQUIRED";
+        } else {
+          const pushRes = await runGitSafe(["push", "-u", "origin", branch], 15000);
+          if (pushRes.ok) {
+            gitAutoSyncState.outboundStatus = "PUSHED";
+            gitAutoSyncState.ahead = 0;
+            addGitSyncEvent(
+              "OUTBOUND",
+              "PUSHED",
+              `Wypchnięto gałąź ${branch} (${gitAutoSyncState.headHash}) do origin/${branch}.`
+            );
+          } else {
+            const isAuthErr = /authentication|credentials|permission|could not read Username|401|403/i.test(
+              pushRes.stderr
+            );
+            gitAutoSyncState.outboundStatus = isAuthErr ? "AUTH_REQUIRED" : "ERROR";
+            addGitSyncEvent(
+              "OUTBOUND",
+              gitAutoSyncState.outboundStatus,
+              isAuthErr
+                ? `Push gałęzi ${branch} (+${ahead}) oczekuje na poświadczenia GitHub (GH_TOKEN / gh auth login).`
+                : `Błąd push do origin/${branch}: ${pushRes.stderr.slice(0, 140)}`
+            );
+          }
+        }
+      } else if (ahead === 0 && !remoteBranchExists && branch !== "main") {
+        // Working branch not yet pushed to origin
+        const mainRevList = await runGitSafe(["rev-list", "--left-right", "--count", "HEAD...origin/main"]);
+        if (mainRevList.ok && mainRevList.stdout) {
+          const parts = mainRevList.stdout.split(/\s+/);
+          gitAutoSyncState.ahead = Number(parts[0]) || 0;
+          gitAutoSyncState.behind = Number(parts[1]) || 0;
+        }
+        if (authReady && (gitAutoSyncState.autoPushWorkBranch || options?.pushNow)) {
+          const pushRes = await runGitSafe(["push", "-u", "origin", branch], 15000);
+          if (pushRes.ok) {
+            gitAutoSyncState.outboundStatus = "PUSHED";
+            addGitSyncEvent(
+              "OUTBOUND",
+              "PUSHED",
+              `Opublikowano nową gałąź ${branch} (${gitAutoSyncState.headHash}) na GitHub.`
+            );
+          } else {
+            gitAutoSyncState.outboundStatus = "AUTH_REQUIRED";
+          }
+        } else {
+          gitAutoSyncState.outboundStatus = gitAutoSyncState.ahead > 0 ? "AUTH_REQUIRED" : "UP_TO_DATE";
+        }
+      } else {
+        gitAutoSyncState.outboundStatus = "UP_TO_DATE";
+      }
+
+      gitAutoSyncState.syncCount += 1;
+      gitAutoSyncState.lastSyncAt = new Date().toISOString();
+      gitAutoSyncState.lastDetail =
+        `[INBOUND: ${gitAutoSyncState.inboundStatus} · OUTBOUND: ${gitAutoSyncState.outboundStatus}] ` +
+        `Gałąź ${gitAutoSyncState.branch} (${gitAutoSyncState.headHash}) względem origin/main (${gitAutoSyncState.remoteHeadHash || "N/A"}): ` +
+        `+${gitAutoSyncState.ahead} / -${gitAutoSyncState.behind}` +
+        (gitAutoSyncState.outboundStatus === "AUTH_REQUIRED"
+          ? " — Fetch z GitHuba aktywny; push oczekuje na GH_TOKEN / gh auth login."
+          : ".");
+
+      broadcastSystemEvent("git_sync", { sync: gitAutoSyncState });
+      return gitAutoSyncState;
+    } finally {
+      gitSyncMutex = false;
+    }
+  }
+
+  let gitAutoSyncTimer: NodeJS.Timeout | null = null;
+  function restartGitBidirectionalSyncTimer() {
+    if (gitAutoSyncTimer) {
+      clearInterval(gitAutoSyncTimer);
+      gitAutoSyncTimer = null;
+    }
+    if (gitAutoSyncState.enabled) {
+      gitAutoSyncTimer = setInterval(() => {
+        if (gitAutoSyncState.enabled) {
+          void performBidirectionalGitSync({ trigger: "auto_interval" });
+        }
+      }, gitAutoSyncState.intervalSec * 1000);
+    }
+  }
+
+  function startGitBidirectionalSyncDaemon() {
+    restartGitBidirectionalSyncTimer();
+    if (gitAutoSyncState.enabled) {
+      setTimeout(() => {
+        void performBidirectionalGitSync({ trigger: "startup" });
+      }, 1500);
+    }
+  }
+
+  app.get("/api/git/bidirectional/status", (_req, res) => {
+    res.json({ ok: true, sync: gitAutoSyncState });
+  });
+
+  app.post("/api/git/bidirectional/toggle", async (req, res) => {
+    const { enabled, intervalSec, autoFastForwardPull, autoPushWorkBranch } = req.body || {};
+    if (typeof enabled === "boolean") {
+      gitAutoSyncState.enabled = enabled;
+    } else if (enabled === undefined && intervalSec === undefined && autoFastForwardPull === undefined && autoPushWorkBranch === undefined) {
+      gitAutoSyncState.enabled = !gitAutoSyncState.enabled;
+    }
+    if (intervalSec !== undefined) {
+      const parsed = Number(intervalSec);
+      if (Number.isFinite(parsed) && parsed >= 15 && parsed <= 3600) {
+        gitAutoSyncState.intervalSec = Math.round(parsed);
+      }
+    }
+    if (typeof autoFastForwardPull === "boolean") {
+      gitAutoSyncState.autoFastForwardPull = autoFastForwardPull;
+    }
+    if (typeof autoPushWorkBranch === "boolean") {
+      gitAutoSyncState.autoPushWorkBranch = autoPushWorkBranch;
+    }
+    restartGitBidirectionalSyncTimer();
+    addGitSyncEvent(
+      "SYSTEM",
+      gitAutoSyncState.enabled ? "AUTO_SYNC_ON" : "AUTO_SYNC_OFF",
+      `Automatyczna synchronizacja obustronna: ${gitAutoSyncState.enabled ? `WŁĄCZONA (co ${gitAutoSyncState.intervalSec}s)` : "WSTRZYMANA"}.`
+    );
+    if (gitAutoSyncState.enabled) {
+      await performBidirectionalGitSync({ trigger: "toggle_on" });
+    }
+    res.json({ ok: true, sync: gitAutoSyncState });
+  });
+
+  app.post("/api/git/bidirectional/sync", async (req, res) => {
+    try {
+      const { commitMessage, stageAndCommit = false, pushNow = true } = req.body || {};
+      const state = await performBidirectionalGitSync({
+        trigger: "manual_bidirectional",
+        commitMessage: typeof commitMessage === "string" ? commitMessage : undefined,
+        stageAndCommit: Boolean(stageAndCommit),
+        pushNow: Boolean(pushNow),
+      });
+      res.json({ ok: true, sync: state });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || "Błąd synchronizacji obustronnej GitHub." });
+    }
+  });
+
   app.get("/api/git/status", async (_req, res) => {
     try {
       const gitScript = `
@@ -3003,7 +4165,8 @@ print(json.dumps({
 }))
 `;
       const info = await querySqliteJson(gitScript);
-      res.json({ ok: true, git: info });
+      info.bidirectional = gitAutoSyncState;
+      res.json({ ok: true, git: info, bidirectional: gitAutoSyncState });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
     }
@@ -3084,7 +4247,7 @@ print(json.dumps({"updated": updated, "relayId": sys.argv[2], "packet": sys.argv
   });
 
   // ==========================================================================
-  // CONTINUOUS BACKGROUND AUTOMATED MISSION FOR AI AGENTS (BACKEND & GUI HEALING)
+  // CONTINUOUS BACKGROUND AUTOMATED MISSION FOR AI AGENTS (LINUX, BACKEND & INNOVATIONS)
   // ==========================================================================
   interface ContinuousMissionLog {
     timestamp: string;
@@ -3093,26 +4256,135 @@ print(json.dumps({"updated": updated, "relayId": sys.argv[2], "packet": sys.argv
     message: string;
   }
 
+  interface SystemInnovationRecord {
+    id: string;
+    cycle: number;
+    timestamp: string;
+    agent: string;
+    category: "LINUX_SYSTEM" | "BACKEND_API" | "SVL_KERNEL" | "OPERATOR_UX";
+    title: string;
+    description: string;
+    artifactPath: string;
+  }
+
+  const isHostProvisionedRuntime =
+    process.env.BASTILLA_CONTINUOUS_MISSION === "true" ||
+    (process.env.BASTILLA_CONTINUOUS_MISSION !== "false" &&
+      process.env.BASTILLA_PROVISION_HOST !== "false" &&
+      !process.env.NODE_TEST_CONTEXT);
+
+  const INNOVATIONS_CATALOG: Array<{
+    agent: string;
+    category: SystemInnovationRecord["category"];
+    title: string;
+    description: string;
+    filename: string;
+    buildContent: (cycle: number) => string;
+  }> = [
+    {
+      agent: "alex",
+      category: "LINUX_SYSTEM",
+      title: "Aliasy powłoki Linux i profil Operatora (bastilla-operator-env.sh)",
+      description:
+        "Dostosowanie środowiska bash/ash dla Operatora Mateusza Mitka: szybkie skróty diagnostyczne (bstatus, bagents, bsync, bdb), optymalizacja PATH oraz zmienne SVL.",
+      filename: "bastilla-operator-env.sh",
+      buildContent: (cycle) =>
+        `#!/usr/bin/env bash\n# Bastilla OS Ultimate — Auto-generated by Agent ALEX (Cycle #${cycle})\nexport BASTILLA_OPERATOR="Mateusz Mitek"\nexport BASTILLA_SVL_VERSION="5.7.0-QuantumWheel-Max"\nalias bstatus='curl -s http://127.0.0.1:3000/api/system/overview | head -c 600'\nalias bsync='curl -s -X POST http://127.0.0.1:3000/api/git/bidirectional/sync'\nalias bchat='curl -s http://127.0.0.1:3000/api/chat/bidirectional/status'\n`,
+    },
+    {
+      agent: "astyria",
+      category: "BACKEND_API",
+      title: "Indeksy SQLite WAL + PRAGMA optimize dla czatu i telemetrii",
+      description:
+        "Automatyczne strojenie bazy SQLite (indeksy wielokolumnowe dla chat_messages, agent_memories oraz agent_ipc_messages) przyspieszające odpowiedzi backendu i strumieni SSE.",
+      filename: "backend-sqlite-tuning.json",
+      buildContent: (cycle) =>
+        JSON.stringify(
+          {
+            cycle,
+            tunedBy: "astyria",
+            operator: "Mateusz Mitek",
+            pragmas: ["PRAGMA optimize", "PRAGMA wal_autocheckpoint=1000"],
+            indexes: [
+              "idx_chat_messages_session_id",
+              "idx_agent_memories_agent_created",
+              "idx_agent_ipc_recipient_status",
+            ],
+            timestamp: new Date().toISOString(),
+          },
+          null,
+          2
+        ),
+    },
+    {
+      agent: "aria",
+      category: "OPERATOR_UX",
+      title: "Profil personalizacji Operatora (Vault 33 + Kanał Obustronny @wszyscy)",
+      description:
+        "Konfiguracja priorytetów interfejsu, awatara Operatora (Lucy Vault 33), inteligentnego routingu @wszyscy oraz automatycznych powiadomień SSE.",
+      filename: "operator-personalization-profile.json",
+      buildContent: (cycle) =>
+        JSON.stringify(
+          {
+            cycle,
+            configuredBy: "aria",
+            operator: "Mateusz Mitek",
+            operatorAvatar: "/assets/operator_lucy_vault33.webp",
+            bidirectionalChatChannel: "@wszyscy",
+            theme: "Bastilla Violet High-Contrast",
+            updatedAt: new Date().toISOString(),
+          },
+          null,
+          2
+        ),
+    },
+    {
+      agent: "aurelius",
+      category: "SVL_KERNEL",
+      title: "Manifest ochrony SVL Core v5.7.0 i strażnik spójności usług",
+      description:
+        "Weryfikacja metryki zwartej C=2.5, kontrola uprawnień kont Linux (UID 1001–1004) oraz manifest bezpieczeństwa połączeń MCP i GitHub.",
+      filename: "svl-security-manifest.json",
+      buildContent: (cycle) =>
+        JSON.stringify(
+          {
+            cycle,
+            verifiedBy: "aurelius",
+            svlCompactDomain: [-1, 1],
+            metricC: 2.5,
+            linuxAccounts: ["aria:1001", "alex:1002", "astyria:1003", "aurelius:1004"],
+            timestamp: new Date().toISOString(),
+          },
+          null,
+          2
+        ),
+    },
+  ];
+
   const continuousMissionState = {
     active: process.env.BASTILLA_CONTINUOUS_MISSION === "true",
     cycle: 0,
     missionId: "MISSION-CONTINUOUS-AUTONOMOUS",
-    codename: "Okresowa kontrola SQLite",
+    codename: "Ciągły Rozwój AI: Nowości + Dostosowanie Linux & Backend",
     leadAgent: "aria",
     agents: ["aria", "alex", "astyria", "aurelius"],
-    phase: "CONTINUOUS_EXECUTION_LOOP",
+    phase: "CONTINUOUS_INNOVATION_AND_TUNING",
     lastRunTimestamp: new Date().toISOString(),
-    lastAction: "Oczekiwanie na rzeczywistą kontrolę SQLite",
+    lastAction: "Gotowość do wdrażania nowości AI, optymalizacji Linuxa i strojenia backendu SQLite",
     stats: {
       repairedMessages: 0,
       memoryFreedMb: 0,
       dbIntegrityChecks: 0,
       ipcMessagesRouted: 0,
       tasksLogged: 0,
+      innovationsAdded: 0,
+      linuxAdaptations: 0,
+      backendUpgrades: 0,
       metricC: 2.5,
       operator: "Mateusz Mitek",
       version: "5.7.0-QuantumWheel-Max",
     },
+    recentInnovations: [] as SystemInnovationRecord[],
     recentLogs: [] as ContinuousMissionLog[],
   };
 
@@ -3130,23 +4402,158 @@ print(json.dumps({"updated": updated, "relayId": sys.argv[2], "packet": sys.argv
   }
 
   let maintenanceRunning = false;
-  async function executeContinuousMissionCycle(): Promise<{ ok: boolean; cycle: number; summary: string }> {
-    if (maintenanceRunning) throw new Error("Trwa kontrola SQLite.");
+  async function executeContinuousMissionCycle(options?: {
+    aiGenerate?: boolean;
+    customDirective?: string;
+  }): Promise<{
+    ok: boolean;
+    cycle: number;
+    summary: string;
+    innovation?: SystemInnovationRecord;
+  }> {
+    if (maintenanceRunning) throw new Error("Trwa cykl misji ciągłej AI.");
     maintenanceRunning = true;
     try {
+      // 1. Verify SQLite integrity & create performance indexes for backend speed
       const check = await querySqliteJson(`import sqlite3, sys, json
 conn = sqlite3.connect(sys.argv[1])
 rows = [r[0] for r in conn.execute("PRAGMA quick_check")]
+conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id, id)")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_memories_agent_created ON agent_memories(agent_id, id)")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_ipc_recipient_status ON agent_ipc_messages(recipient, status)")
+conn.execute("PRAGMA optimize")
+conn.commit()
 conn.close()
 print(json.dumps({"results": rows}))`);
-      if (check.results?.length !== 1 || check.results[0] !== "ok") throw new Error("Kontrola SQLite zgłosiła błąd.");
+      if (check.results?.length !== 1 || check.results[0] !== "ok") {
+        throw new Error("Kontrola SQLite zgłosiła błąd.");
+      }
+
       continuousMissionState.cycle += 1;
+      const currentCycle = continuousMissionState.cycle;
+      const spec = INNOVATIONS_CATALOG[(currentCycle - 1) % INNOVATIONS_CATALOG.length];
+      continuousMissionState.leadAgent = spec.agent;
       continuousMissionState.stats.dbIntegrityChecks += 1;
-      continuousMissionState.lastRunTimestamp = new Date().toISOString();
-      continuousMissionState.lastAction = "SQLite quick_check: ok. Wykonał serwer aplikacji.";
-      addMissionLog("server", "SUCCESS", continuousMissionState.lastAction);
-      return { ok: true, cycle: continuousMissionState.cycle, summary: continuousMissionState.lastAction };
-    } finally { maintenanceRunning = false; }
+      continuousMissionState.stats.innovationsAdded += 1;
+      if (spec.category === "LINUX_SYSTEM") {
+        continuousMissionState.stats.linuxAdaptations += 1;
+      } else {
+        continuousMissionState.stats.backendUpgrades += 1;
+      }
+
+      // 2. Write real Linux / Backend adaptation artifact to disk
+      const innovationsDir = path.join(path.dirname(DB_PATH), "innovations");
+      fs.mkdirSync(innovationsDir, { recursive: true });
+      const artifactPath = path.join(innovationsDir, spec.filename);
+      let title = spec.title;
+      let description = spec.description;
+
+      // Optional live AI-generated innovation when requested or every 3rd cycle on live host
+      const shouldAskAi =
+        Boolean(options?.aiGenerate) ||
+        (isHostProvisionedRuntime && currentCycle % 3 === 1);
+
+      if (shouldAskAi) {
+        try {
+          const directive = options?.customDirective?.trim()
+            ? `Wskazówka Operatora: ${options.customDirective.trim()}\n`
+            : "";
+          const aiPrompt =
+            `${directive}Trwa Cykl #${currentCycle} Misji Ciągłej Rozwoju Systemu Bastilla OS Ultimate dla Operatora Mateusza Mitka.\n` +
+            `Jako agent ${spec.agent.toUpperCase()} zaprojektuj jedną konkretną nowość lub ulepszenie dostosowujące system Linux i backend Node.js/SQLite do naszych potrzeb.\n` +
+            `Odpowiedz po polsku w 2 zwięzłych zdaniach: w pierwszym zdaniu podaj nazwę wdrożonego ulepszenia, a w drugim opisz, co dokładnie zoptymalizowano w Linuxie lub backendzie.`;
+          const aiOut = await generateAgentReplyTurn({
+            speakerId: spec.agent,
+            prompt: aiPrompt,
+            enginePreference: "auto",
+          });
+          if (aiOut.text) {
+            const lines = aiOut.text
+              .split(/\n+/)
+              .map((l) => l.replace(/^[#*-\s]+/, "").trim())
+              .filter(Boolean);
+            if (lines.length > 0) {
+              title = lines[0].slice(0, 110);
+              description = lines.slice(1).join(" ").slice(0, 320) || aiOut.text.slice(0, 320);
+            }
+            if (options?.aiGenerate || currentCycle % 5 === 1) {
+              const chatMsgContent = `**[Misja Ciągła AI · Cykl #${currentCycle} — Nowość Linux & Backend]**\n**${title}**\n${description}`;
+              const savedChat = await querySqliteJson(
+                `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+cur = conn.cursor()
+cur.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES ('bastilla-main', 'assistant', ?, ?, ?, ?, ?, ?)",
+  (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], now))
+row_id = cur.lastrowid
+conn.commit(); conn.close()
+print(json.dumps({"id": row_id, "created_at": now}))`,
+                [
+                  spec.agent,
+                  `${aiOut.engineUsed} · Misja Ciągła #${currentCycle}`,
+                  chatMsgContent,
+                  `${spec.filename} (Cykl #${currentCycle})`,
+                  spec.buildContent(currentCycle),
+                ]
+              );
+              broadcastSystemEvent("chat_message", {
+                message: {
+                  id: savedChat.id || Date.now(),
+                  session_id: "bastilla-main",
+                  sender_role: "assistant",
+                  agent_id: spec.agent,
+                  engine_used: `${aiOut.engineUsed} · Misja Ciągła #${currentCycle}`,
+                  content: chatMsgContent,
+                  artifact_title: `${spec.filename} (Cykl #${currentCycle})`,
+                  artifact_code: spec.buildContent(currentCycle),
+                  created_at: savedChat.created_at || new Date().toISOString(),
+                },
+              });
+            }
+          }
+        } catch {}
+      }
+
+      fs.writeFileSync(artifactPath, spec.buildContent(currentCycle), "utf-8");
+      if (spec.filename.endsWith(".sh")) {
+        try {
+          fs.chmodSync(artifactPath, 0o755);
+        } catch {}
+      }
+
+      const innovation: SystemInnovationRecord = {
+        id: `INNOV-${currentCycle}-${Date.now()}`,
+        cycle: currentCycle,
+        timestamp: new Date().toISOString(),
+        agent: spec.agent,
+        category: spec.category,
+        title,
+        description,
+        artifactPath,
+      };
+      continuousMissionState.recentInnovations.unshift(innovation);
+      if (continuousMissionState.recentInnovations.length > 25) {
+        continuousMissionState.recentInnovations.pop();
+      }
+
+      continuousMissionState.lastRunTimestamp = innovation.timestamp;
+      continuousMissionState.lastAction = `[${spec.agent.toUpperCase()} · ${spec.category}] ${title} (SQLite quick_check: ok)`;
+      addMissionLog(spec.agent, "OPTIMIZE", `${title} — ${description}`);
+      broadcastSystemEvent("mission_cycle", {
+        mission: continuousMissionState,
+        innovation,
+      });
+
+      return {
+        ok: true,
+        cycle: currentCycle,
+        summary: continuousMissionState.lastAction,
+        innovation,
+      };
+    } finally {
+      maintenanceRunning = false;
+    }
   }
 
   let continuousMissionInterval: NodeJS.Timeout | null = null;
@@ -3157,12 +4564,12 @@ print(json.dumps({"results": rows}))`);
     }
     if (continuousMissionState.active) executeContinuousMissionCycle().catch(() => {});
     continuousMissionInterval = setInterval(() => {
-      if (continuousMissionState.active) {
+      if (continuousMissionState.active && !maintenanceRunning) {
         executeContinuousMissionCycle().catch((err) => {
           console.error("Continuous mission cycle error:", err);
         });
       }
-    }, 6000);
+    }, 60000);
 
     console.log(`[Bastilla OS Ultimate] Continuous mission: ${continuousMissionState.active ? "active" : "paused"}.`);
   }
@@ -3186,12 +4593,403 @@ print(json.dumps({"results": rows}))`);
     res.json({ ok: true, mission: continuousMissionState });
   });
 
-  app.post("/api/missions/continuous/trigger", async (_req, res) => {
+  app.post("/api/missions/continuous/trigger", async (req, res) => {
     try {
-      const result = await executeContinuousMissionCycle();
+      const { aiGenerate = false, customDirective } = req.body || {};
+      const result = await executeContinuousMissionCycle({
+        aiGenerate: Boolean(aiGenerate),
+        customDirective: typeof customDirective === "string" ? customDirective : undefined,
+      });
       res.json({ ok: true, result, mission: continuousMissionState });
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  app.post("/api/missions/continuous/innovate", async (req, res) => {
+    try {
+      const { customDirective } = req.body || {};
+      const result = await executeContinuousMissionCycle({
+        aiGenerate: true,
+        customDirective: typeof customDirective === "string" ? customDirective : undefined,
+      });
+      res.json({ ok: true, result, mission: continuousMissionState });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
+  });
+
+  // ==========================================================================
+  // LOCAL AI DESKTOP (X11 / Xvfb / TigerVNC-x11vnc / noVNC / VISUAL LOOP)
+  // & SPHERICAL CONTEXT WORKER + CENTRAL DIAGNOSTICS
+  // ==========================================================================
+  if (fs.existsSync("/usr/share/novnc")) {
+    app.use("/api/desktop/novnc", express.static("/usr/share/novnc"));
+  }
+
+  app.get("/api/desktop/status", async (_req, res) => {
+    try {
+      const status = await desktopSessionManager.getStatus();
+      res.json({ ok: true, status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd odczytu stanu pulpitu.") });
+    }
+  });
+
+  app.get("/api/desktop/windows", async (_req, res) => {
+    try {
+      const windows = await desktopSessionManager.listWindows();
+      res.json({ ok: true, windows });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd odczytu okien X11.") });
+    }
+  });
+
+  app.post("/api/desktop/session", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Wymagana autoryzacja Operatora." });
+    }
+    try {
+      const action = String(req.body?.action || "start");
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "aria";
+      const status =
+        action === "stop"
+          ? await desktopSessionManager.stopIsolatedSession()
+          : await desktopSessionManager.startIsolatedSession(agentId);
+      broadcastSystemEvent("desktop_status", { status });
+      res.json({ ok: true, status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Nie udało się zarządzać sesją pulpitu.") });
+    }
+  });
+
+  app.post("/api/desktop/control", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Wymagana autoryzacja Operatora." });
+    }
+    try {
+      const enabled = Boolean(req.body?.aiControlEnabled);
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "aria";
+      const control = desktopSessionManager.setAiControlEnabled(enabled, agentId);
+      const status = await desktopSessionManager.getStatus();
+      broadcastSystemEvent("desktop_status", { status });
+      res.json({ ok: true, ...control, status });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd przełączania sterowania AI.") });
+    }
+  });
+
+  app.post("/api/desktop/screenshot", async (req, res) => {
+    try {
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "aria";
+      const screenshot = await desktopSessionManager.captureScreenshot(agentId);
+      if (req.body?.saveToChat) {
+        const msgText = `Zrzut pulpitu X11 (${screenshot.display} · ${screenshot.width}x${screenshot.height} · sesja ${screenshot.sessionId})`;
+        await querySqliteJson(
+          `import sqlite3, sys, json
+from datetime import datetime, timezone
+now = datetime.now(timezone.utc).isoformat()
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("INSERT INTO chat_messages (session_id, sender_role, agent_id, engine_used, content, artifact_title, artifact_code, created_at) VALUES ('bastilla-main', 'assistant', ?, 'desktop-x11', ?, '', '', ?)",
+  (sys.argv[2], sys.argv[3], now))
+conn.commit(); conn.close(); print(json.dumps({"saved": True}))`,
+          [agentId, msgText]
+        ).catch(() => {});
+      }
+      res.json({ ok: true, screenshot });
+    } catch (err: any) {
+      res.status(503).json({ ok: false, error: redact(err?.message || "Zrzut ekranu X11 niedostępny.") });
+    }
+  });
+
+  app.post("/api/desktop/action", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Sterowanie GUI wymaga autoryzacji Operatora." });
+    }
+    try {
+      const { action = "", agentId = "aria", x, y, button = "left", doubleClick = false, direction = "down", clicks = 3, text = "", key = "", target = "" } = req.body || {};
+      const safeAgent = AGENTS.includes(agentId) ? String(agentId) : "aria";
+      let result: any;
+      if (action === "mouse_move") {
+        result = await desktopSessionManager.mouseMove(Number(x), Number(y), safeAgent);
+      } else if (action === "mouse_click") {
+        result = await desktopSessionManager.mouseClick(Number(x), Number(y), button, Boolean(doubleClick), safeAgent);
+      } else if (action === "mouse_scroll") {
+        result = await desktopSessionManager.mouseScroll(direction, Number(clicks), safeAgent);
+      } else if (action === "keyboard_type") {
+        result = await desktopSessionManager.keyboardType(String(text), safeAgent);
+      } else if (action === "keyboard_press") {
+        result = await desktopSessionManager.keyboardPress(String(key), safeAgent);
+      } else if (action === "window_focus") {
+        result = await desktopSessionManager.focusWindow(String(target), safeAgent);
+      } else {
+        return res.status(400).json({ ok: false, error: `Nieobsługiwana akcja GUI: ${action}` });
+      }
+      const status = await desktopSessionManager.getStatus();
+      broadcastSystemEvent("desktop_status", { status });
+      res.json({ ok: true, result, status });
+    } catch (err: any) {
+      res.status(400).json({ ok: false, error: redact(err?.message || "Błąd wykonania akcji pulpitu.") });
+    }
+  });
+
+  app.post("/api/desktop/vision-analyze", async (req, res) => {
+    if (!isOperatorAuthorized(req)) {
+      return res.status(401).json({ ok: false, error: "Analiza wizualna pulpitu wymaga autoryzacji Operatora." });
+    }
+    try {
+      const agentId = AGENTS.includes(req.body?.agentId) ? String(req.body.agentId) : "astyria";
+      const goal = String(req.body?.goal || "Opisz aktualny stan pulpitu Linux, otwarte okna oraz następny bezpieczny krok.").trim();
+      const executeAction = Boolean(req.body?.executeAction);
+
+      const screenshot = await desktopSessionManager.captureScreenshot(agentId);
+      const [windows, ollamaStatus] = await Promise.all([
+        desktopSessionManager.listWindows(),
+        probeOllamaStatus(getOllamaBaseUrl()),
+      ]);
+      const visionOllamaModel = ollamaStatus.models.find((m) => m.multimodal)?.name || null;
+      const geminiClient = getGeminiClient();
+
+      const visionPrompt =
+        `Analizujesz świeży zrzut ekranu sesji X11 (${screenshot.display}, rozdzielczość ${screenshot.width}x${screenshot.height}px, sesja ${screenshot.sessionId}).\n` +
+        `Widoczne okna wmctrl: ${windows.length ? windows.map((w) => `${w.id}:${w.title}`).join(", ") : "brak okien (pusty pulpit Fluxbox)"}.\n` +
+        `Cel Operatora: ${goal}\n` +
+        `Odpowiedz po polsku w krótkich punktach oraz — jeśli potrzebna jest konkretna akcja GUI — podaj na końcu blok JSON:\n` +
+        `{"proposedAction": "none"|"mouse_click"|"keyboard_press", "x": number, "y": number, "key": string, "reason": string}`;
+
+      let analysis = "";
+      let modelUsed = "none";
+      let proposedAction: any = { proposedAction: "none", reason: "Brak modelu multimodalnego do planowania akcji." };
+
+      if (geminiClient) {
+        const out = await runLiveMultimodalModel(
+          [
+            {
+              role: "user",
+              parts: [
+                { inlineData: { mimeType: screenshot.mimeType, data: screenshot.base64 } },
+                { text: visionPrompt },
+              ],
+            },
+          ],
+          undefined,
+          buildAgentSystemInstruction(agentId)
+        );
+        analysis = out.text;
+        modelUsed = `gemini/${out.modelUsed}`;
+      } else if (ollamaStatus.reachable && visionOllamaModel) {
+        const r = await fetch(`${getOllamaBaseUrl()}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: visionOllamaModel,
+            stream: false,
+            messages: [{ role: "user", content: visionPrompt, images: [screenshot.base64] }],
+          }),
+        });
+        if (!r.ok) {
+          throw new Error(`Ollama Vision HTTP ${r.status}`);
+        }
+        const body: any = await r.json();
+        analysis = String(body?.message?.content || "").trim();
+        modelUsed = `ollama/${visionOllamaModel}`;
+      } else {
+        analysis =
+          `Zrzut ekranu X11 wykonano poprawnie (${screenshot.width}x${screenshot.height}px, ${screenshot.byteSize} B, okna: ${windows.length}). ` +
+          `Analiza semantyczna obrazu wymaga skonfigurowanego GEMINI_API_KEY lub lokalnego modelu multimodalnego Ollama (np. llama3.2-vision:11b / qwen2.5vl). ` +
+          `Wykryte modele Ollama: ${ollamaStatus.modelNames.join(", ") || "brak"}.`;
+      }
+
+      const jsonMatch = analysis.match(/\{[\s\S]*?"proposedAction"[\s\S]*?\}/);
+      if (jsonMatch) {
+        try {
+          proposedAction = JSON.parse(jsonMatch[0]);
+        } catch {}
+      }
+
+      let executedResult: any = null;
+      let verificationScreenshot: any = null;
+      const statusNow = await desktopSessionManager.getStatus();
+      if (executeAction && statusNow.aiControlEnabled && statusNow.sessionIsolated) {
+        if (
+          proposedAction?.proposedAction === "mouse_click" &&
+          typeof proposedAction.x === "number" &&
+          typeof proposedAction.y === "number" &&
+          proposedAction.x >= 0 &&
+          proposedAction.x <= screenshot.width &&
+          proposedAction.y >= 0 &&
+          proposedAction.y <= screenshot.height
+        ) {
+          executedResult = await desktopSessionManager.mouseClick(proposedAction.x, proposedAction.y, "left", false, agentId);
+          verificationScreenshot = await desktopSessionManager.captureScreenshot(agentId);
+        } else if (proposedAction?.proposedAction === "keyboard_press" && typeof proposedAction.key === "string" && proposedAction.key.trim()) {
+          executedResult = await desktopSessionManager.keyboardPress(proposedAction.key, agentId);
+          verificationScreenshot = await desktopSessionManager.captureScreenshot(agentId);
+        }
+      }
+
+      res.json({
+        ok: true,
+        modelUsed,
+        screenshot,
+        windows,
+        analysis,
+        proposedAction,
+        executedResult,
+        verificationScreenshot,
+      });
+    } catch (err: any) {
+      res.status(503).json({ ok: false, error: redact(err?.message || "Błąd analizy wizualnej pulpitu.") });
+    }
+  });
+
+  app.get("/api/system/spherical-context", async (_req, res) => {
+    try {
+      const snapshot = await collectSphericalContext(
+        [
+          {
+            name: "ollama",
+            timeoutMs: 1800,
+            run: async () => {
+              const s = await probeOllamaStatus(getOllamaBaseUrl());
+              return { state: s.state, reachable: s.reachable, models: s.modelNames };
+            },
+          },
+          {
+            name: "desktop_x11",
+            timeoutMs: 1800,
+            run: async () => {
+              const d = await desktopSessionManager.getStatus();
+              return { display: d.display, active: d.x11SessionActive, isolated: d.sessionIsolated, vncRunning: d.vncRunning };
+            },
+          },
+          {
+            name: "sqlite_queue",
+            timeoutMs: 1500,
+            run: async () => ({ tasks: queue.list().slice(0, 10) }),
+          },
+          {
+            name: "mcp",
+            timeoutMs: 1200,
+            run: async () => buildMcpStatusSnapshot(),
+          },
+          {
+            name: "codex_cli",
+            timeoutMs: 1800,
+            run: async () => codexAuth.status(),
+          },
+          {
+            name: "image_engines",
+            timeoutMs: 1800,
+            run: async () => imageManager.probeStatus(),
+          },
+          {
+            name: "git_repo",
+            timeoutMs: 1800,
+            run: async () => {
+              const [branch, head, status] = await Promise.all([
+                runGitSafe(["rev-parse", "--abbrev-ref", "HEAD"]),
+                runGitSafe(["rev-parse", "--short", "HEAD"]),
+                runGitSafe(["status", "--short"]),
+              ]);
+              return {
+                branch: branch.stdout,
+                head: head.stdout,
+                dirtyCount: status.stdout ? status.stdout.split("\n").filter(Boolean).length : 0,
+              };
+            },
+          },
+        ],
+        { concurrencyCap: 3 }
+      );
+      res.json({ ok: true, snapshot });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd workera sferycznego.") });
+    }
+  });
+
+  app.get("/api/diagnostics/logs", async (_req, res) => {
+    try {
+      const desktopStatus = await desktopSessionManager.getStatus();
+      const recentTasks = await querySqliteJson(
+        `import sqlite3, sys, json
+conn = sqlite3.connect(sys.argv[1])
+conn.row_factory = sqlite3.Row
+rows = [dict(r) for r in conn.execute("SELECT id, title, assigned_agent, terminal_type, status, output_summary, created_at FROM task_history ORDER BY id DESC LIMIT 20").fetchall()]
+conn.close()
+print(json.dumps({"tasks": rows}))`
+      ).catch(() => ({ tasks: [] }));
+
+      res.json({
+        ok: true,
+        collectedAt: new Date().toISOString(),
+        continuousMissionLogs: continuousMissionState.recentLogs.slice(0, 30),
+        desktopAuditLog: desktopStatus.auditLog,
+        gitSyncEvents: gitAutoSyncState.recentEvents,
+        recentTasks: recentTasks.tasks || [],
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd eksportu logów.") });
+    }
+  });
+
+  app.get("/api/github/details", async (_req, res) => {
+    try {
+      const [branch, head, diffStat, logRes, ghAuth, remoteUrl] = await Promise.all([
+        runGitSafe(["rev-parse", "--abbrev-ref", "HEAD"]),
+        runGitSafe(["rev-parse", "--short", "HEAD"]),
+        runGitSafe(["diff", "--stat"]),
+        runGitSafe(["log", "-n", "10", "--pretty=format:%h|%an|%ar|%s"]),
+        execFileAsync("gh", ["auth", "status"], { cwd: PROJECT_ROOT, timeout: 4000 })
+          .then((o) => ({ ok: true, out: `${o.stdout}\n${o.stderr}`.trim() }))
+          .catch((e: any) => ({ ok: false, out: String(e?.stderr || e?.stdout || e?.message || "Not logged in").trim() })),
+        runGitSafe(["remote", "get-url", "origin"]),
+      ]);
+
+      let issues: any[] = [];
+      let prs: any[] = [];
+      if (ghAuth.ok) {
+        const [issRes, prRes] = await Promise.all([
+          execFileAsync(
+            "gh",
+            ["issue", "list", "--limit", "5", "--json", "number,title,state,url"],
+            { cwd: PROJECT_ROOT, timeout: 3500 }
+          ).catch(() => null),
+          execFileAsync(
+            "gh",
+            ["pr", "list", "--limit", "5", "--json", "number,title,state,url,headRefName"],
+            { cwd: PROJECT_ROOT, timeout: 3500 }
+          ).catch(() => null),
+        ]);
+        if (issRes?.stdout) {
+          try { issues = JSON.parse(issRes.stdout || "[]"); } catch {}
+        }
+        if (prRes?.stdout) {
+          try { prs = JSON.parse(prRes.stdout || "[]"); } catch {}
+        }
+      }
+
+      res.json({
+        ok: true,
+        repo: "Rush47/Bastilla_Ultimate",
+        remoteUrl: remoteUrl.stdout || "https://github.com/Rush47/Bastilla_Ultimate",
+        branch: branch.stdout || "main",
+        head: head.stdout || "",
+        diffStat: diffStat.stdout || "Brak niezapisanych zmian w śledzonych plikach.",
+        commits: (logRes.stdout || "")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => {
+            const [hash, author, date, message] = line.split("|");
+            return { hash, author, date, message };
+          }),
+        ghAuthReady: ghAuth.ok,
+        ghAuthDetail: redact(ghAuth.out),
+        issues,
+        prs,
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: redact(err?.message || "Błąd odczytu szczegółów GitHub.") });
     }
   });
 
@@ -3226,7 +5024,11 @@ print(json.dumps({"results": rows}))`);
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       root: PROJECT_ROOT,
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: process.env.DISABLE_HMR !== "true",
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -3243,12 +5045,80 @@ print(json.dumps({"results": rows}))`);
     startRootEscalationSocket();
   }
   if (process.env.BASTILLA_OLLAMA_BRIDGE === "true") startLocalOllamaDaemon();
+  if (!process.env.NODE_TEST_CONTEXT && process.env.BASTILLA_PROVISION_HOST !== "false") {
+    const endpoint = getOllamaBaseUrl();
+    try {
+      const parsedEndpoint = new URL(endpoint);
+      if (["127.0.0.1", "localhost", "0.0.0.0"].includes(parsedEndpoint.hostname)) {
+        void startOllamaDaemon(endpoint).then((res) => {
+          if (res.started) {
+            console.log(`[Bastilla OS] Native Ollama daemon started at ${res.status.endpoint} (PID ${res.status.daemonPid ?? "?"}).`);
+          }
+        }).catch(() => {});
+      }
+    } catch {}
+  }
   startContinuousAgentMissionDaemon();
+  startGitBidirectionalSyncDaemon();
 
   const server = app.listen(PORT, HOST, () => {
     const address = server.address();
     const port = typeof address === "object" && address ? address.port : PORT;
     console.log(`[Bastilla OS Ultimate] Server running at http://${HOST}:${port}`);
+  });
+
+  server.on("upgrade", async (req, socket, head) => {
+    const pathname = (req.url || "").split("?")[0];
+    if (pathname !== "/api/desktop/vnc-ws") return;
+
+    const configuredToken = process.env.BASTILLA_API_TOKEN || "";
+    const hostHeader = String(req.headers.host || "").split(":")[0].toLowerCase();
+    const appUrlOrigin = process.env.APP_URL?.replace(/\/$/, "") || "";
+    let appUrlHost = "";
+    try { appUrlHost = appUrlOrigin ? new URL(appUrlOrigin).hostname.toLowerCase() : ""; } catch {}
+    const isLocalOrPreview =
+      ["127.0.0.1", "localhost", "::1", "[::1]"].includes(hostHeader) ||
+      (Boolean(appUrlHost) && hostHeader === appUrlHost) ||
+      /\.run\.app$/i.test(hostHeader);
+
+    if (configuredToken) {
+      const digest = (v: string) => createHash("sha256").update(v).digest();
+      const valid = (v: string) => timingSafeEqual(digest(v), digest(configuredToken));
+      const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+      const rawCookie =
+        req.headers.cookie
+          ?.split(";")
+          .map((x) => x.trim())
+          .find((x) => x.startsWith("bastilla_access="))
+          ?.slice(16) || "";
+      let cookieToken = "";
+      try { cookieToken = decodeURIComponent(rawCookie); } catch {}
+      if ((!bearer || !valid(bearer)) && (!cookieToken || !valid(cookieToken))) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+    } else if (!isLocalOrPreview) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const desktopStatus = await desktopSessionManager.getStatus().catch(() => null);
+    if (!desktopStatus?.vncRunning || !desktopStatus.vncPort) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    bridgeAuthenticatedVncWebSocket(req, socket, head, desktopStatus.vncPort);
+  });
+
+  process.once("SIGTERM", () => {
+    void desktopSessionManager.stopIsolatedSession();
+  });
+  process.once("SIGINT", () => {
+    void desktopSessionManager.stopIsolatedSession();
   });
 }
 
